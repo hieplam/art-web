@@ -386,6 +386,37 @@ Login button is a plain `<a href="https://api.example.com/auth/google/start">`. 
 
 There is no NextAuth, no JWT in localStorage, no auth client SDK on the frontend.
 
+### 7.6 Cache control for pages that may include private content
+
+Next.js's default rendering behaviors are aggressive caching — both static rendering at build time and the Data Cache for fetches. **Any page whose HTML can include private content for the viewer must opt out of every layer of caching**, otherwise an authenticated owner's private artwork can be served as cached HTML to an anonymous visitor.
+
+The hard rule:
+
+| Route | Caching | Why |
+|---|---|---|
+| `/` (home feed) | Cacheable (public-only data) | Public feed query filters `visibility='public' AND published_at IS NOT NULL`; safe to cache. |
+| `/tag/[name]` | Cacheable (public-only data) | Tag pages are public-only by spec (§8.6 case 5). |
+| `/u/[slug]` | **`force-dynamic` + `no-store`** | Owner sees their own drafts; uncacheable. |
+| `/art/[id]` | **`force-dynamic` + `no-store`** | Private artwork visible only to owner; uncacheable. |
+| `/upload`, `/settings` | **`force-dynamic`** | Auth-gated; uncacheable. |
+
+```ts
+// app/u/[slug]/page.tsx
+export const dynamic = 'force-dynamic';
+export const fetchCache = 'force-no-store';
+
+// app/art/[id]/page.tsx
+export const dynamic = 'force-dynamic';
+export const fetchCache = 'force-no-store';
+```
+
+Additionally, server-side fetches to the Go API must pass `{ cache: 'no-store' }` whenever the response could embed signed private URLs. Cached signed URLs are a double leak: stale auth, served to the wrong viewer.
+
+For the Cloudflare CDN sitting in front of Next.js HTML responses (if applicable):
+- Cache rules must respect `Cache-Control: private` and `Cache-Control: no-store` headers from origin.
+- Never cache responses that carry `Set-Cookie`.
+- For `/cdn-cgi/image/*`, cache key is path only (no cookie); this is correct because images are content-addressed and signed-URL-gated.
+
 ## 8. Privacy & Access Enforcement
 
 ### 8.1 Storage access path
@@ -529,30 +560,64 @@ Five-minute TTL is the trade-off between leakage window (a leaked URL is valid f
 
 ### 8.6 Critical correctness tests
 
-These run on every commit; failure blocks merge. Privacy/security cases live here together with upload-idempotency and publish-lifecycle cases because all three categories have the same property: silent regression destroys data integrity or leaks private content.
+These run on every commit; failure blocks merge. Four test categories below — privacy matrix, HMAC canonicalization, upload idempotency, publish lifecycle, and frontend UX — all share the same property: silent regression leaks private content, corrupts data, or breaks the smooth-gallery promise.
 
-**Privacy / access (cases 1–9):**
+#### 8.6.1 Privacy matrix (all surfaces × viewer types)
 
-1. Anonymous `GET /art/<private_id>` → 404
-2. Anonymous direct `GET cdn.example.com/private/...` (no sig) → 401
-3. Anonymous direct `GET cdn.example.com/private/...` (expired sig) → 401
-4. Anonymous direct `GET cdn.example.com/private/...` (tampered sig) → 401
-5. Owner `GET /art/<own_private>` → 200 with signed URLs
-6. Other-user `GET /art/<someone_elses_private>` → 404
-7. After flipping public→private and CDN purge, the old `/public/...` path 404s
-8. After flipping private→public, the new `/public/...` path 200s
-9. **End-to-end signed-URL round-trip.** Test code calls the Go `PrivateImageURL("private/<id>/0.jpg")`, then issues the *transformed* request the browser will actually make (`GET /cdn-cgi/image/width=800,format=auto,quality=85/private/<id>/0.jpg?sig=...&exp=...`) against a deployed dev Worker, and asserts a 200. This is the only test that catches canonicalization drift between API signing and Worker validation. It must run in CI on every commit that touches either side, against a real Worker (not a JS unit test of the Worker function — that misses Cloudflare's transform-prefix handling).
+The previous spec only tested *direct access* (artwork detail and CDN paths). Private artwork can leak through every list/discovery surface — feed, profile, tag, SSR HTML — and through Next.js's caching layers. This matrix is the canonical authoritative test set.
 
-**Upload idempotency (cases 10–13):**
+**Setup** (used by every row): user **A** owns artwork **P** (public, tagged `t`) and artwork **Q** (private, tagged `t`). User **B** is a different signed-in user. **Anon** is unauthenticated.
 
-10. **Retry with the same `client_image_id` is safe.** POST one image with `client_image_id=K`, position=0. POST it again with the *same* `client_image_id` and *same* position. The second response returns the *same* `artwork_image.id` as the first. `SELECT count(*) FROM artwork_images WHERE artwork_id=A` returns 1, not 2. No new R2 object is written.
-11. **Duplicate position is rejected.** With image at position=0 (`client_image_id=K1`) already inserted, POST a *different* image (`client_image_id=K2`) at position=0. Response is 412 Precondition Failed; DB state unchanged; no R2 object created (or if PUT happened first, it's leaked but invisible to API consumers — that's covered by §11).
-12. **Concurrent uploads do not create duplicate positions.** Spawn N=10 parallel POSTs against the same artwork, each with a unique `client_image_id` and the same position=5. Exactly one returns 200; the other 9 return 412. Final `SELECT count(*) FROM artwork_images WHERE artwork_id=A AND position=5` = 1.
-13. **Failed third image leaves first two valid; user retries the third.** POST 5 files; simulate a server panic on the 3rd file mid-processing. Verify rows for files 0, 1 exist (their per-file transactions committed). Re-POST all 5 files with the same `client_image_id`s. Files 0, 1 return their existing rows (skipped at step 2 of §6.5); files 2, 3, 4 are processed and inserted. Final state = 5 rows, no duplicates.
+| # | Surface | Anonymous | Owner (A) | Other auth (B) |
+|---|---|---|---|---|
+| 1 | `GET /artworks` (public feed JSON) | 200; contains P; **must not** contain Q; **no signed `/private/` URLs in payload** | 200; contains P; **must not** contain Q (this is the public feed even for the owner) | 200; contains P; **must not** contain Q |
+| 2 | `GET /artworks/:id` where `id=Q` | 404 | 200; payload contains signed `/private/` URL with `sig` + `exp` | 404 (not 403; 404 hides existence) |
+| 3 | `GET /artworks/:id` where `id=P` | 200; public CDN URL (no `sig`/`exp`) | 200; public URL | 200; public URL |
+| 4 | `GET /users/:slug` (A's profile JSON) | 200; lists P; **must not** list Q; **no signed `/private/` URLs in payload** | 200; lists P **and** Q; Q's images carry signed URLs | 200; lists P; **must not** list Q |
+| 5 | `GET /tags/:name` where `name=t` | 200; contains P; **must not** contain Q (tag pages are public-only by design) | 200; contains P; **must not** contain Q | 200; contains P; **must not** contain Q |
+| 6 | SSR `/` (home page HTML) | HTML contains no `Q.id`, no `private/`, no `sig=` query string | same | same |
+| 7 | SSR `/u/:slug` (HTML, A's profile) | HTML contains no `Q.id`, no `private/`, no `sig=` | HTML contains `Q.id`, signed `/private/` URLs, `sig=` query strings | HTML contains no `Q.id`, no `private/`, no `sig=` |
+| 8 | SSR `/tag/:name` (HTML) | HTML contains no `Q.id`, no `private/`, no `sig=` | same | same |
+| 9 | SSR `/art/:id` HTML where `id=Q` | renders 404 page; **HTML body must not contain any reference to Q** (no title, no description) | renders 200 page with signed `/private/` URLs | renders 404 page; same scrubbing as anonymous |
+| 10 | CDN `cdn.example.com/public/<key>` (direct GET) | 200; `Cache-Control: public, max-age=31536000, immutable` | 200 | 200 |
+| 11 | CDN `cdn.example.com/private/<key>` (no `sig`) | 401 | 401 (Worker auth is by signed URL, not cookies) | 401 |
+| 12 | CDN `cdn.example.com/private/<key>?sig=valid&exp=future` | 200; `Cache-Control: private, no-store` | 200 | 200 (any holder of a valid signed URL gets through — by design; that's why TTL is 5 min) |
+| 13 | CDN `cdn.example.com/cdn-cgi/image/width=800,format=auto,quality=85/private/<key>?sig=valid&exp=future` (transformed) | 200 | 200 | 200 |
+| 14 | CDN transformed URL with **no** `sig` | 401 | 401 | 401 |
 
-**Publish lifecycle (case 14):**
+**Negative-content assertions** (cases 1, 4, 6, 7, 8, 9 anon/B columns): the test must not just check that Q's row is absent. It must:
 
-14. **`published_at` semantics (option A).** Create artwork with `visibility='private'`; verify `published_at IS NULL`. Verify it does *not* appear in `GET /artworks` (the public feed). Flip to `public`; verify `published_at` is now `~= now()` and appears in the feed. Flip private→public→private→public again; verify `published_at` is unchanged from the first public transition (stable across toggles).
+- Search the JSON/HTML response body for the literal `private/` substring → must not appear.
+- Search for any occurrence of `Q.id` (the artwork's UUID) → must not appear.
+- Search for `sig=` or `exp=` query parameters → must not appear.
+
+This catches subtle leaks like: API forgot to filter Q from the feed → row appears in JSON; or SSR component rendered Q but with `display:none` CSS → still in HTML; or response includes related-artwork links that don't honor visibility.
+
+**Next.js cache regression test** (specific case 7 anon column): after an *owner* request hits `/u/:slug` (which would populate any naïve cache with owner-visible HTML), make an *anonymous* request to the same URL and re-verify the negative-content assertions. This catches the Next.js Data Cache footgun called out in §7.6.
+
+#### 8.6.2 HMAC canonicalization round-trip (case 15)
+
+15. **End-to-end signed-URL round-trip.** Test code calls the Go `PrivateImageURL("private/<id>/0.jpg")`, then issues the *transformed* request the browser will actually make (`GET /cdn-cgi/image/width=800,format=auto,quality=85/private/<id>/0.jpg?sig=...&exp=...`) against a deployed dev Worker, and asserts a 200. The only test that catches canonicalization drift between API signing and Worker validation. Runs in CI on every commit that touches either side, against a real Worker.
+
+#### 8.6.3 Upload idempotency (cases 16–19)
+
+16. **Retry with the same `client_image_id` is safe.** POST one image with `client_image_id=K`, position=0. POST again with the *same* `client_image_id` and *same* position. Second response returns the *same* `artwork_image.id` as the first. `SELECT count(*) FROM artwork_images WHERE artwork_id=A` returns 1, not 2.
+17. **Duplicate position is rejected.** With image at position=0 (`client_image_id=K1`) already inserted, POST a *different* image (`client_image_id=K2`) at position=0. Response is 412 Precondition Failed; DB state unchanged.
+18. **Concurrent uploads do not create duplicate positions.** Spawn N=10 parallel POSTs against the same artwork, each with a unique `client_image_id` and the same position=5. Exactly one returns 200; the other 9 return 412. `SELECT count(*) FROM artwork_images WHERE artwork_id=A AND position=5` = 1.
+19. **Failed third image leaves first two valid; user retries the third.** POST 5 files; simulate a server panic on the 3rd file mid-processing. Verify rows for files 0, 1 exist (their per-file transactions committed). Re-POST all 5 files with the same `client_image_id`s. Files 0, 1 return their existing rows; files 2, 3, 4 are processed and inserted. Final state = 5 rows, no duplicates.
+
+#### 8.6.4 Publish lifecycle (case 20)
+
+20. **`published_at` semantics (option A).** Create artwork with `visibility='private'`; verify `published_at IS NULL` and the artwork does *not* appear in `GET /artworks`. Flip to `public`; verify `published_at` is now `~= now()` and the artwork appears in the feed. Flip private→public→private→public again; verify `published_at` is unchanged from the first public transition.
+
+#### 8.6.5 Frontend UX correctness (cases 21–24)
+
+These run as Playwright E2E tests against a docker-compose'd full stack on every commit.
+
+21. **Infinite scroll does not duplicate items.** Load `/`, scroll to trigger 5 page fetches (~120 items). Collect all rendered `data-artwork-id` attributes; assert each appears exactly once. Catches cursor-pagination off-by-one bugs and React-key collision bugs.
+22. **Masonry reserves dimensions; no layout jump.** Load `/` with network throttled to "Slow 3G." Take a screenshot at 0ms (placeholders only) and at 5000ms (images loaded). Assert the bounding boxes of all visible cards have not moved (Cumulative Layout Shift < 0.05 over the load). Catches missing `width`/`height` on `next/image` and broken aspect-ratio reservation.
+23. **Lazy loading only requests images near the viewport.** Load `/` with network logging. Initially, only images within the first 2 viewport heights should have requested image bytes (look for `/cdn-cgi/image/...` requests). Scroll down 3 viewport heights; verify additional image requests now appear. Catches accidental `loading="eager"` or broken intersection-observer.
+24. **Flip private + incognito = disappearance.** Owner signs in, posts artwork P (public). Verify P appears at `/u/<slug>` in an incognito window. Owner flips P to private. Within ~30s (allowing CDN purge), reload the incognito window and assert P no longer appears at `/u/<slug>`, `/`, `/tag/<name>`, or `/art/<id>` (the last must show the 404 page with no leaked metadata).
 
 ## 9. Testing Strategy
 
@@ -565,7 +630,7 @@ These run on every commit; failure blocks merge. Privacy/security cases live her
 | HTTP handlers | Routing, auth middleware, status codes, error mapping | `httptest` against the full chain with real DB |
 | Auth | OAuth callback, JWT issue/verify, cookie attributes | Mock Google's token endpoint; everything else real |
 | Storage impls | `localfs.Store` and `r2.Store` | Real filesystem for localfs; testcontainers MinIO for r2 |
-| Critical correctness | All 14 cases in §8.6 (privacy, upload idempotency, publish lifecycle) | Dedicated test files: `internal/artwork/privacy_test.go`, `internal/image/upload_idempotency_test.go`, `internal/artwork/publish_lifecycle_test.go` |
+| Critical correctness | All 24 cases in §8.6 (privacy matrix 14, HMAC round-trip 1, upload idempotency 4, publish lifecycle 1, frontend UX 4) | Privacy matrix: `internal/artwork/privacy_matrix_test.go` (Go) + `e2e/privacy_html.spec.ts` (Playwright). Upload: `internal/image/upload_idempotency_test.go`. Publish: `internal/artwork/publish_lifecycle_test.go`. Frontend UX: `e2e/ux.spec.ts`. |
 
 **Rule:** integration tests use real Postgres, never a mock. (Mocked DB tests pass while the real migration breaks — burned by this before.)
 
@@ -590,6 +655,7 @@ Don't write tests at all three layers for the same code — pick the right level
 ## 11. Risks & Open Questions
 
 - **Cloudflare Worker maintenance burden**: it's a small piece of infra outside the main repos. Mitigation: keep it under 50 lines, test against a deployed dev Worker as part of E2E.
+- **Next.js caching is a privacy footgun**: the framework's defaults (static rendering at build time, the Data Cache for fetches) mean a single missing `dynamic = 'force-dynamic'` directive on `/u/:slug` or `/art/:id` will serve cached owner-visible HTML to anonymous viewers. Mitigation: cache-control rules in §7.6 are mandatory, and §8.6 case 7-anon includes a regression test that requests as owner first, then anonymous, to catch this leak class.
 - **CDN cache purge latency on privacy flips**: Cloudflare cache purges are fast (<30s) but not instant. A user flipping public→private could see the old cached image for up to that window via the public URL. Documented behavior; acceptable for v1.
 - **Orphaned R2 objects from partial upload failures**: if `storage.Put` succeeds but the `INSERT` fails (e.g., concurrent retry already inserted, or a transaction rollback), the bytes sit in R2 with no row pointing at them. They're invisible to API consumers (no signed URL, no `/public/` reference) so privacy is preserved, but they consume storage forever. Mitigation: a periodic GC sweeper job (deferred to v2) walks R2 keys and deletes any whose `<artwork_id>/<image_id>` doesn't match a row in `artwork_images`. At v1 scale this leak is bounded and cheap; not blocking ship.
 - **No backpressure on uploads**: a malicious user could upload 1000 25MB images. Mitigation v1: rate-limit uploads per user (10/min). Storage cost cap not in scope.
@@ -603,5 +669,5 @@ A v1 implementation is complete when:
 - A new visitor can land on `example.com`, browse the masonry feed without signing in, click any artwork, and see all images at full display resolution (image transform serves the largest reasonable width for the viewport, e.g. up to `width=2400`, AVIF/WebP, quality=85; the original bytes are kept in R2 but not exposed) with the artist name and date.
 - An artist can sign in with Google, upload a multi-image artwork with title/description/tags, see it appear on the feed and on their profile.
 - The artist can flip an artwork to private; it disappears from the feed and from their public profile (when viewed in an incognito tab) but remains visible in their authenticated view.
-- All 14 critical correctness tests in §8.6 pass (privacy, upload idempotency, publish lifecycle).
+- All 24 critical correctness tests in §8.6 pass (privacy matrix across all surfaces and viewer types, HMAC canonicalization round-trip, upload idempotency, publish lifecycle, frontend UX).
 - Lighthouse score on the home feed ≥ 90 for Performance with 50 images on screen on a throttled 4G connection.
