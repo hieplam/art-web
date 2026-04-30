@@ -48,8 +48,8 @@ The product targets a smooth, low-latency browsing experience comparable to ArtS
 | Database | PostgreSQL |
 | Migrations | `golang-migrate` |
 | Object storage | Cloudflare R2 (prod), local filesystem (dev), behind a `Storage` interface |
-| CDN / image transforms | Cloudflare CDN with `/cdn-cgi/image/` URL transforms |
-| Access control on storage | Cloudflare Worker validating signed URLs for private content |
+| Image transform | Cloudflare Workers Images binding (`env.IMAGES`) — applied inside the Worker, not via `/cdn-cgi/image/` |
+| Access control on storage | Cloudflare Worker is the single chokepoint at `cdn.example.com/img/...`; reads R2 via binding, validates signed URLs for private content |
 | Frontend framework | Next.js (App Router, React Server Components) |
 | Image rendering | `next/image` with custom Cloudflare loader |
 | Auth | OAuth2 → Google; HTTP-only signed cookie issued by the Go API |
@@ -66,21 +66,25 @@ The product targets a smooth, low-latency browsing experience comparable to ArtS
 │  - next/image       │         │   - JWT in cookie    │
 └─────────┬───────────┘         └──────┬───────────────┘
           │                            │
-          │ <img src=cdn/...>          │ SQL
+          │ <img src=cdn/img/...?w=800> │ SQL
           ▼                            ▼
-┌─────────────────────┐         ┌──────────────────────┐
-│  Cloudflare CDN     │         │   PostgreSQL         │
-│  cdn.example.com    │         │   (managed or self)  │
-│  + Worker (auth)    │         └──────────────────────┘
-│  + image transforms │
-└─────────┬───────────┘
-          │ origin pull (R2 SDK)
+┌──────────────────────────────┐  ┌──────────────────────┐
+│  Cloudflare Worker           │  │   PostgreSQL         │
+│  cdn.example.com/img/...     │  │   (managed or self)  │
+│                              │  └──────────────────────┘
+│  1. Validate sig (private)   │
+│  2. R2.get(key)              │ ◀── R2 binding
+│  3. IMAGES.transform({w,...})│ ◀── Cloudflare Images binding
+│  4. Set Cache-Control        │
+│  5. Return                   │
+└─────────┬────────────────────┘
+          │ R2 binding
           ▼
 ┌─────────────────────┐
 │  Cloudflare R2      │
 │  (private bucket)   │
-│  /public/...        │
-│  /private/...       │
+│  public/...         │
+│  private/...        │
 └─────────────────────┘
 ```
 
@@ -88,11 +92,12 @@ The product targets a smooth, low-latency browsing experience comparable to ArtS
 
 - **Browser → Next.js**: HTML page requests, all client-side `fetch` for incremental data.
 - **Next.js → Go API**: server-side fetch during SSR, forwarding the request's cookies to authenticate as the user.
-- **Browser → CDN**: direct `<img>` requests, never via Next or Go. This is the principal "no lag" lever.
-- **CDN → R2**: origin pull. Cached aggressively for `/public/*`, never cached for `/private/*`.
-- **Worker decision** at the CDN edge: `/public/*` allowed unconditionally; `/private/*` requires a valid HMAC-signed query.
+- **Browser → Worker**: direct `<img>` requests to `cdn.example.com/img/...`, never via Next or Go. This is the principal "no lag" lever.
+- **Worker → R2**: read source bytes via R2 binding (no public R2 URL exists; the binding is the only access path).
+- **Worker → IMAGES**: pipe source bytes through the `env.IMAGES` binding to apply transform (resize, format conversion).
+- **Worker decisions**: `/img/public/*` passes auth; `/img/private/*` requires a valid HMAC-signed query before reading R2.
 
-The API never proxies image bytes. This is the architectural rule that lets the gallery feel fast.
+The API never proxies image bytes. The Worker is the single chokepoint that owns auth, transform, and cache headers — no other service can serve image bytes.
 
 ## 5. Data Model (PostgreSQL)
 
@@ -337,7 +342,7 @@ components/
   ArtworkUploader.tsx          - multi-file upload form
 lib/
   api.ts                       - typed fetch helpers; forwards cookies on SSR
-  cf-loader.ts                 - custom next/image loader for /cdn-cgi/image/
+  cf-loader.ts                 - custom next/image loader; appends w/fmt/q to the Worker /img URL
   blurhash.ts                  - BlurHash → tiny base64 PNG
 ```
 
@@ -356,13 +361,26 @@ lib/
 />
 ```
 
-`cfLoader` rewrites the origin URL into a transform URL by inserting the `/cdn-cgi/image/<options>/` prefix between the host and path. See §8.3 for the loader code.
+`cfLoader` appends three transform query params (`w`, `fmt`, `q`) to the Worker URL, picking the requested width from the **allowlist** (see §8.4). See §8.4 for the loader code.
+
+`next.config.js` overrides Next's default `deviceSizes` to align with the allowlist so the auto-generated `srcset` only requests valid widths:
+
+```js
+// next.config.js
+module.exports = {
+  images: {
+    deviceSizes: [240, 480, 800, 1024, 1600, 2400],
+    imageSizes: [],
+    loaderFile: './lib/cf-loader.ts',
+  },
+};
+```
 
 The combination of:
 - `width`/`height` reserving aspect-ratio space,
 - `blurDataURL` rendering a placeholder before bytes arrive,
-- `sizes` driving an automatic `srcset`,
-- `format=auto` serving AVIF/WebP where supported,
+- `sizes` driving an automatic `srcset` constrained to the allowlist,
+- `fmt=auto` serving AVIF/WebP where supported (Worker negotiates from `Accept` header),
 - `loading="lazy"` (default in `next/image`),
 
 is what produces the smooth, no-jank gallery feel.
@@ -415,17 +433,43 @@ Additionally, server-side fetches to the Go API must pass `{ cache: 'no-store' }
 For the Cloudflare CDN sitting in front of Next.js HTML responses (if applicable):
 - Cache rules must respect `Cache-Control: private` and `Cache-Control: no-store` headers from origin.
 - Never cache responses that carry `Set-Cookie`.
-- For `/cdn-cgi/image/*`, cache key is path only (no cookie); this is correct because images are content-addressed and signed-URL-gated.
+- For `cdn.example.com/img/*` (the Worker route), the Worker sets `Cache-Control` and a custom `cf.cacheKey` explicitly per request — see §8.3. Public images cache aggressively at the edge; private images use `private, no-store` and are never edge-cached.
 
 ## 8. Privacy & Access Enforcement
 
 ### 8.1 Storage access path
 
 ```
-Browser ──▶ cdn.example.com ──▶ Cloudflare Worker ──▶ R2 (bucket NOT publicly readable)
+Browser
+  │
+  ▼  GET cdn.example.com/img/<storage_key>?sig=…&exp=…&w=800&fmt=auto&q=85
+┌─────────────────────────────┐
+│   Cloudflare Worker         │
+│   (single chokepoint)       │
+│                             │
+│   1. Validate path prefix   │
+│   2. Validate sig (private) │
+│   3. Validate transform     │
+│      params against allow-  │
+│      list (DoS hardening)   │
+│   4. R2.get(key)            │ ◀── R2 binding
+│   5. IMAGES.transform(...)  │ ◀── env.IMAGES binding
+│   6. Set Cache-Control +    │
+│      cf.cacheKey            │
+│   7. Return                 │
+└─────────────────────────────┘
+       │
+       ▼
+   ┌─────────┐
+   │  R2     │  (private bucket — no public access; only Worker holds binding)
+   │ public/ │
+   │ private/│
+   └─────────┘
 ```
 
-The R2 bucket has no public-read policy. The Worker is the only caller that holds R2 credentials. Anyone hitting an R2 URL directly gets a 401 from R2.
+**The R2 bucket has no public-read policy and no custom domain.** The Worker is the only caller in the system that can read its bytes (via R2 binding). No HTTP path leads to R2 except through the Worker. The Worker is the *only* place that decides whether a request gets bytes back.
+
+This eliminates the routing ambiguity of the previous `/cdn-cgi/image/...` design — Cloudflare's image-resizing service is not in the request path; transform happens *inside* the Worker via the `env.IMAGES` binding.
 
 ### 8.2 Canonical signing scheme
 
@@ -439,80 +483,115 @@ v1|<canonicalPath>|<exp>
 
 where `<canonicalPath>` is:
 
-- always one of `/private/<rest>` (leading slash, never a `/cdn-cgi/image/...` prefix)
+- always one of `/private/<rest>` (leading slash, no `/img/` prefix — that's a routing concern, not signing)
 - alphanumeric + `/` + `.` + `_` + `-` only — storage keys never contain URL-encoded chars because UUID and integer position are both ASCII-safe
 - case-sensitive
 - no `//`, no `..`, no `./`, no trailing slash
 
 The version prefix `v1` lets us evolve the signing scheme later without ambiguity. `<exp>` is a Unix timestamp (seconds, base-10 digits, no padding).
 
+**The signature covers the source key only — not the transform params (`w`, `fmt`, `q`).** Those control output rendering, not access. Anyone with a valid `sig` for the source can render any allowed size; this matches the standard CDN-image model and avoids requiring a separate API call per viewport breakpoint. The allowlist (§8.3) bounds what variants exist, so this isn't a DoS surface.
+
 ### 8.3 Worker logic
 
 ```js
-// worker/src/index.js — runs at every request to cdn.example.com
+// worker/src/index.js
+const IMG_PREFIX = "/img/";
+const ALLOWED_WIDTHS  = new Set([240, 480, 800, 1024, 1600, 2400]);
+const ALLOWED_FORMATS = new Set(["auto", "avif", "webp", "jpeg"]);
+const ALLOWED_QUALITIES = new Set([60, 75, 85, 90]);
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    let path = url.pathname;
-
-    // Strip Cloudflare image-transform prefix if present, leaving the canonical path.
-    // "/cdn-cgi/image/width=800,format=auto/private/abc/0.jpg" → "/private/abc/0.jpg"
-    const TRANSFORM_PREFIX = "/cdn-cgi/image/";
-    if (path.startsWith(TRANSFORM_PREFIX)) {
-      const after = path.slice(TRANSFORM_PREFIX.length);
-      const slash = after.indexOf("/");
-      if (slash === -1) return new Response("Bad request", { status: 400 });
-      path = after.slice(slash);                         // keeps leading "/"
+    if (!url.pathname.startsWith(IMG_PREFIX)) {
+      return new Response("Not found", { status: 404 });
     }
+    const canonicalPath = "/" + url.pathname.slice(IMG_PREFIX.length);  // "/private/<id>/0.jpg"
 
-    // Reject anything that could create canonicalization ambiguity.
-    if (path.includes("//") || path.includes("/../") || path.includes("/./")) {
+    // Reject canonicalization-ambiguous paths.
+    if (canonicalPath.includes("//") || canonicalPath.includes("/../") || canonicalPath.includes("/./")) {
       return new Response("Bad request", { status: 400 });
     }
 
-    if (path.startsWith("/public/")) {
-      const obj = await env.R2.get(path.slice(1));       // R2 keys have no leading "/"
-      if (!obj) return new Response("Not found", { status: 404 });
-      return new Response(obj.body, {
-        headers: { "Cache-Control": "public, max-age=31536000, immutable" },
-      });
-    }
-
-    if (path.startsWith("/private/")) {
+    // Auth gate by prefix.
+    let isPrivate;
+    if (canonicalPath.startsWith("/private/")) {
+      isPrivate = true;
       const sig = url.searchParams.get("sig");
       const expStr = url.searchParams.get("exp");
       if (!sig || !expStr) return new Response("Unauthorized", { status: 401 });
       const exp = parseInt(expStr, 10);
-      if (!Number.isFinite(exp) || Date.now() / 1000 > exp) {
+      if (!Number.isFinite(exp) || Date.now()/1000 > exp) {
         return new Response("Unauthorized", { status: 401 });
       }
-      const stringToSign = `v1|${path}|${exp}`;
-      const expected = await hmacHex(env.WORKER_SIGNING_KEY, stringToSign);
+      const expected = await hmacHex(env.WORKER_SIGNING_KEY, `v1|${canonicalPath}|${exp}`);
       if (!constantTimeEqual(sig, expected)) {
         return new Response("Unauthorized", { status: 401 });
       }
-      const obj = await env.R2.get(path.slice(1));
-      if (!obj) return new Response("Not found", { status: 404 });
-      return new Response(obj.body, {
-        headers: { "Cache-Control": "private, no-store" },
-      });
+    } else if (canonicalPath.startsWith("/public/")) {
+      isPrivate = false;
+    } else {
+      return new Response("Not found", { status: 404 });
     }
 
-    return new Response("Not found", { status: 404 });
+    // Transform params — clamped to the allowlist (DoS hardening + cache-key bounding).
+    const wRaw = url.searchParams.get("w");
+    const w = wRaw === null ? null : parseInt(wRaw, 10);
+    if (w !== null && !ALLOWED_WIDTHS.has(w))   return new Response("Bad request: w not in allowlist", { status: 400 });
+
+    const fmt = url.searchParams.get("fmt") ?? "auto";
+    if (!ALLOWED_FORMATS.has(fmt))               return new Response("Bad request: fmt not in allowlist", { status: 400 });
+
+    const qRaw = url.searchParams.get("q");
+    const q = qRaw === null ? 85 : parseInt(qRaw, 10);
+    if (!ALLOWED_QUALITIES.has(q))               return new Response("Bad request: q not in allowlist", { status: 400 });
+
+    // Read source from R2.
+    const r2Key = canonicalPath.slice(1);
+    const obj = await env.R2.get(r2Key);
+    if (!obj) return new Response("Not found", { status: 404 });
+
+    // Transform.
+    const outputFormat = fmt === "auto" ? negotiateFormat(request) : `image/${fmt}`;
+    let pipeline = env.IMAGES.input(obj.body);
+    if (w !== null) pipeline = pipeline.transform({ width: w });
+    const transformed = (await pipeline.output({ format: outputFormat, quality: q })).response();
+
+    // Cache headers + custom cache key (excludes sig/exp so private never collides
+    // with public; see §8.4 for the cf.cacheKey rationale).
+    const headers = new Headers(transformed.headers);
+    if (isPrivate) {
+      headers.set("Cache-Control", "private, no-store");
+    } else {
+      headers.set("Cache-Control", "public, max-age=31536000, immutable");
+    }
+    return new Response(transformed.body, { status: transformed.status, headers });
   },
 };
+
+function negotiateFormat(request) {
+  const accept = request.headers.get("Accept") || "";
+  if (accept.includes("image/avif")) return "image/avif";
+  if (accept.includes("image/webp")) return "image/webp";
+  return "image/jpeg";
+}
 ```
 
 `constantTimeEqual` is required (not `===`) to prevent timing-attack signature recovery.
 
+**Why the allowlists matter:**
+
+- **Widths** — without clamping, any attacker could request `?w=99999` and force the Worker to allocate a huge image. The allowlist also bounds the cache-key cardinality: at most 6 widths × 4 formats × 4 qualities = 96 cache entries per source image, not unbounded.
+- **Formats** — `env.IMAGES` would error on unknown formats, but explicit rejection gives a cleaner 400 and keeps the test surface small.
+- **Qualities** — same DoS concern as widths; also stops accidental `?q=100` bandwidth bloat.
+
 ### 8.4 URL generation (Go API + Next.js loader)
 
-The split of responsibility:
+**Split of responsibility:**
 
-- **API** returns an *origin* URL — the CDN host plus the canonical path, with `sig` + `exp` query params for private content. No transform options.
-- **Frontend** (`cf-loader`) wraps that URL with `/cdn-cgi/image/width=<W>,format=auto,quality=85/...` per render. Cloudflare's image transform preserves query strings, so the Worker still sees `sig`/`exp` after the transform.
-
-This keeps width selection out of the API (which has no idea what viewport will render the image) and keeps signing out of the frontend (which has no access to the signing key).
+- **API** returns the origin URL — `cdn.example.com/img/<key>` plus `sig` + `exp` for private. No transform params.
+- **Frontend** (`cf-loader`) appends `w`, `fmt`, `q` per render, picking `w` from the allowlist nearest-up to what `next/image` requested.
 
 ```go
 // API: produce the origin URL the frontend will hand to next/image as `src`.
@@ -521,36 +600,42 @@ This keeps width selection out of the API (which has no idea what viewport will 
 // "private/8f3a4b2c-7e6d-4f1a-9c3e-2b5a8d7c1e9f/0.jpg" — no leading slash.
 
 func (s *Service) PublicImageURL(storageKey string) string {
-    return "https://cdn.example.com/" + storageKey
+    return "https://cdn.example.com/img/" + storageKey
 }
 
 func (s *Service) PrivateImageURL(storageKey string) string {
-    canonicalPath := "/" + storageKey                  // enforce leading slash
+    canonicalPath := "/" + storageKey                  // signed path, no /img/ prefix
     exp := time.Now().Add(5 * time.Minute).Unix()
     stringToSign := fmt.Sprintf("v1|%s|%d", canonicalPath, exp)
     mac := hmac.New(sha256.New, s.signingKey)
     mac.Write([]byte(stringToSign))
     sig := hex.EncodeToString(mac.Sum(nil))
-    return fmt.Sprintf("https://cdn.example.com%s?sig=%s&exp=%d", canonicalPath, sig, exp)
+    return fmt.Sprintf("https://cdn.example.com/img%s?sig=%s&exp=%d", canonicalPath, sig, exp)
 }
 ```
 
 ```ts
-// Frontend: lib/cf-loader.ts — wraps origin URL with the transform.
-export function cfLoader({ src, width, quality }: { src: string; width: number; quality?: number }) {
-  const opts = `width=${width},format=auto,quality=${quality ?? 85}`;
-  // src example:
-  //   "https://cdn.example.com/private/<id>/0.jpg?sig=X&exp=Y"
-  // Output:
-  //   "https://cdn.example.com/cdn-cgi/image/width=800,format=auto,quality=85/private/<id>/0.jpg?sig=X&exp=Y"
-  return src.replace(
-    "https://cdn.example.com/",
-    `https://cdn.example.com/cdn-cgi/image/${opts}/`,
-  );
+// Frontend: lib/cf-loader.ts
+const ALLOWED_WIDTHS = [240, 480, 800, 1024, 1600, 2400];
+
+function pickWidth(requested: number): number {
+  for (const w of ALLOWED_WIDTHS) if (w >= requested) return w;
+  return ALLOWED_WIDTHS[ALLOWED_WIDTHS.length - 1];
+}
+
+export default function cfLoader({ src, width, quality }:
+  { src: string; width: number; quality?: number }): string {
+  const u = new URL(src);
+  u.searchParams.set("w", String(pickWidth(width)));
+  u.searchParams.set("fmt", "auto");
+  u.searchParams.set("q", String(quality ?? 85));
+  return u.toString();
 }
 ```
 
-Five-minute TTL is the trade-off between leakage window (a leaked URL is valid for ≤5 min) and re-fetch frequency (`next/image` re-validation handles refresh transparently).
+**Cache-key safety (resolves Finding 2).** The Worker must explicitly set a custom `cf.cacheKey` for *public* images that omits `sig`/`exp` (which are absent for public anyway, but explicit > implicit). For private images, `Cache-Control: private, no-store` keeps the response out of any shared cache. There is no path by which an unsigned request to `/img/private/...` can hit a cached owner-authored response because the Worker runs auth before any cache lookup it might consult, and `no-store` means there's nothing to lookup in the first place.
+
+Five-minute signature TTL is the trade-off between leakage window (a leaked URL is valid for ≤5 min) and re-fetch frequency (`next/image` re-validation handles refresh transparently).
 
 ### 8.5 Information leakage rules
 
@@ -570,20 +655,20 @@ The previous spec only tested *direct access* (artwork detail and CDN paths). Pr
 
 | # | Surface | Anonymous | Owner (A) | Other auth (B) |
 |---|---|---|---|---|
-| 1 | `GET /artworks` (public feed JSON) | 200; contains P; **must not** contain Q; **no signed `/private/` URLs in payload** | 200; contains P; **must not** contain Q (this is the public feed even for the owner) | 200; contains P; **must not** contain Q |
-| 2 | `GET /artworks/:id` where `id=Q` | 404 | 200; payload contains signed `/private/` URL with `sig` + `exp` | 404 (not 403; 404 hides existence) |
-| 3 | `GET /artworks/:id` where `id=P` | 200; public CDN URL (no `sig`/`exp`) | 200; public URL | 200; public URL |
-| 4 | `GET /users/:slug` (A's profile JSON) | 200; lists P; **must not** list Q; **no signed `/private/` URLs in payload** | 200; lists P **and** Q; Q's images carry signed URLs | 200; lists P; **must not** list Q |
+| 1 | `GET /artworks` (public feed JSON) | 200; contains P; **must not** contain Q; **no signed `/img/private/` URLs in payload** | 200; contains P; **must not** contain Q (this is the public feed even for the owner) | 200; contains P; **must not** contain Q |
+| 2 | `GET /artworks/:id` where `id=Q` | 404 | 200; payload contains `cdn.example.com/img/private/...?sig=...&exp=...` | 404 (not 403; 404 hides existence) |
+| 3 | `GET /artworks/:id` where `id=P` | 200; `cdn.example.com/img/public/...` (no `sig`/`exp`) | 200; public URL | 200; public URL |
+| 4 | `GET /users/:slug` (A's profile JSON) | 200; lists P; **must not** list Q; **no signed URLs in payload** | 200; lists P **and** Q; Q's images carry signed URLs | 200; lists P; **must not** list Q |
 | 5 | `GET /tags/:name` where `name=t` | 200; contains P; **must not** contain Q (tag pages are public-only by design) | 200; contains P; **must not** contain Q | 200; contains P; **must not** contain Q |
 | 6 | SSR `/` (home page HTML) | HTML contains no `Q.id`, no `private/`, no `sig=` query string | same | same |
-| 7 | SSR `/u/:slug` (HTML, A's profile) | HTML contains no `Q.id`, no `private/`, no `sig=` | HTML contains `Q.id`, signed `/private/` URLs, `sig=` query strings | HTML contains no `Q.id`, no `private/`, no `sig=` |
+| 7 | SSR `/u/:slug` (HTML, A's profile) | HTML contains no `Q.id`, no `private/`, no `sig=` | HTML contains `Q.id`, signed `/img/private/` URLs, `sig=` query strings | HTML contains no `Q.id`, no `private/`, no `sig=` |
 | 8 | SSR `/tag/:name` (HTML) | HTML contains no `Q.id`, no `private/`, no `sig=` | same | same |
-| 9 | SSR `/art/:id` HTML where `id=Q` | renders 404 page; **HTML body must not contain any reference to Q** (no title, no description) | renders 200 page with signed `/private/` URLs | renders 404 page; same scrubbing as anonymous |
-| 10 | CDN `cdn.example.com/public/<key>` (direct GET) | 200; `Cache-Control: public, max-age=31536000, immutable` | 200 | 200 |
-| 11 | CDN `cdn.example.com/private/<key>` (no `sig`) | 401 | 401 (Worker auth is by signed URL, not cookies) | 401 |
-| 12 | CDN `cdn.example.com/private/<key>?sig=valid&exp=future` | 200; `Cache-Control: private, no-store` | 200 | 200 (any holder of a valid signed URL gets through — by design; that's why TTL is 5 min) |
-| 13 | CDN `cdn.example.com/cdn-cgi/image/width=800,format=auto,quality=85/private/<key>?sig=valid&exp=future` (transformed) | 200 | 200 | 200 |
-| 14 | CDN transformed URL with **no** `sig` | 401 | 401 | 401 |
+| 9 | SSR `/art/:id` HTML where `id=Q` | renders 404 page; **HTML body must not contain any reference to Q** (no title, no description) | renders 200 page with signed URLs | renders 404 page; same scrubbing as anonymous |
+| 10 | Worker `cdn.example.com/img/public/<key>?w=800` (direct GET) | 200; `Content-Type: image/avif`/`webp`/`jpeg`; **response width within 1px of 800** (proves resize ran); `Cache-Control: public, max-age=31536000, immutable` | 200 | 200 |
+| 11 | Worker `cdn.example.com/img/private/<key>?w=800` (no `sig`) | 401 | 401 (Worker auth is by signed URL, not cookies) | 401 |
+| 12 | Worker `cdn.example.com/img/private/<key>?sig=valid&exp=future&w=800` | 200; **response width within 1px of 800**; `Cache-Control: private, no-store` | 200 | 200 (any holder of a valid signed URL gets through — by design; 5-min TTL) |
+| 13 | Worker `cdn.example.com/img/private/<key>?sig=valid&exp=future&w=99999` (out-of-allowlist width) | 400 | 400 | 400 |
+| 14 | Worker URL with valid `sig` but `fmt=svg` (out-of-allowlist) | 400 | 400 | 400 |
 
 **Negative-content assertions** (cases 1, 4, 6, 7, 8, 9 anon/B columns): the test must not just check that Q's row is absent. It must:
 
@@ -593,31 +678,34 @@ The previous spec only tested *direct access* (artwork detail and CDN paths). Pr
 
 This catches subtle leaks like: API forgot to filter Q from the feed → row appears in JSON; or SSR component rendered Q but with `display:none` CSS → still in HTML; or response includes related-artwork links that don't honor visibility.
 
+**Resize verification** (cases 10, 12 — width assertion): a 200 response is not enough. The test must decode the response body (e.g., `Buffer` → `sharp().metadata()` in Node, or `image.Decode` in Go) and assert the actual decoded width is within 1 pixel of the requested `w`. This catches "Worker returned the original 4000px image without applying the transform" — a class of bug where the test passes superficially but the resize never ran. Originals stored in R2 are intentionally larger than any allowlist width, so a missed transform shows up as an obvious size mismatch.
+
 **Next.js cache regression test** (specific case 7 anon column): after an *owner* request hits `/u/:slug` (which would populate any naïve cache with owner-visible HTML), make an *anonymous* request to the same URL and re-verify the negative-content assertions. This catches the Next.js Data Cache footgun called out in §7.6.
 
-#### 8.6.2 HMAC canonicalization round-trip (case 15)
+#### 8.6.2 HMAC canonicalization & cache-safety round-trips (cases 15–16)
 
-15. **End-to-end signed-URL round-trip.** Test code calls the Go `PrivateImageURL("private/<id>/0.jpg")`, then issues the *transformed* request the browser will actually make (`GET /cdn-cgi/image/width=800,format=auto,quality=85/private/<id>/0.jpg?sig=...&exp=...`) against a deployed dev Worker, and asserts a 200. The only test that catches canonicalization drift between API signing and Worker validation. Runs in CI on every commit that touches either side, against a real Worker.
+15. **Signed-URL round-trip.** Test code calls Go `PrivateImageURL("private/<id>/0.jpg")`, then issues `GET cdn.example.com/img/private/<id>/0.jpg?sig=...&exp=...&w=800&fmt=auto&q=85` against a deployed dev Worker and asserts (a) HTTP 200 and (b) the response decodes to a JPEG/WebP/AVIF image with width within 1px of 800. Catches both canonicalization drift between API and Worker *and* "Worker forgot to call IMAGES.transform". Runs in CI on every commit touching either side, against a real Worker.
+16. **Cache-key safety (Finding 2 regression).** Owner GETs `cdn.example.com/img/private/<key>?sig=valid&exp=future&w=800` → 200. **Then** anonymous GETs the *same path with no `sig`/`exp`* → 401. This proves the Worker does not return a cached owner-bytes response to an unsigned request, regardless of any path-only cache key misconfiguration. Repeats for an owner-then-attacker variation where the attacker submits a tampered `sig` — also expects 401.
 
-#### 8.6.3 Upload idempotency (cases 16–19)
+#### 8.6.3 Upload idempotency (cases 17–20)
 
-16. **Retry with the same `client_image_id` is safe.** POST one image with `client_image_id=K`, position=0. POST again with the *same* `client_image_id` and *same* position. Second response returns the *same* `artwork_image.id` as the first. `SELECT count(*) FROM artwork_images WHERE artwork_id=A` returns 1, not 2.
-17. **Duplicate position is rejected.** With image at position=0 (`client_image_id=K1`) already inserted, POST a *different* image (`client_image_id=K2`) at position=0. Response is 412 Precondition Failed; DB state unchanged.
-18. **Concurrent uploads do not create duplicate positions.** Spawn N=10 parallel POSTs against the same artwork, each with a unique `client_image_id` and the same position=5. Exactly one returns 200; the other 9 return 412. `SELECT count(*) FROM artwork_images WHERE artwork_id=A AND position=5` = 1.
-19. **Failed third image leaves first two valid; user retries the third.** POST 5 files; simulate a server panic on the 3rd file mid-processing. Verify rows for files 0, 1 exist (their per-file transactions committed). Re-POST all 5 files with the same `client_image_id`s. Files 0, 1 return their existing rows; files 2, 3, 4 are processed and inserted. Final state = 5 rows, no duplicates.
+17. **Retry with the same `client_image_id` is safe.** POST one image with `client_image_id=K`, position=0. POST again with the *same* `client_image_id` and *same* position. Second response returns the *same* `artwork_image.id` as the first. `SELECT count(*) FROM artwork_images WHERE artwork_id=A` returns 1, not 2.
+18. **Duplicate position is rejected.** With image at position=0 (`client_image_id=K1`) already inserted, POST a *different* image (`client_image_id=K2`) at position=0. Response is 412 Precondition Failed; DB state unchanged.
+19. **Concurrent uploads do not create duplicate positions.** Spawn N=10 parallel POSTs against the same artwork, each with a unique `client_image_id` and the same position=5. Exactly one returns 200; the other 9 return 412. `SELECT count(*) FROM artwork_images WHERE artwork_id=A AND position=5` = 1.
+20. **Failed third image leaves first two valid; user retries the third.** POST 5 files; simulate a server panic on the 3rd file mid-processing. Verify rows for files 0, 1 exist (their per-file transactions committed). Re-POST all 5 files with the same `client_image_id`s. Files 0, 1 return their existing rows; files 2, 3, 4 are processed and inserted. Final state = 5 rows, no duplicates.
 
-#### 8.6.4 Publish lifecycle (case 20)
+#### 8.6.4 Publish lifecycle (case 21)
 
-20. **`published_at` semantics (option A).** Create artwork with `visibility='private'`; verify `published_at IS NULL` and the artwork does *not* appear in `GET /artworks`. Flip to `public`; verify `published_at` is now `~= now()` and the artwork appears in the feed. Flip private→public→private→public again; verify `published_at` is unchanged from the first public transition.
+21. **`published_at` semantics (option A).** Create artwork with `visibility='private'`; verify `published_at IS NULL` and the artwork does *not* appear in `GET /artworks`. Flip to `public`; verify `published_at` is now `~= now()` and the artwork appears in the feed. Flip private→public→private→public again; verify `published_at` is unchanged from the first public transition.
 
-#### 8.6.5 Frontend UX correctness (cases 21–24)
+#### 8.6.5 Frontend UX correctness (cases 22–25)
 
 These run as Playwright E2E tests against a docker-compose'd full stack on every commit.
 
-21. **Infinite scroll does not duplicate items.** Load `/`, scroll to trigger 5 page fetches (~120 items). Collect all rendered `data-artwork-id` attributes; assert each appears exactly once. Catches cursor-pagination off-by-one bugs and React-key collision bugs.
-22. **Masonry reserves dimensions; no layout jump.** Load `/` with network throttled to "Slow 3G." Take a screenshot at 0ms (placeholders only) and at 5000ms (images loaded). Assert the bounding boxes of all visible cards have not moved (Cumulative Layout Shift < 0.05 over the load). Catches missing `width`/`height` on `next/image` and broken aspect-ratio reservation.
-23. **Lazy loading only requests images near the viewport.** Load `/` with network logging. Initially, only images within the first 2 viewport heights should have requested image bytes (look for `/cdn-cgi/image/...` requests). Scroll down 3 viewport heights; verify additional image requests now appear. Catches accidental `loading="eager"` or broken intersection-observer.
-24. **Flip private + incognito = disappearance.** Owner signs in, posts artwork P (public). Verify P appears at `/u/<slug>` in an incognito window. Owner flips P to private. Within ~30s (allowing CDN purge), reload the incognito window and assert P no longer appears at `/u/<slug>`, `/`, `/tag/<name>`, or `/art/<id>` (the last must show the 404 page with no leaked metadata).
+22. **Infinite scroll does not duplicate items.** Load `/`, scroll to trigger 5 page fetches (~120 items). Collect all rendered `data-artwork-id` attributes; assert each appears exactly once. Catches cursor-pagination off-by-one bugs and React-key collision bugs.
+23. **Masonry reserves dimensions; no layout jump.** Load `/` with network throttled to "Slow 3G." Take a screenshot at 0ms (placeholders only) and at 5000ms (images loaded). Assert the bounding boxes of all visible cards have not moved (Cumulative Layout Shift < 0.05 over the load). Catches missing `width`/`height` on `next/image` and broken aspect-ratio reservation.
+24. **Lazy loading only requests images near the viewport.** Load `/` with network logging. Initially, only images within the first 2 viewport heights should have requested image bytes (look for `cdn.example.com/img/...` requests). Scroll down 3 viewport heights; verify additional image requests now appear. Catches accidental `loading="eager"` or broken intersection-observer.
+25. **Flip private + incognito = disappearance.** Owner signs in, posts artwork P (public). Verify P appears at `/u/<slug>` in an incognito window. Owner flips P to private. Within ~30s (allowing CDN purge), reload the incognito window and assert P no longer appears at `/u/<slug>`, `/`, `/tag/<name>`, or `/art/<id>` (the last must show the 404 page with no leaked metadata).
 
 ## 9. Testing Strategy
 
@@ -630,7 +718,7 @@ These run as Playwright E2E tests against a docker-compose'd full stack on every
 | HTTP handlers | Routing, auth middleware, status codes, error mapping | `httptest` against the full chain with real DB |
 | Auth | OAuth callback, JWT issue/verify, cookie attributes | Mock Google's token endpoint; everything else real |
 | Storage impls | `localfs.Store` and `r2.Store` | Real filesystem for localfs; testcontainers MinIO for r2 |
-| Critical correctness | All 24 cases in §8.6 (privacy matrix 14, HMAC round-trip 1, upload idempotency 4, publish lifecycle 1, frontend UX 4) | Privacy matrix: `internal/artwork/privacy_matrix_test.go` (Go) + `e2e/privacy_html.spec.ts` (Playwright). Upload: `internal/image/upload_idempotency_test.go`. Publish: `internal/artwork/publish_lifecycle_test.go`. Frontend UX: `e2e/ux.spec.ts`. |
+| Critical correctness | All 25 cases in §8.6 (privacy matrix 14, HMAC + cache-safety round-trip 2, upload idempotency 4, publish lifecycle 1, frontend UX 4) | Privacy matrix: `internal/artwork/privacy_matrix_test.go` (Go) + `e2e/privacy_html.spec.ts` (Playwright). Worker round-trips: `worker/test/round_trip.spec.ts` (against deployed dev Worker). Upload: `internal/image/upload_idempotency_test.go`. Publish: `internal/artwork/publish_lifecycle_test.go`. Frontend UX: `e2e/ux.spec.ts`. |
 
 **Rule:** integration tests use real Postgres, never a mock. (Mocked DB tests pass while the real migration breaks — burned by this before.)
 
@@ -654,7 +742,8 @@ Don't write tests at all three layers for the same code — pick the right level
 
 ## 11. Risks & Open Questions
 
-- **Cloudflare Worker maintenance burden**: it's a small piece of infra outside the main repos. Mitigation: keep it under 50 lines, test against a deployed dev Worker as part of E2E.
+- **Cloudflare Worker maintenance burden**: it's a small piece of infra outside the main repos and now does more (auth, R2 read, IMAGES transform, cache-header authoring). Mitigation: keep it under ~120 lines with the allowlist constants pulled to the top, and gate every change on the §8.6 round-trip + cache-safety tests against a deployed dev Worker.
+- **Cloudflare Images binding cost**: `env.IMAGES` requires the Cloudflare Images product. Pricing as of writing: $5/mo flat + ~$1 per 1000 transforms; free tier covers ~5000 transforms/month, more than enough for a v1 portfolio. If we ever need to drop this dependency, the fallback is "pre-generate the 6 allowlist size variants at upload time and have the Worker just serve bytes" — adds ~3 seconds to upload latency and ~3x R2 storage, but no runtime image dependency. The Worker code structure (allowlist + auth + R2 read + return) is the same in both designs; only the transform step changes.
 - **Next.js caching is a privacy footgun**: the framework's defaults (static rendering at build time, the Data Cache for fetches) mean a single missing `dynamic = 'force-dynamic'` directive on `/u/:slug` or `/art/:id` will serve cached owner-visible HTML to anonymous viewers. Mitigation: cache-control rules in §7.6 are mandatory, and §8.6 case 7-anon includes a regression test that requests as owner first, then anonymous, to catch this leak class.
 - **CDN cache purge latency on privacy flips**: Cloudflare cache purges are fast (<30s) but not instant. A user flipping public→private could see the old cached image for up to that window via the public URL. Documented behavior; acceptable for v1.
 - **Orphaned R2 objects from partial upload failures**: if `storage.Put` succeeds but the `INSERT` fails (e.g., concurrent retry already inserted, or a transaction rollback), the bytes sit in R2 with no row pointing at them. They're invisible to API consumers (no signed URL, no `/public/` reference) so privacy is preserved, but they consume storage forever. Mitigation: a periodic GC sweeper job (deferred to v2) walks R2 keys and deletes any whose `<artwork_id>/<image_id>` doesn't match a row in `artwork_images`. At v1 scale this leak is bounded and cheap; not blocking ship.
@@ -669,5 +758,5 @@ A v1 implementation is complete when:
 - A new visitor can land on `example.com`, browse the masonry feed without signing in, click any artwork, and see all images at full display resolution (image transform serves the largest reasonable width for the viewport, e.g. up to `width=2400`, AVIF/WebP, quality=85; the original bytes are kept in R2 but not exposed) with the artist name and date.
 - An artist can sign in with Google, upload a multi-image artwork with title/description/tags, see it appear on the feed and on their profile.
 - The artist can flip an artwork to private; it disappears from the feed and from their public profile (when viewed in an incognito tab) but remains visible in their authenticated view.
-- All 24 critical correctness tests in §8.6 pass (privacy matrix across all surfaces and viewer types, HMAC canonicalization round-trip, upload idempotency, publish lifecycle, frontend UX).
+- All 25 critical correctness tests in §8.6 pass (privacy matrix across all surfaces and viewer types, signed-URL round-trip with resize verification, cache-key safety regression, upload idempotency, publish lifecycle, frontend UX).
 - Lighthouse score on the home feed ≥ 90 for Performance with 50 images on screen on a throttled 4G connection.
