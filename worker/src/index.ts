@@ -1,7 +1,7 @@
 // worker/src/index.ts
 import { ALLOWED_FORMATS, ALLOWED_QUALITIES, isAllowedWidth } from "./allowlist";
 import { validateCanonicalPath } from "./path";
-import { verifySignature } from "./sign";
+import { verifySignature } from "./sign"; // used in Task 6 private-path HMAC verification
 
 const IMG_PREFIX = "/img/";
 
@@ -58,7 +58,7 @@ export async function handle(request: Request, env: Env): Promise<Response> {
     // dot-segment traversals (e.g. /img/public/../foo.jpg → /img/foo.jpg).
     // Treat as a bad request so callers get a clear signal rather than a
     // misleading 404.
-    return new Response("Bad request: unknown path namespace", { status: 400 });
+    return new Response("Not found", { status: 404 });
   }
 
   // Validate transform params before any R2 read so a malformed request

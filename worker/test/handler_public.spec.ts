@@ -66,8 +66,11 @@ describe("public path", () => {
   });
 
   it("returns 400 for canonicalization-ambiguous path", async () => {
+    // new Request() normalises dot-segments (%2e%2e → ..), so use
+    // double-encoded dots (%252e = literal %-sign + 2e) which survive URL
+    // parsing but contain '%' — rejected by validateCanonicalPath's ALLOWED_RE.
     const r = await handle(
-      new Request("https://cdn.example.com/img/public/../foo.jpg"), env);
+      new Request("https://cdn.example.com/img/public/%252e%252e/foo.jpg"), env);
     expect(r.status).toBe(400);
   });
 
