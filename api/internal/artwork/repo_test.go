@@ -13,7 +13,10 @@ import (
 )
 
 func newCtx(t *testing.T) (*artwork.Repo, *user.Repo, string) {
-	pool, _ := db.New(context.Background(), dbtest.StartPostgres(t))
+	pool, err := db.New(context.Background(), dbtest.StartPostgres(t))
+	if err != nil {
+		t.Fatalf("db.New: %v", err)
+	}
 	dbtest.TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
 		_, err := pool.Exec(ctx, sql)
 		return err

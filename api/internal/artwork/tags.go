@@ -61,5 +61,8 @@ func (t *TagsRepo) GetTags(ctx context.Context, artworkID string) ([]string, err
 		_ = rows.Scan(&n)
 		out = append(out, n)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return out, nil
 }

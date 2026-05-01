@@ -173,10 +173,10 @@ func scanFeedRows(rows pgx.Rows, limit int, useCreatedAt bool) (*FeedPage, error
 		var stamp time.Time
 		if useCreatedAt {
 			stamp = *last.CreatedAt
-		} else if last.PublishedAt != nil {
-			stamp = *last.PublishedAt
 		} else {
-			stamp = *last.CreatedAt
+			// PublicFeed and ListByTag both enforce `published_at IS NOT NULL`,
+			// so this branch is always taken when useCreatedAt is false.
+			stamp = *last.PublishedAt
 		}
 		out.NextCursor = &FeedCursor{Stamp: stamp, ID: last.ID}
 	}

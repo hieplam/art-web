@@ -45,11 +45,17 @@ func setRawCookie(w http.ResponseWriter, name, value, domain, path, sameSite str
 	w.Header().Add("Set-Cookie", v)
 }
 
-func StartHandler(providers map[string]Provider, _ string, cookieOpts CookieOpts) http.Handler {
+func jsonError(w http.ResponseWriter, body string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_, _ = w.Write([]byte(body))
+}
+
+func StartHandler(providers map[string]Provider, cookieOpts CookieOpts) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p, ok := providers[chi.URLParam(r, "provider")]
 		if !ok {
-			http.Error(w, `{"error":"unknown_provider"}`, 404)
+			jsonError(w, `{"error":"unknown_provider"}`, 404)
 			return
 		}
 		state := randState()
@@ -68,12 +74,12 @@ func CallbackHandler(
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p, ok := providers[chi.URLParam(r, "provider")]
 		if !ok {
-			http.Error(w, `{"error":"unknown_provider"}`, 404)
+			jsonError(w, `{"error":"unknown_provider"}`, 404)
 			return
 		}
 		stateCookie, err := r.Cookie("oauth_state")
 		if err != nil || stateCookie.Value != r.URL.Query().Get("state") {
-			http.Error(w, `{"error":"bad_state"}`, 400)
+			jsonError(w, `{"error":"bad_state"}`, 400)
 			return
 		}
 		// Clear the state cookie.
@@ -81,17 +87,17 @@ func CallbackHandler(
 
 		prof, err := p.Exchange(r.Context(), r.URL.Query().Get("code"))
 		if err != nil {
-			http.Error(w, `{"error":"exchange_failed"}`, 502)
+			jsonError(w, `{"error":"exchange_failed"}`, 502)
 			return
 		}
 		uid, err := users.UpsertOAuth(r.Context(), p.Name(), prof.Subject, prof.Email, prof.DisplayName, prof.AvatarURL)
 		if err != nil {
-			http.Error(w, `{"error":"upsert_failed"}`, 500)
+			jsonError(w, `{"error":"upsert_failed"}`, 500)
 			return
 		}
 		tok, err := jwts.Issue(uid, 7*24*time.Hour)
 		if err != nil {
-			http.Error(w, `{"error":"sign_failed"}`, 500)
+			jsonError(w, `{"error":"sign_failed"}`, 500)
 			return
 		}
 		setRawCookie(w, "auth", tok, cookieOpts.Domain, "/", "Lax", 7*24*3600, true, cookieOpts.Secure)

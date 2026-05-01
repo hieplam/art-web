@@ -27,7 +27,7 @@ func Middleware(j *JWT) func(http.Handler) http.Handler {
 func RequireUser(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := UserIDFrom(r.Context()); !ok {
-			http.Error(w, `{"error":"unauthorized"}`, 401)
+			jsonError(w, `{"error":"unauthorized"}`, 401)
 			return
 		}
 		next.ServeHTTP(w, r)

@@ -34,7 +34,7 @@ func (f *fakeUserRepo) UpsertOAuth(_ context.Context, prov, sub, email, name, av
 }
 
 func TestStart_RedirectsToProviderWithState(t *testing.T) {
-	h := auth.StartHandler(map[string]auth.Provider{"google": fakeProvider{}}, "/", auth.CookieOpts{Secure: true})
+	h := auth.StartHandler(map[string]auth.Provider{"google": fakeProvider{}}, auth.CookieOpts{Secure: true})
 	rec := httptest.NewRecorder()
 	req := withChiURLParam(httptest.NewRequest("GET", "/auth/google/start", nil), "provider", "google")
 	h.ServeHTTP(rec, req)

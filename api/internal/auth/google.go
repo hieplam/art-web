@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -52,7 +53,10 @@ func (g *googleProvider) Exchange(ctx context.Context, code string) (*Profile, e
 	if err != nil {
 		return nil, err
 	}
-	req, _ := http.NewRequestWithContext(ctx, "GET", g.userinfoURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", g.userinfoURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("userinfo: build request: %w", err)
+	}
 	req.Header.Set("Authorization", "Bearer "+tok.AccessToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

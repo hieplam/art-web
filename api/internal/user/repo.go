@@ -98,7 +98,10 @@ func (r *Repo) Get(ctx context.Context, id string) (*User, error) {
 	err := r.pool.QueryRow(ctx,
 		`SELECT id, slug, display_name, email, COALESCE(avatar_url,'') FROM users WHERE id=$1`,
 		id).Scan(&u.ID, &u.Slug, &u.DisplayName, &u.Email, &u.AvatarURL)
-	return &u, err
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
 }
 
 func (r *Repo) GetBySlug(ctx context.Context, slug string) (*User, error) {
@@ -106,7 +109,10 @@ func (r *Repo) GetBySlug(ctx context.Context, slug string) (*User, error) {
 	err := r.pool.QueryRow(ctx,
 		`SELECT id, slug, display_name, email, COALESCE(avatar_url,'') FROM users WHERE slug=$1`,
 		slug).Scan(&u.ID, &u.Slug, &u.DisplayName, &u.Email, &u.AvatarURL)
-	return &u, err
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
 }
 
 func uniqueConstraint(err error) string {
