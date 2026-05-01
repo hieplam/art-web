@@ -6,7 +6,7 @@
 
 **Architecture:** chi-routed HTTP API with HS256 JWT in an HttpOnly cookie, OAuth2 (Google), pgx/v5 to Postgres, golang-migrate for schema, an internal `Storage` interface with `localfs` (dev) and `r2` (prod, via AWS S3 SDK pointed at R2) implementations, on-upload metadata extraction (decode → width/height/blurhash). All image bytes are streamed straight to storage; no thumbnails are pre-generated. Privacy is enforced at the service boundary (private + non-owner returns 404, never 403).
 
-**Tech Stack:** Go 1.22+, chi/v5, pgx/v5, golang-migrate/v4, golang-jwt/v5, golang.org/x/oauth2, aws-sdk-go-v2 (s3 client for R2), buckket/go-blurhash, testcontainers-go (postgres + minio).
+**Tech Stack:** Go 1.24+ (required for `t.Context()` in tests), chi/v5, pgx/v5, golang-migrate/v4, golang-jwt/v5, golang.org/x/oauth2, aws-sdk-go-v2 (s3 client for R2), buckket/go-blurhash, testcontainers-go (postgres + minio).
 
 **Subtree owned by this plan:** `api/` (read [contracts §1](./2026-04-30-art-gallery-contracts.md#1-monorepo-layout)).
 
@@ -125,8 +125,14 @@ git commit -m "[api] chore: bootstrap go module skeleton"
 **Files:**
 - Create: `api/migrations/0001_init.up.sql`
 - Create: `api/migrations/0001_init.down.sql`
+- Create: `api/migrations/embed.go` *(this file is what makes the SQL importable from any package via `migrations.FS`; embedding from `internal/db/` or `internal/dbtest/` is not possible because Go's `//go:embed` rejects `..` in patterns)*
 
-- [ ] **Step 1: Author the up migration verbatim from spec §5**
+**Schema deviations from spec §5** *(applied in this plan; spec author has signed off as of code-review pass 2026-05-01)*:
+
+1. Replace `artworks.cover_image_id uuid` (and its FK) with `artworks.cover_position int NOT NULL DEFAULT 0`. The original FK on `artwork_images.id` allows a cover to point at an image belonging to a *different* artwork — the FK only constrains existence, not same-artwork. `cover_position` resolves this structurally: the cover is the image with `(artwork_id, position) = (artwork_id, cover_position)`. Reordering still updates `cover_position` if the artist wants the cover to follow a specific image, but the cross-artwork bug is impossible.
+2. Add `artwork_images.source_sha256 text NOT NULL`. Idempotency keyed only on `client_image_id` allows a buggy client to re-use a key with a different file and silently get the original row back. Storing the SHA-256 of the source bytes lets the upload pipeline distinguish "true retry of the same bytes" (return existing row) from "key collision with different bytes" (409 conflict).
+
+- [ ] **Step 1: Author the up migration**
 
 ```sql
 -- api/migrations/0001_init.up.sql
@@ -148,7 +154,7 @@ CREATE TABLE artworks (
   title          text NOT NULL,
   description    text,
   visibility     text NOT NULL CHECK (visibility IN ('public','private')),
-  cover_image_id uuid,
+  cover_position int NOT NULL DEFAULT 0,                       -- which artwork_images.position is the cover
   created_at     timestamptz NOT NULL DEFAULT now(),
   published_at   timestamptz
 );
@@ -163,6 +169,7 @@ CREATE TABLE artwork_images (
   artwork_id      uuid NOT NULL REFERENCES artworks(id) ON DELETE CASCADE,
   client_image_id uuid NOT NULL,
   storage_key     text NOT NULL,
+  source_sha256   text NOT NULL,                               -- hex of SHA-256 of the original bytes
   width           int NOT NULL,
   height          int NOT NULL,
   byte_size       int NOT NULL,
@@ -173,10 +180,6 @@ CREATE TABLE artwork_images (
   UNIQUE (artwork_id, client_image_id),
   UNIQUE (artwork_id, position)
 );
-
-ALTER TABLE artworks
-  ADD CONSTRAINT artworks_cover_fk
-  FOREIGN KEY (cover_image_id) REFERENCES artwork_images(id);
 
 CREATE TABLE tags (
   id   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -202,15 +205,38 @@ DROP TABLE IF EXISTS artworks;
 DROP TABLE IF EXISTS users;
 ```
 
-- [ ] **Step 3: Sanity-check the SQL by hand**
+- [ ] **Step 3: Embed the migrations as a package**
 
-Walk down the up file with the spec §5 open: every column, type, constraint, index must match. The deferred FK on `artworks.cover_image_id` is intentional — `artwork_images` doesn't exist yet at the moment the `artworks` table is created.
+```go
+// api/migrations/embed.go
+package migrations
 
-- [ ] **Step 4: Commit**
+import "embed"
+
+// FS exposes the SQL migration files for use by the production migrate
+// runner (internal/db/migrate.go) and the test harness (internal/dbtest).
+// Both consumers call iofs.New(FS, ".") because the SQL files sit
+// directly in this package's directory.
+//
+//go:embed *.sql
+var FS embed.FS
+```
+
+- [ ] **Step 4: Sanity-check the SQL by hand**
+
+Walk down the up file: every column matches spec §5 *except* the two documented deviations above (`cover_position`, `source_sha256`). The cover-FK ALTER from spec §5 is intentionally absent.
+
+- [ ] **Step 5: Commit**
 
 ```bash
 git add api/migrations/
-git commit -m "[api] feat: add 0001 init migration matching spec §5"
+git commit -m "[api] feat: 0001 init migration with cover_position + source_sha256
+
+Diverges from spec §5 in two ways:
+- cover_position int (not cover_image_id uuid) so a cover cannot point
+  to an image belonging to a different artwork.
+- artwork_images.source_sha256 text NOT NULL so upload retries with the
+  same client_image_id can be verified against the original bytes."
 ```
 
 The migration is verified end-to-end in Task 5 once the runner exists.
@@ -321,7 +347,7 @@ package dbtest
 
 import (
 	"context"
-	"embed"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -329,17 +355,14 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/<org>/art-web/api/migrations"
 )
 
-//go:embed all:../../migrations
-var migrationsFS embed.FS
-
 var (
-	once       sync.Once
-	sharedDSN  string
-	sharedErr  error
-	sharedTerm func()
+	once      sync.Once
+	sharedDSN string
+	sharedErr error
 )
 
 // StartPostgres spins up a single shared Postgres container per test process,
@@ -356,10 +379,8 @@ func StartPostgres(t testing.TB) string {
 			tcpostgres.WithUsername("test"),
 			tcpostgres.WithPassword("test"),
 			tcpostgres.BasicWaitStrategies(),
-			tcpostgres.WithInitScripts(),
 			tcpostgres.WithSQLDriver("pgx"),
 		)
-		_ = wait.ForListeningPort // satisfy import in some tc-go versions
 		if err != nil {
 			sharedErr = err
 			return
@@ -369,13 +390,15 @@ func StartPostgres(t testing.TB) string {
 			sharedErr = err
 			return
 		}
-		// Run migrations once.
-		src, err := iofs.New(migrationsFS, "../../migrations")
+		// Run migrations once. The embedded FS lives in api/migrations/
+		// (see Task 2.5 below); the iofs root is "." because *.sql sit
+		// directly in that directory.
+		src, err := iofs.New(migrations.FS, ".")
 		if err != nil {
 			sharedErr = err
 			return
 		}
-		m, err := migrate.NewWithSourceInstance("iofs", src, "pgx5://"+dsn[len("postgres://"):])
+		m, err := migrate.NewWithSourceInstance("iofs", src, "pgx5://"+strings.TrimPrefix(dsn, "postgres://"))
 		if err != nil {
 			sharedErr = err
 			return
@@ -385,7 +408,6 @@ func StartPostgres(t testing.TB) string {
 			return
 		}
 		sharedDSN = dsn
-		sharedTerm = func() { _ = container.Terminate(ctx) }
 	})
 	if sharedErr != nil {
 		t.Fatalf("postgres harness: %v", sharedErr)
@@ -473,20 +495,18 @@ package db
 
 import (
 	"context"
-	"embed"
 	"errors"
 	"strings"
 
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+
+	"github.com/<org>/art-web/api/migrations"
 )
 
-//go:embed all:../../migrations
-var migrationsFS embed.FS
-
 func MigrateUp(_ context.Context, dsn string) error {
-	src, err := iofs.New(migrationsFS, "../../migrations")
+	src, err := iofs.New(migrations.FS, ".")
 	if err != nil {
 		return err
 	}
@@ -2092,7 +2112,7 @@ type Artwork struct {
 	ID, UserID, Title, Visibility string
 	Description                   *string
 	PublishedAt, CreatedAt        *time.Time
-	CoverImageID                  *string
+	CoverPosition                 int
 }
 
 type Repo struct{ pool *pgxpool.Pool }
@@ -2113,17 +2133,15 @@ func (r *Repo) Get(ctx context.Context, id string) (*Artwork, error) {
 	var a Artwork
 	var desc *string
 	var pub, cre time.Time
-	var cover *string
 	err := r.pool.QueryRow(ctx, `
-		SELECT id, user_id, title, description, visibility, published_at, created_at, cover_image_id
+		SELECT id, user_id, title, description, visibility, published_at, created_at, cover_position
 		FROM artworks WHERE id = $1`, id).
-		Scan(&a.ID, &a.UserID, &a.Title, &desc, &a.Visibility, &pubOrNil{&pub, &a.PublishedAt}, &cre, &cover)
+		Scan(&a.ID, &a.UserID, &a.Title, &desc, &a.Visibility, &pubOrNil{&pub, &a.PublishedAt}, &cre, &a.CoverPosition)
 	if err != nil {
 		return nil, err
 	}
 	a.Description = desc
 	a.CreatedAt = &cre
-	a.CoverImageID = cover
 	return &a, nil
 }
 
@@ -2163,8 +2181,8 @@ func (r *Repo) PatchVisibility(ctx context.Context, id, vis string) error {
 	return err
 }
 
-func (r *Repo) SetCoverImage(ctx context.Context, id, imageID string) error {
-	_, err := r.pool.Exec(ctx, `UPDATE artworks SET cover_image_id=$2 WHERE id=$1`, id, imageID)
+func (r *Repo) SetCoverPosition(ctx context.Context, id string, position int) error {
+	_, err := r.pool.Exec(ctx, `UPDATE artworks SET cover_position=$2 WHERE id=$1`, id, position)
 	return err
 }
 
@@ -2270,7 +2288,7 @@ func (r *Repo) PublicFeed(ctx context.Context, c FeedCursor, limit int) (*FeedPa
 		limit = 24
 	}
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, user_id, title, description, visibility, published_at, created_at, cover_image_id
+		SELECT id, user_id, title, description, visibility, published_at, created_at, cover_position
 		FROM artworks
 		WHERE visibility='public' AND published_at IS NOT NULL
 		  AND ($1 = 0 OR (extract(epoch FROM published_at)::bigint, id::text) < ($1, $2))
@@ -2280,27 +2298,7 @@ func (r *Repo) PublicFeed(ctx context.Context, c FeedCursor, limit int) (*FeedPa
 		return nil, err
 	}
 	defer rows.Close()
-	out := &FeedPage{}
-	for rows.Next() {
-		var a Artwork
-		var desc, cover *string
-		var pub, cre time.Time
-		if err := rows.Scan(&a.ID, &a.UserID, &a.Title, &desc, &a.Visibility, &pub, &cre, &cover); err != nil {
-			return nil, err
-		}
-		p := pub
-		a.PublishedAt = &p
-		a.CreatedAt = &cre
-		a.Description = desc
-		a.CoverImageID = cover
-		out.Items = append(out.Items, a)
-	}
-	if len(out.Items) > limit {
-		last := out.Items[limit-1]
-		out.Items = out.Items[:limit]
-		out.NextCursor = &FeedCursor{PublishedAtUnix: last.PublishedAt.Unix(), ID: last.ID}
-	}
-	return out, nil
+	return scanFeedRows(rows, limit, false /*useCreatedAt*/)
 }
 ```
 
@@ -2348,7 +2346,7 @@ func (r *Repo) ListByUser(ctx context.Context, userID string, viewerIsOwner bool
 		limit = 24
 	}
 	q := `
-		SELECT id, user_id, title, description, visibility, published_at, created_at, cover_image_id
+		SELECT id, user_id, title, description, visibility, published_at, created_at, cover_position
 		FROM artworks
 		WHERE user_id = $1 ` +
 		map[bool]string{
@@ -2366,23 +2364,23 @@ func (r *Repo) ListByUser(ctx context.Context, userID string, viewerIsOwner bool
 	return scanFeedRows(rows, limit, true /*useCreatedAt*/)
 }
 
-// scanFeedRows is a helper used by both PublicFeed and ListByUser; refactor
-// PublicFeed to use it and remove the inline scan loop.
+// scanFeedRows is shared by PublicFeed, ListByUser, and ListByTag.
+// `published_at` is nullable (drafts have NULL), so we scan into a
+// pointer to time.Time. The cursor stamp is derived from created_at
+// (per-user view) or published_at (public feed / tag view).
 func scanFeedRows(rows pgx.Rows, limit int, useCreatedAt bool) (*FeedPage, error) {
 	out := &FeedPage{}
 	for rows.Next() {
 		var a Artwork
-		var desc, cover *string
-		var pub, cre time.Time
-		if err := rows.Scan(&a.ID, &a.UserID, &a.Title, &desc, &a.Visibility, &pub, &cre, &cover); err != nil {
-			// pub may be NULL when the owner sees a draft — handle separately
+		var desc *string
+		var pub *time.Time
+		var cre time.Time
+		if err := rows.Scan(&a.ID, &a.UserID, &a.Title, &desc, &a.Visibility, &pub, &cre, &a.CoverPosition); err != nil {
 			return nil, err
 		}
-		p := pub
-		a.PublishedAt = &p
+		a.PublishedAt = pub
 		a.CreatedAt = &cre
 		a.Description = desc
-		a.CoverImageID = cover
 		out.Items = append(out.Items, a)
 	}
 	if len(out.Items) > limit {
@@ -2397,8 +2395,6 @@ func scanFeedRows(rows pgx.Rows, limit int, useCreatedAt bool) (*FeedPage, error
 	return out, nil
 }
 ```
-
-A subtle bug: `ListByUser` with `viewerIsOwner=true` returns drafts, and `published_at` is NULL on those, so the simple `var pub time.Time` scan fails. Fix: change `pub` to `*time.Time` in the helper. This is intentionally left exposed for the implementing engineer to encounter and fix as part of running the test. (The fix is two lines; if you'd rather pre-fix, change `var pub time.Time` to `var pub *time.Time` and adjust assignment to `a.PublishedAt = pub`.)
 
 - [ ] **Step 3: Run + commit**
 
@@ -2435,7 +2431,7 @@ func (r *Repo) ListByTag(ctx context.Context, tag string, c FeedCursor, limit in
 		limit = 24
 	}
 	rows, err := r.pool.Query(ctx, `
-		SELECT a.id, a.user_id, a.title, a.description, a.visibility, a.published_at, a.created_at, a.cover_image_id
+		SELECT a.id, a.user_id, a.title, a.description, a.visibility, a.published_at, a.created_at, a.cover_position
 		FROM artworks a
 		JOIN artwork_tags at ON at.artwork_id = a.id
 		JOIN tags t ON t.id = at.tag_id
@@ -2853,11 +2849,11 @@ func setup(t *testing.T) (*image.Repo, string) {
 	return image.NewRepo(pool), aid
 }
 
-func TestRetryWithSameClientID_IsNoOp(t *testing.T) {
+func TestCase17_RetryWithSameClientIDAndSameBytes_IsNoOp(t *testing.T) {
 	repo, aid := setup(t)
 	in := image.InsertInput{ArtworkID: aid, ClientImageID: "K1", Position: 0,
 		ContentType: "image/jpeg", StorageKey: "private/" + aid + "/abc.jpg",
-		Width: 50, Height: 50, ByteSize: 1234, Blurhash: "L0"}
+		SourceSHA256: "deadbeef", Width: 50, Height: 50, ByteSize: 1234, Blurhash: "L0"}
 	r1, err := repo.Insert(t.Context(), in)
 	if err != nil {
 		t.Fatalf("first insert: %v", err)
@@ -2871,13 +2867,32 @@ func TestRetryWithSameClientID_IsNoOp(t *testing.T) {
 	}
 }
 
-func TestPositionCollision_RejectedAs412(t *testing.T) {
+// Finding 5 regression: same client_image_id but different bytes must not
+// silently return the original row.
+func TestCase17b_SameClientIDDifferentBytes_RejectedAsFingerprintMismatch(t *testing.T) {
+	repo, aid := setup(t)
+	in := image.InsertInput{ArtworkID: aid, ClientImageID: "K1", Position: 0,
+		ContentType: "image/jpeg", StorageKey: "k1",
+		SourceSHA256: "deadbeef", Width: 50, Height: 50, ByteSize: 1, Blurhash: ""}
+	if _, err := repo.Insert(t.Context(), in); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	in.SourceSHA256 = "cafebabe" // different file, same key
+	in.StorageKey = "k1-other"
+	if _, err := repo.Insert(t.Context(), in); err != image.ErrFingerprintMismatch {
+		t.Fatalf("want ErrFingerprintMismatch, got %v", err)
+	}
+}
+
+func TestCase18_PositionCollision_RejectedAs412(t *testing.T) {
 	repo, aid := setup(t)
 	a := image.InsertInput{ArtworkID: aid, ClientImageID: "K1", Position: 0,
-		ContentType: "image/jpeg", StorageKey: "k1", Width: 1, Height: 1, ByteSize: 1, Blurhash: ""}
+		ContentType: "image/jpeg", StorageKey: "k1", SourceSHA256: "aaa",
+		Width: 1, Height: 1, ByteSize: 1, Blurhash: ""}
 	b := a
 	b.ClientImageID = "K2"
 	b.StorageKey = "k2"
+	b.SourceSHA256 = "bbb"
 	if _, err := repo.Insert(t.Context(), a); err != nil {
 		t.Fatalf("a: %v", err)
 	}
@@ -2902,11 +2917,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var ErrPositionTaken = errors.New("position already taken by a different client_image_id")
+var (
+	ErrPositionTaken       = errors.New("position already taken by a different client_image_id")
+	ErrFingerprintMismatch = errors.New("client_image_id reused with a different file (sha256 mismatch)")
+)
 
 type InsertInput struct {
-	ArtworkID, ClientImageID, ContentType, StorageKey, Blurhash string
-	Position, Width, Height, ByteSize                           int
+	ArtworkID, ClientImageID, ContentType, StorageKey, Blurhash, SourceSHA256 string
+	Position, Width, Height, ByteSize                                          int
 }
 
 type InsertResult struct {
@@ -2919,13 +2937,19 @@ type Repo struct{ pool *pgxpool.Pool }
 func NewRepo(p *pgxpool.Pool) *Repo { return &Repo{pool: p} }
 
 func (r *Repo) Insert(ctx context.Context, in InsertInput) (*InsertResult, error) {
-	// 1. Idempotency check.
-	var existingID string
+	if in.SourceSHA256 == "" {
+		return nil, errors.New("SourceSHA256 is required")
+	}
+	// 1. Idempotency check — same client_image_id AND same fingerprint = retry.
+	var existingID, existingSHA string
 	err := r.pool.QueryRow(ctx,
-		`SELECT id FROM artwork_images WHERE artwork_id=$1 AND client_image_id=$2`,
-		in.ArtworkID, in.ClientImageID).Scan(&existingID)
+		`SELECT id, source_sha256 FROM artwork_images WHERE artwork_id=$1 AND client_image_id=$2`,
+		in.ArtworkID, in.ClientImageID).Scan(&existingID, &existingSHA)
 	if err == nil {
-		return &InsertResult{ID: existingID, Existed: true}, nil
+		if existingSHA == in.SourceSHA256 {
+			return &InsertResult{ID: existingID, Existed: true}, nil
+		}
+		return nil, ErrFingerprintMismatch
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return nil, err
@@ -2935,12 +2959,12 @@ func (r *Repo) Insert(ctx context.Context, in InsertInput) (*InsertResult, error
 	var id string
 	err = r.pool.QueryRow(ctx, `
 		INSERT INTO artwork_images
-		  (artwork_id, client_image_id, storage_key, width, height, byte_size,
-		   content_type, position, blurhash)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8, NULLIF($9,''))
+		  (artwork_id, client_image_id, storage_key, source_sha256,
+		   width, height, byte_size, content_type, position, blurhash)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, NULLIF($10,''))
 		RETURNING id`,
-		in.ArtworkID, in.ClientImageID, in.StorageKey, in.Width, in.Height,
-		in.ByteSize, in.ContentType, in.Position, in.Blurhash).Scan(&id)
+		in.ArtworkID, in.ClientImageID, in.StorageKey, in.SourceSHA256,
+		in.Width, in.Height, in.ByteSize, in.ContentType, in.Position, in.Blurhash).Scan(&id)
 	if err == nil {
 		return &InsertResult{ID: id, Existed: false}, nil
 	}
@@ -2950,12 +2974,16 @@ func (r *Repo) Insert(ctx context.Context, in InsertInput) (*InsertResult, error
 		return nil, err
 	}
 	if strings.Contains(err.Error(), "client_image_id") {
-		// Concurrent retry won the race — return that row.
+		// Concurrent retry won the race — re-check fingerprint before
+		// returning the winner's row.
 		err = r.pool.QueryRow(ctx,
-			`SELECT id FROM artwork_images WHERE artwork_id=$1 AND client_image_id=$2`,
-			in.ArtworkID, in.ClientImageID).Scan(&existingID)
+			`SELECT id, source_sha256 FROM artwork_images WHERE artwork_id=$1 AND client_image_id=$2`,
+			in.ArtworkID, in.ClientImageID).Scan(&existingID, &existingSHA)
 		if err != nil {
 			return nil, err
+		}
+		if existingSHA != in.SourceSHA256 {
+			return nil, ErrFingerprintMismatch
 		}
 		return &InsertResult{ID: existingID, Existed: true}, nil
 	}
@@ -2967,8 +2995,8 @@ func (r *Repo) Insert(ctx context.Context, in InsertInput) (*InsertResult, error
 
 func (r *Repo) ListByArtwork(ctx context.Context, artworkID string) ([]InsertedImage, error) {
 	rows, err := r.pool.Query(ctx, `
-		SELECT id, artwork_id, client_image_id, storage_key, width, height,
-		       byte_size, content_type, position, COALESCE(blurhash,'')
+		SELECT id, artwork_id, client_image_id, storage_key, source_sha256,
+		       width, height, byte_size, content_type, position, COALESCE(blurhash,'')
 		FROM artwork_images WHERE artwork_id = $1 ORDER BY position`, artworkID)
 	if err != nil {
 		return nil, err
@@ -2977,7 +3005,7 @@ func (r *Repo) ListByArtwork(ctx context.Context, artworkID string) ([]InsertedI
 	var out []InsertedImage
 	for rows.Next() {
 		var im InsertedImage
-		_ = rows.Scan(&im.ID, &im.ArtworkID, &im.ClientImageID, &im.StorageKey,
+		_ = rows.Scan(&im.ID, &im.ArtworkID, &im.ClientImageID, &im.StorageKey, &im.SourceSHA256,
 			&im.Width, &im.Height, &im.ByteSize, &im.ContentType, &im.Position, &im.Blurhash)
 		out = append(out, im)
 	}
@@ -2985,8 +3013,8 @@ func (r *Repo) ListByArtwork(ctx context.Context, artworkID string) ([]InsertedI
 }
 
 type InsertedImage struct {
-	ID, ArtworkID, ClientImageID, StorageKey, ContentType, Blurhash string
-	Position, Width, Height, ByteSize                               int
+	ID, ArtworkID, ClientImageID, StorageKey, ContentType, Blurhash, SourceSHA256 string
+	Position, Width, Height, ByteSize                                              int
 }
 ```
 
@@ -3018,6 +3046,8 @@ package image
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -3055,22 +3085,6 @@ var (
 )
 
 func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in UploadOne) (*UploadResult, error) {
-	// Idempotency fast-path.
-	if existing, err := s.images.Pool().Query(ctx,
-		`SELECT id, storage_key, width, height, byte_size, content_type, position, COALESCE(blurhash,'')
-		   FROM artwork_images WHERE artwork_id=$1 AND client_image_id=$2`,
-		art.ID, in.Manifest.ClientImageID); err == nil {
-		defer existing.Close()
-		if existing.Next() {
-			var im InsertedImage
-			im.ArtworkID = art.ID
-			im.ClientImageID = in.Manifest.ClientImageID
-			_ = existing.Scan(&im.ID, &im.StorageKey, &im.Width, &im.Height,
-				&im.ByteSize, &im.ContentType, &im.Position, &im.Blurhash)
-			return &UploadResult{Image: im, Existed: true}, nil
-		}
-	}
-
 	// Validate + decode.
 	limited := io.LimitReader(in.Body, MaxBytes+1)
 	buf, err := io.ReadAll(limited)
@@ -3084,6 +3098,12 @@ func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in Upload
 	if err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
+
+	// Fingerprint the source bytes. The Repo.Insert idempotency check
+	// uses this to distinguish "true retry" from "key reuse with different
+	// bytes" (which returns ErrFingerprintMismatch).
+	sum := sha256.Sum256(buf)
+	sha := hex.EncodeToString(sum[:])
 
 	// Build storage key.
 	imgID := uuid.NewString()
@@ -3099,30 +3119,29 @@ func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in Upload
 	res, err := s.images.Insert(ctx, InsertInput{
 		ArtworkID: art.ID, ClientImageID: in.Manifest.ClientImageID,
 		Position: in.Manifest.Position, ContentType: in.Manifest.ContentType,
-		StorageKey: key, Width: dec.Width, Height: dec.Height,
+		StorageKey: key, SourceSHA256: sha,
+		Width: dec.Width, Height: dec.Height,
 		ByteSize: len(buf), Blurhash: dec.Blurhash,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	// First image becomes cover.
-	if art.CoverImageID == nil {
-		_ = s.artworks.SetCoverImage(ctx, art.ID, res.ID)
-	}
+	// First image becomes cover by default: cover_position defaults to 0
+	// at artwork creation, and the first uploaded image lands at position 0.
+	// Explicit cover overrides go through SetCoverPosition (PATCH endpoint).
 
 	return &UploadResult{
 		Image: InsertedImage{
 			ID: res.ID, ArtworkID: art.ID, ClientImageID: in.Manifest.ClientImageID,
 			StorageKey: key, ContentType: in.Manifest.ContentType, Blurhash: dec.Blurhash,
-			Position: in.Manifest.Position, Width: dec.Width, Height: dec.Height, ByteSize: len(buf),
+			SourceSHA256: sha,
+			Position:     in.Manifest.Position, Width: dec.Width, Height: dec.Height, ByteSize: len(buf),
 		},
 		Existed: res.Existed,
 	}, nil
 }
 ```
-
-Add a `Pool()` accessor on `*image.Repo` for the fast-path lookup: `func (r *Repo) Pool() *pgxpool.Pool { return r.pool }`.
 
 - [ ] **Step 2: HTTP handler (multipart form parsing)**
 
@@ -3189,6 +3208,9 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 		out, err := h.svc.UploadOne(r.Context(), art, UploadOne{Manifest: e, Body: f})
 		f.Close()
 		switch {
+		case errors.Is(err, ErrFingerprintMismatch):
+			http.Error(w, `{"error":"fingerprint_mismatch","message":"client_image_id reused with different bytes"}`, 409)
+			return
 		case errors.Is(err, ErrPositionTaken):
 			http.Error(w, `{"error":"position_taken"}`, 412)
 			return
@@ -3609,24 +3631,26 @@ import (
 )
 
 type Deps struct {
-	JWT        *auth.JWT
-	URL        *auth.URLBuilder
-	Providers  map[string]auth.Provider
-	Users      *user.Repo
-	Artworks   *artwork.Repo
-	Tags       *artwork.TagsRepo
-	Images     *image.Repo
-	Upload     *image.Handler
-	Vis        *artwork.VisibilityService
-	Frontend   string         // post-login redirect
-	CookieOpts auth.CookieOpts // Domain + Secure for the auth cookie
+	JWT           *auth.JWT
+	URL           *auth.URLBuilder
+	Providers     map[string]auth.Provider
+	Users         *user.Repo
+	Artworks      *artwork.Repo
+	Tags          *artwork.TagsRepo
+	Images        *image.Repo
+	Upload        *image.Handler
+	Vis           *artwork.VisibilityService
+	Frontend      string         // post-login redirect
+	AllowedOrigin string         // CORS Access-Control-Allow-Origin (the FE host)
+	CookieOpts    auth.CookieOpts // Domain + Secure for the auth cookie
 }
 
 func New(d *Deps) chi.Router {
 	r := chi.NewRouter()
-	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, corsMW)
+	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
+	r.Use(CORSFor(d.AllowedOrigin))
 	r.Use(auth.Middleware(d.JWT))
-	r.Use(noStoreForViewerSpecific)
+	r.Use(NoStoreForViewerSpecific())
 
 	r.Route("/auth", func(r chi.Router) {
 		r.Get("/{provider}/start", auth.StartHandler(d.Providers, d.Frontend).ServeHTTP)
@@ -3827,16 +3851,14 @@ func loadCoverAndArtist(ctx context.Context, d *Deps, a *artwork.Artwork) (*imag
 		return nil, nil, err
 	}
 	var cover *image.InsertedImage
-	if a.CoverImageID != nil {
-		for i := range images {
-			if images[i].ID == *a.CoverImageID {
-				cover = &images[i]
-				break
-			}
+	for i := range images {
+		if images[i].Position == a.CoverPosition {
+			cover = &images[i]
+			break
 		}
 	}
 	if cover == nil && len(images) > 0 {
-		cover = &images[0]
+		cover = &images[0] // fall back to first image (lowest position)
 	}
 	if cover == nil {
 		return nil, nil, errors.New("no images")
@@ -3987,12 +4009,10 @@ func getArtworkHandler(d *Deps) http.Handler {
 			imgs = append(imgs, renderImageRef(d, &images[i], a.Visibility))
 		}
 		var cover *image.InsertedImage
-		if a.CoverImageID != nil {
-			for i := range images {
-				if images[i].ID == *a.CoverImageID {
-					cover = &images[i]
-					break
-				}
+		for i := range images {
+			if images[i].Position == a.CoverPosition {
+				cover = &images[i]
+				break
 			}
 		}
 		if cover == nil && len(images) > 0 {
@@ -4094,7 +4114,7 @@ func tagsHandler(d *Deps) http.Handler {
 			renderJSON(w, 500, map[string]string{"error": "list_failed"})
 			return
 		}
-		renderFeed(w, d, page, false /*viewerCanSeePrivate*/)
+		renderFeed(w, r.Context(), d, page)
 	})
 }
 ```
@@ -4402,7 +4422,6 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"log/slog"
 	"net/http"
 	"os"
@@ -4451,8 +4470,8 @@ func main() {
 		store = storage.NewR2(s3cli, cfg.R2Bucket)
 	}
 
-	signKey, _ := hex.DecodeString(cfg.WorkerSigningKey)
-	jwtKey, _ := hex.DecodeString(cfg.JWTSigningKey)
+	signKey := mustDecodeHexKey("WORKER_SIGNING_KEY", cfg.WorkerSigningKey)
+	jwtKey  := mustDecodeHexKey("JWT_SIGNING_KEY",    cfg.JWTSigningKey)
 
 	jwts := auth.NewJWT(jwtKey, time.Now)
 	urls := auth.NewURLBuilder(cfg.CDNOrigin, signKey, time.Now)
@@ -4472,7 +4491,8 @@ func main() {
 		},
 		Users: users, Artworks: arts, Tags: tags, Images: images,
 		Upload: upload, Vis: vis,
-		Frontend: cfg.FrontendURL,
+		Frontend:      cfg.FrontendURL,
+		AllowedOrigin: cfg.AllowedOrigin,
 		CookieOpts: auth.CookieOpts{
 			Domain: cfg.CookieDomain,             // "" in dev; ".example.com" in prod
 			Secure: cfg.AppEnv != "dev",
@@ -4493,11 +4513,15 @@ func main() {
 // api/cmd/api/config.go
 package main
 
-import "os"
+import (
+	"encoding/hex"
+	"os"
+	"strconv"
+)
 
 type config struct {
 	Addr, AppEnv, DatabaseURL, FrontendURL, CDNOrigin             string
-	WorkerSigningKey, JWTSigningKey, CookieDomain                 string
+	WorkerSigningKey, JWTSigningKey, CookieDomain, AllowedOrigin  string
 	GoogleClientID, GoogleClientSecret, GoogleRedirectURL         string
 	R2AccountID, R2KeyID, R2KeySecret, R2Bucket                   string
 }
@@ -4512,6 +4536,7 @@ func loadConfig() config {
 		WorkerSigningKey:   mustEnv("WORKER_SIGNING_KEY"),
 		JWTSigningKey:      mustEnv("JWT_SIGNING_KEY"),
 		CookieDomain:       getEnv("COOKIE_DOMAIN", ""), // e.g. ".example.com" in prod
+		AllowedOrigin:      getEnv("ALLOWED_ORIGIN", "http://localhost:3000"),
 		GoogleClientID:     getEnv("GOOGLE_OAUTH_CLIENT_ID", ""),
 		GoogleClientSecret: getEnv("GOOGLE_OAUTH_CLIENT_SECRET", ""),
 		GoogleRedirectURL:  getEnv("GOOGLE_OAUTH_REDIRECT_URL", "http://localhost:8080/auth/google/callback"),
@@ -4535,7 +4560,25 @@ func mustEnv(k string) string {
 	}
 	return v
 }
+
+// mustDecodeHexKey decodes a hex-encoded signing key and panics on any
+// failure mode that would silently weaken security: malformed hex, or a
+// decoded length below 32 bytes (256-bit minimum per contracts §11).
+func mustDecodeHexKey(name, value string) []byte {
+	if value == "" {
+		panic(name + " is empty")
+	}
+	b, err := hex.DecodeString(value)
+	if err != nil {
+		panic(name + " is not valid hex: " + err.Error())
+	}
+	if len(b) < 32 {
+		panic(name + " decoded to fewer than 32 bytes (got " + strconv.Itoa(len(b)) + ")")
+	}
+	return b
+}
 ```
+
 
 - [ ] **Step 3: Smoke build**
 
@@ -4589,7 +4632,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: '1.22' }
+        with: { go-version: '1.24' }
       - run: go mod download
       - run: go vet ./...
       - run: go test -race ./...

@@ -198,7 +198,7 @@ type ArtworkSummary = {
   visibility: "public" | "private";
   published_at: string | null;          // null until first publish
   created_at: string;
-  cover: ImageRef;                      // chosen by artworks.cover_image_id
+  cover: ImageRef;                      // image where position == artworks.cover_position
   artist: User;
 };
 ```
@@ -256,7 +256,7 @@ type ApiError = {
 | 401 | missing/invalid auth cookie on a protected route, or missing/invalid signature on a `/private/` Worker URL |
 | 403 | **only** for explicit owner actions on a *visible* but not-owned resource where existence is already public; **never** for "private and not yours" — that returns 404 |
 | 404 | resource missing OR private and viewer is not the owner (existence-hiding rule, spec §8.5) |
-| 409 | display-name slug conflict, OAuth provider/subject already linked to another account |
+| 409 | display-name slug conflict; OAuth provider/subject already linked to another account; **upload idempotency: same `client_image_id` reused with different bytes (sha256 mismatch)** |
 | 412 | upload idempotency: position collision with a different `client_image_id` |
 | 415 | request `Content-Type` is not `multipart/form-data` on a multipart endpoint (per-file `content_type` field validation returns 400 instead — that's payload-shape, not HTTP-level) |
 | 422 | image larger than 25 MB, decode failure, dimension extraction failure |
@@ -287,6 +287,7 @@ type ApiError = {
 | `R2_BUCKET` | API + Worker | identical bucket name |
 | `CDN_ORIGIN` | API only | base URL emitted in image responses; defaults `https://cdn.example.com` |
 | `COOKIE_DOMAIN` | API only | e.g. `.example.com` in prod; empty in dev |
+| `ALLOWED_ORIGIN` | API only | CORS Access-Control-Allow-Origin; the FE host (e.g. `https://example.com`) |
 | `APP_ENV` | API only | `dev` sets `Secure=false` on the auth cookie |
 | `NEXT_PUBLIC_API_BASE` | Web only | e.g. `https://api.example.com` |
 | `NEXT_PUBLIC_CDN_BASE` | Web only | optional dev override; if unset, the loader uses the host of the URL the API returned |
