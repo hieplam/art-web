@@ -53,13 +53,17 @@ func renderArtworkSummary(d *Deps, a *artwork.Artwork, cover *image.InsertedImag
 		s := a.PublishedAt.UTC().Format(time.RFC3339)
 		pub = &s
 	}
+	var coverJSON any
+	if cover != nil {
+		coverJSON = renderImageRef(d, cover, a.Visibility)
+	}
 	return map[string]any{
 		"id":           a.ID,
 		"title":        a.Title,
 		"visibility":   a.Visibility,
 		"published_at": pub,
 		"created_at":   a.CreatedAt.UTC().Format(time.RFC3339),
-		"cover":        renderImageRef(d, cover, a.Visibility),
+		"cover":        coverJSON,
 		"artist":       renderUser(artist),
 	}
 }

@@ -43,7 +43,9 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	}
 	entries, err := ParseManifest(strings.NewReader(manifestRaw))
 	if err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, 400)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 		return
 	}
 	files := r.MultipartForm.File["files"]

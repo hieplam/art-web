@@ -60,6 +60,9 @@ func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in Upload
 	ext, _ := ExtFor(in.Manifest.ContentType)
 	key := fmt.Sprintf("%s/%s/%s.%s", art.Visibility, art.ID, imgID, ext)
 
+	// On retry (same client_image_id + same SHA256), Insert returns Existed=true
+	// but `key` was already written above and will never be referenced — orphan.
+	// TODO post-v1: track and sweep in R2 GC (spec §11).
 	if err := s.store.Put(ctx, key, bytes.NewReader(buf), in.Manifest.ContentType); err != nil {
 		return nil, err
 	}

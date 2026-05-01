@@ -176,6 +176,9 @@ func TestUploadCase20_PartialFailureResume(t *testing.T) {
 		t.Fatalf("retry status %d", rec2.Code)
 	}
 
+	// dbtest.StartPostgres is sync.Once: the second call returns the same DSN as
+	// newHandler used, so this pool reads the same database. Tests must not run
+	// in parallel with other tests that call TruncateAll on the shared container.
 	pool, err := db.New(t.Context(), dbtest.StartPostgres(t))
 	if err != nil {
 		t.Fatalf("db.New: %v", err)
