@@ -17,6 +17,7 @@ func newCtx(t *testing.T) (*artwork.Repo, *user.Repo, string) {
 	if err != nil {
 		t.Fatalf("db.New: %v", err)
 	}
+	t.Cleanup(func() { pool.Close() })
 	dbtest.TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
 		_, err := pool.Exec(ctx, sql)
 		return err

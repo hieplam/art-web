@@ -54,4 +54,13 @@ func TestDevSeed_Many_BulkSeedsPublic(t *testing.T) {
 	if feed.StatusCode != 200 {
 		t.Fatalf("feed: %d", feed.StatusCode)
 	}
+	var body struct {
+		Items []any `json:"items"`
+	}
+	if err := json.NewDecoder(feed.Body).Decode(&body); err != nil {
+		t.Fatalf("decode feed: %v", err)
+	}
+	if len(body.Items) == 0 {
+		t.Fatal("feed must contain seeded bulk items")
+	}
 }

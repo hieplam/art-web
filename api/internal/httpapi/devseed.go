@@ -92,6 +92,10 @@ func (h *DevSeed) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if many, _ := strconv.Atoi(r.URL.Query().Get("many")); many > 0 {
+		const maxMany = 100
+		if many > maxMany {
+			many = maxMany
+		}
 		for i := 0; i < many; i++ {
 			id, err := h.Artworks.Create(ctx, aliceID, fmt.Sprintf("Bulk %d", i), "Seeded bulk artwork", "public")
 			if err != nil {
