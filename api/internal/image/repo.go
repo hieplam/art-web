@@ -89,6 +89,25 @@ func (r *Repo) Insert(ctx context.Context, in InsertInput) (*InsertResult, error
 	}
 }
 
+// FindByClientImageID returns the stored row for (artworkID, clientImageID), or nil if none exists.
+func (r *Repo) FindByClientImageID(ctx context.Context, artworkID, clientImageID string) (*InsertedImage, error) {
+	var im InsertedImage
+	err := r.pool.QueryRow(ctx, `
+		SELECT id, artwork_id, client_image_id, storage_key, source_sha256,
+		       width, height, byte_size, content_type, position, COALESCE(blurhash,'')
+		FROM artwork_images WHERE artwork_id=$1 AND client_image_id=$2`,
+		artworkID, clientImageID).Scan(
+		&im.ID, &im.ArtworkID, &im.ClientImageID, &im.StorageKey, &im.SourceSHA256,
+		&im.Width, &im.Height, &im.ByteSize, &im.ContentType, &im.Position, &im.Blurhash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &im, nil
+}
+
 func (r *Repo) ListByArtwork(ctx context.Context, artworkID string) ([]InsertedImage, error) {
 	rows, err := r.pool.Query(ctx, `
 		SELECT id, artwork_id, client_image_id, storage_key, source_sha256,

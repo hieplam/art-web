@@ -68,13 +68,22 @@ func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in Upload
 	sum := sha256.Sum256(buf)
 	sha := hex.EncodeToString(sum[:])
 
+	// Pre-check before any storage write (spec §6.5): skip the write entirely on retry.
+	existing, err := s.images.FindByClientImageID(ctx, art.ID, in.Manifest.ClientImageID)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		if existing.SourceSHA256 != sha {
+			return nil, ErrFingerprintMismatch
+		}
+		return &UploadResult{Image: *existing, Existed: true}, nil
+	}
+
 	imgID := uuid.NewString()
 	ext, _ := ExtFor(in.Manifest.ContentType)
 	key := fmt.Sprintf("%s/%s/%s.%s", art.Visibility, art.ID, imgID, ext)
 
-	// On idempotent retry (same client_image_id + same SHA256), Insert returns
-	// Existed=true but `key` is a duplicate object never referenced by the DB.
-	// TODO post-v1: track and sweep in R2 GC (spec §11).
 	if err := s.store.Put(ctx, key, bytes.NewReader(buf), in.Manifest.ContentType); err != nil {
 		return nil, err
 	}
@@ -87,7 +96,7 @@ func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in Upload
 		ByteSize: len(buf), Blurhash: dec.Blurhash,
 	})
 	if err != nil {
-		_ = s.store.Delete(ctx, key) // best-effort: prevent orphan on insert failure
+		_ = s.store.Delete(ctx, key) // best-effort: prevent orphan on concurrent-race insert failure
 		return nil, err
 	}
 
