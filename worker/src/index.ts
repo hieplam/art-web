@@ -48,8 +48,17 @@ export async function handle(request: Request, env: Env): Promise<Response> {
 
   let isPrivate: boolean;
   if (canonicalPath.startsWith("/private/")) {
-    // Private branch — Task 6 replaces this stub with HMAC verification.
-    return new Response("Unauthorized", { status: 401 });
+    isPrivate = true;
+    const sig = url.searchParams.get("sig");
+    const expStr = url.searchParams.get("exp");
+    if (!sig || !expStr) return new Response("Unauthorized", { status: 401 });
+    const exp = parseExactDecimal(expStr);
+    if (exp === null || Date.now() / 1000 > exp) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+    const keyBytes = hexToBytes(env.WORKER_SIGNING_KEY);
+    const ok = await verifySignature(keyBytes, canonicalPath, exp, sig);
+    if (!ok) return new Response("Unauthorized", { status: 401 });
   } else if (canonicalPath.startsWith("/public/")) {
     isPrivate = false;
   } else {
