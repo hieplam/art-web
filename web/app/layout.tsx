@@ -1,11 +1,14 @@
 // web/app/layout.tsx
 import "./globals.css";
-import type { ReactNode } from "react";
+import { Nav } from "@/components/Nav";
 
-export default function Root({ children }: { children: ReactNode }) {
+export default async function Root({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <Nav />
+        {children}
+      </body>
     </html>
   );
 }
