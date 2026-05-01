@@ -1,8 +1,8 @@
 import { render, screen, act } from "@testing-library/react";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { InfiniteFeed } from "./InfiniteFeed";
 
-let triggerEnter: () => void;
+let triggerEnter: () => void = () => {};
 
 beforeEach(() => {
   vi.stubGlobal("IntersectionObserver", class {
@@ -10,9 +10,12 @@ beforeEach(() => {
       triggerEnter = () => cb([{ isIntersecting: true }]);
     }
     observe() {}
+    unobserve() {}
     disconnect() {}
   });
 });
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("InfiniteFeed", () => {
   it("calls fetchMore when sentinel intersects, then renders new items", async () => {
