@@ -21,3 +21,23 @@ func TestDecodeAndBlurhash_JPEG(t *testing.T) {
 		t.Fatalf("blurhash too short: %q", out.Blurhash)
 	}
 }
+
+func TestDecodeAndBlurhash_ReturnsFormat(t *testing.T) {
+	cases := []struct {
+		file   string
+		want   string
+	}{
+		{"testdata/sample.jpg", "jpeg"},
+		{"testdata/sample.png", "png"},
+	}
+	for _, tc := range cases {
+		raw, _ := os.ReadFile(tc.file)
+		out, err := image.DecodeAndBlurhash(bytes.NewReader(raw), "")
+		if err != nil {
+			t.Fatalf("%s decode: %v", tc.file, err)
+		}
+		if out.Format != tc.want {
+			t.Fatalf("%s: expected Format %q, got %q", tc.file, tc.want, out.Format)
+		}
+	}
+}

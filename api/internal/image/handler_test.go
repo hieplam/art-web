@@ -44,6 +44,27 @@ func (f *failingStore) Put(ctx context.Context, k string, b io.Reader, ct string
 	return f.Storage.Put(ctx, k, b, ct)
 }
 
+type spyStore struct {
+	storage.Storage
+	mu          sync.Mutex
+	putCount    int
+	deleteKeys  []string
+}
+
+func (s *spyStore) Put(ctx context.Context, k string, b io.Reader, ct string) error {
+	s.mu.Lock()
+	s.putCount++
+	s.mu.Unlock()
+	return s.Storage.Put(ctx, k, b, ct)
+}
+
+func (s *spyStore) Delete(ctx context.Context, k string) error {
+	s.mu.Lock()
+	s.deleteKeys = append(s.deleteKeys, k)
+	s.mu.Unlock()
+	return s.Storage.Delete(ctx, k)
+}
+
 func newHandler(t *testing.T, store storage.Storage) (*chi.Mux, string, string) {
 	pool, err := db.New(context.Background(), dbtest.StartPostgres(t))
 	if err != nil {
@@ -188,5 +209,68 @@ func TestUploadCase20_PartialFailureResume(t *testing.T) {
 		`SELECT COUNT(*) FROM artwork_images WHERE artwork_id=$1`, aid).Scan(&n)
 	if n != 5 {
 		t.Fatalf("expected 5 rows, got %d", n)
+	}
+}
+
+func TestUploadContentTypeMismatch_Returns422(t *testing.T) {
+	store := storage.NewLocalFS(t.TempDir())
+	mux, aid, token := newHandler(t, store)
+
+	// Send a real JPEG but declare content_type as image/png — must be rejected.
+	raw, _ := os.ReadFile("testdata/sample.jpg")
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	_ = mw.WriteField("manifest", `[{"client_image_id":"K1","position":0,"content_type":"image/png"}]`)
+	w, _ := mw.CreateFormFile("files", "f.jpg")
+	_, _ = w.Write(raw)
+	mw.Close()
+
+	req := httptest.NewRequest("POST", "/artworks/"+aid+"/images", body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.AddCookie(&http.Cookie{Name: "auth", Value: token})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != 422 {
+		t.Fatalf("expected 422 for content-type mismatch, got %d", rec.Code)
+	}
+}
+
+func TestUploadIdempotentRetry_SkipsStorageWrite(t *testing.T) {
+	spy := &spyStore{Storage: storage.NewLocalFS(t.TempDir())}
+	mux, aid, token := newHandler(t, spy)
+
+	if code := uploadJPEG(t, mux, aid, token, "K1", 0); code != 200 && code != 201 {
+		t.Fatalf("first upload: %d", code)
+	}
+	putAfterFirst := spy.putCount
+
+	// Retry with identical client_image_id and bytes — pre-check must short-circuit before Put.
+	if code := uploadJPEG(t, mux, aid, token, "K1", 0); code != 200 && code != 201 {
+		t.Fatalf("retry upload: %d", code)
+	}
+	if spy.putCount != putAfterFirst {
+		t.Fatalf("idempotent retry must not call store.Put: putCount was %d after first, %d after retry",
+			putAfterFirst, spy.putCount)
+	}
+}
+
+func TestUploadPositionConflict_OrphanIsDeleted(t *testing.T) {
+	spy := &spyStore{Storage: storage.NewLocalFS(t.TempDir())}
+	mux, aid, token := newHandler(t, spy)
+
+	// K1 claims position 0.
+	if code := uploadJPEG(t, mux, aid, token, "K1", 0); code != 200 && code != 201 {
+		t.Fatalf("first upload: %d", code)
+	}
+
+	// K2 at the same position must fail with 412 and the orphan key must be cleaned up.
+	if code := uploadJPEG(t, mux, aid, token, "K2", 0); code != 412 {
+		t.Fatalf("expected 412 for position conflict, got %d", code)
+	}
+	spy.mu.Lock()
+	deleted := len(spy.deleteKeys)
+	spy.mu.Unlock()
+	if deleted == 0 {
+		t.Fatal("expected store.Delete to be called for the orphan key after ErrPositionTaken")
 	}
 }

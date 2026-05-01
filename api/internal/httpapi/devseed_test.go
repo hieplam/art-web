@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	"local/art-web/api/internal/db"
+	"local/art-web/api/internal/dbtest"
 	"local/art-web/api/internal/httpapi"
 )
 
@@ -62,5 +64,30 @@ func TestDevSeed_Many_BulkSeedsPublic(t *testing.T) {
 	}
 	if len(body.Items) == 0 {
 		t.Fatal("feed must contain seeded bulk items")
+	}
+}
+
+func TestDevSeed_Many120_WritesAllItems(t *testing.T) {
+	httptest.NewServer(httpapi.New(testDeps(t, "test"))) // ensures DB + schema are ready
+	srv := httptest.NewServer(httpapi.New(testDeps(t, "test")))
+	defer srv.Close()
+
+	r, _ := srv.Client().Post(srv.URL+"/dev/seed?many=120", "", nil)
+	if r.StatusCode != 200 {
+		t.Fatalf("many=120 seed: %d", r.StatusCode)
+	}
+
+	// Query the DB directly to confirm all 120 bulk items (+ 1 public P) were written,
+	// not silently capped at the old maxMany=100 limit.
+	pool, err := db.New(t.Context(), dbtest.StartPostgres(t))
+	if err != nil {
+		t.Fatalf("db.New: %v", err)
+	}
+	t.Cleanup(func() { pool.Close() })
+	var n int
+	_ = pool.QueryRow(t.Context(),
+		`SELECT COUNT(*) FROM artworks WHERE visibility='public'`).Scan(&n)
+	if n < 121 {
+		t.Fatalf("expected at least 121 public artworks (120 bulk + 1 P), got %d — cap may still be too low", n)
 	}
 }
