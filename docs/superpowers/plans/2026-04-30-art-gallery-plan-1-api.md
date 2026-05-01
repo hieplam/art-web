@@ -4659,4 +4659,4 @@ After all 32 tasks land, Plan 1 produces a Go API that:
 - Builds a signed image URL the Worker (Plan 2) verifies (case 15 companion)
 - Runs against `localfs` in dev or `r2` in prod via the same `Storage` interface
 
-The 25-test correctness budget is partially satisfied (cases 1-5 + 15-companion + 17-21 + the building blocks for 6-9). The remaining cases (10-14, 15 cross-system, 16, 22-25) are addressed by Plans 2 and 3.
+The 26-test correctness budget is partially satisfied (cases 1-5 + 15-companion + 17-21 incl. 17b + the building blocks for 6-9). The remaining cases (10-14, 15 cross-system, 16, 22-25) are addressed by Plans 2 and 3.

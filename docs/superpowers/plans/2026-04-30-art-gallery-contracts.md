@@ -294,7 +294,7 @@ type ApiError = {
 
 ## 12. Test Distribution Across Plans
 
-The 25 critical-correctness test cases from spec §8.6 are distributed:
+The 26 critical-correctness test cases from spec §8.6 are distributed:
 
 | Spec § | Cases | Plan | File |
 |---|---|---|---|
@@ -303,7 +303,7 @@ The 25 critical-correctness test cases from spec §8.6 are distributed:
 | 8.6.1 (privacy matrix — SSR HTML) | 6, 7, 8, 9 | Plan 3 | `web/e2e/privacy_html.spec.ts` |
 | 8.6.2 (HMAC + cache safety) | 15, 16 | Plan 2 | `worker/test/round_trip.spec.ts`, `worker/test/cache_safety.spec.ts` |
 | 8.6.2 (signer correctness, Go side) | (companion of 15) | Plan 1 | `api/internal/auth/signurl_test.go` |
-| 8.6.3 (upload idempotency) | 17, 18, 19, 20 | Plan 1 | `api/internal/image/upload_idempotency_test.go` |
+| 8.6.3 (upload idempotency) | 17, 17b, 18, 19, 20 | Plan 1 | `api/internal/image/upload_idempotency_test.go` |
 | 8.6.4 (publish lifecycle) | 21 | Plan 1 | `api/internal/artwork/publish_lifecycle_test.go` |
 | 8.6.5 (UX) | 22, 23, 24, 25 | Plan 3 | `web/e2e/ux.spec.ts` |
 

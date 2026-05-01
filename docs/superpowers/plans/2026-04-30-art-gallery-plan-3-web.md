@@ -1809,4 +1809,4 @@ After all 22 tasks land, Plan 3 produces a Next.js frontend that:
 - Has 4 Playwright privacy tests (cases 6-9) and 4 UX tests (cases 22-25) running against a docker-compose'd full stack
 - Treats the API and Worker as pure consumers — no NextAuth, no client-side auth state
 
-Combined with Plans 1 and 2, all 25 critical-correctness tests from spec §8.6 are covered, and §12 acceptance criteria (Lighthouse ≥ 90 on the home feed under 4G with 50 images) is achievable given the rendering choices.
+Combined with Plans 1 and 2, all 26 critical-correctness tests from spec §8.6 are covered (including 17b fingerprint mismatch), and §12 acceptance criteria (Lighthouse ≥ 90 on the home feed under 4G with 50 images) is achievable given the rendering choices.
