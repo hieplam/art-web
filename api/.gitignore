@@ -1,0 +1,6 @@
+/bin/
+/var/storage/
+*.test
+coverage.out
+.env
+.env.local
