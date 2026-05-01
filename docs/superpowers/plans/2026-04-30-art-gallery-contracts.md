@@ -377,7 +377,7 @@ All `v` paths are major-version pinned via the import path; minor/patch resolves
 | `next` | `14.2.0` | web |
 | `react`, `react-dom` | `18.3.0` | web |
 | `typescript` | `^5.4.0` | web + worker |
-| `vitest` | `^1.6.0` | web + worker |
+| `vitest` | `^2.1.0` | web + worker |
 | `@cloudflare/vitest-pool-workers` | `^0.5.0` | worker |
 | `@cloudflare/workers-types` | `^4.20240117.0` | worker |
 | `wrangler` | `^3.50.0` (dep) — prereq tooling `3.x` | worker |
