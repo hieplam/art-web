@@ -51,7 +51,8 @@ test("case 25 — flip private + incognito → disappearance", async ({ browser 
   await ip.goto(`/u/${env.aliceSlug}`);
   expect(await ip.content()).toContain(env.pId);
 
-  await fetch(`${process.env.API_BASE}/artworks/${env.pId}`, {
+  const apiBase = process.env.API_BASE || "http://localhost:8080";
+  await fetch(`${apiBase}/artworks/${env.pId}`, {
     method: "PATCH",
     headers: { Cookie: env.aliceCookie, "Content-Type": "application/json" },
     body: JSON.stringify({ visibility: "private" }),

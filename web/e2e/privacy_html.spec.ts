@@ -1,8 +1,6 @@
 // web/e2e/privacy_html.spec.ts
-import { test, expect, request } from "@playwright/test";
+import { test, expect } from "@playwright/test";
 import { seedMatrix } from "./_helpers";
-
-const API = process.env.API_BASE || "http://localhost:8080";
 
 let env: Awaited<ReturnType<typeof seedMatrix>>;
 test.beforeAll(async () => { env = await seedMatrix(); });
