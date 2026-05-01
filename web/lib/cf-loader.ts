@@ -8,7 +8,12 @@ function pickWidth(requested: number): number {
 }
 
 export default function cfLoader(args: { src: string; width: number; quality?: number }): string {
-  const u = new URL(args.src);
+  let u: URL;
+  try {
+    u = new URL(args.src);
+  } catch {
+    return args.src;
+  }
   const publicOrigin = process.env.NEXT_PUBLIC_CDN_BASE;
   if (publicOrigin) {
     const origin = new URL(publicOrigin);

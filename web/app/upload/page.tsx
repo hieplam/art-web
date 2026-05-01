@@ -5,6 +5,7 @@ import { ArtworkUploader } from "@/components/ArtworkUploader";
 import type { User } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
 
 export default async function UploadPage() {
   const serverBase = apiBase();
