@@ -1,6 +1,6 @@
 // web/components/Nav.tsx
 import Link from "next/link";
-import { api, apiBase, forwardCookie, hasAuthCookie, publicApiBase } from "@/lib/api";
+import { api, apiBase, ApiClientError, forwardCookie, hasAuthCookie, publicApiBase } from "@/lib/api";
 import type { User } from "@/lib/types";
 
 export async function Nav() {
@@ -9,7 +9,9 @@ export async function Nav() {
   let me: User | null = null;
   if (hasAuthCookie()) {
     try { me = await api<User>({ base: serverBase, path: "/me", cookie: forwardCookie() }); }
-    catch { /* 401 = not signed in */ }
+    catch (err) {
+      if (!(err instanceof ApiClientError && err.status === 401)) throw err;
+    }
   }
   return (
     <nav className="flex items-center justify-between px-4 py-2 border-b">
