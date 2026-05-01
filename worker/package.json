@@ -1,0 +1,24 @@
+{
+  "name": "art-web-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "test": "vitest run",
+    "test:integration": "vitest run -c vitest.integration.config.ts",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.5.0",
+    "@cloudflare/workers-types": "^4.20240117.0",
+    "image-size": "^1.1.1",
+    "typescript": "^5.4.0",
+    "vitest": "^2.1.0",
+    "wrangler": "^3.50.0"
+  }
+}
