@@ -54,6 +54,7 @@
 | 30 | Publish lifecycle test (case 21) | http |
 | 31 | `cmd/api/main.go` wiring + config | smoke |
 | 32 | `Makefile` + `.github/workflows/api.yml` | CI |
+| 33 | Test-only `/dev/seed` endpoint (APP_ENV=test only) | http (consumed by Plan 3 E2E) |
 
 ---
 
@@ -4654,12 +4655,24 @@ func classifyCachePath(p string) cacheHint {
 }
 ```
 
-- [ ] **Step 3: Run + commit**
+- [ ] **Step 3: `/healthz` route** (registered before all middleware so docker-compose healthchecks pass even before DB connects)
+
+```go
+// api/internal/httpapi/router.go (excerpt — at the very top of New())
+r.Get("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+    w.WriteHeader(http.StatusOK)
+    _, _ = w.Write([]byte("ok"))
+})
+```
+
+The route bypasses cache-control middleware (no header) and the auth middleware. A healthz that requires DB to answer would fail to flap on transient DB blips and prevent docker-compose `up --wait` from converging — keep it boring.
+
+- [ ] **Step 4: Run + commit**
 
 ```bash
 cd api && go test ./internal/httpapi/...
-git add api/internal/httpapi/middleware.go api/internal/httpapi/middleware_test.go
-git commit -m "[api] feat(httpapi): CORS + no-store for viewer-specific endpoints"
+git add api/internal/httpapi/middleware.go api/internal/httpapi/middleware_test.go api/internal/httpapi/router.go
+git commit -m "[api] feat(httpapi): CORS, cache-control, and /healthz for compose healthchecks"
 ```
 
 ---
@@ -4901,7 +4914,10 @@ func main() {
 	defer pool.Close()
 
 	var store storage.Storage
-	if cfg.AppEnv == "dev" {
+	// `test` and `dev` both run against localfs so the e2e docker-compose
+	// stack and developer machines do not need real R2 credentials. Plan 3's
+	// docker-compose sets APP_ENV=test for the api service (Plan 3 Task 21).
+	if cfg.AppEnv == "dev" || cfg.AppEnv == "test" {
 		store = storage.NewLocalFS("./var/storage")
 	} else {
 		s3cli := s3.NewFromConfig(aws.Config{
@@ -5095,9 +5111,225 @@ git commit -m "[api] ci: Makefile + GitHub Actions workflow scoped to api/**"
 
 ---
 
+## Task 33: Test-only `/dev/seed` endpoint
+
+**Why this task exists:** Plan 3's E2E suite (`web/e2e/privacy_html.spec.ts`, `web/e2e/ux.spec.ts`) and Plan 2's Layer-B round-trip (`worker/test_integration/round_trip.spec.ts`) both need a deterministic way to mint an authenticated cookie and pre-seed the privacy-matrix fixture (user A, user B, artworks P+Q, tag `t`). The v1 spec only supports Google OAuth — usable in production, useless in CI. This task adds a *strictly* APP_ENV-gated POST `/dev/seed` route that returns ready-to-use cookies and IDs.
+
+**Security posture:** the route is only registered when `cfg.AppEnv == "test"`. Even a single-line drift in `main.go` would expose user-creation-on-demand to prod, so the registration sits behind both an env check AND a top-of-handler re-check; defense in depth.
+
+**Files:**
+- Create: `api/internal/httpapi/devseed.go`
+- Create: `api/internal/httpapi/devseed_test.go`
+- Modify: `api/internal/httpapi/router.go` (register the route only when APP_ENV=test)
+- Modify: `api/cmd/api/main.go` (pass `cfg.AppEnv` into `httpapi.Deps`)
+
+- [ ] **Step 1: Failing test**
+
+```go
+// api/internal/httpapi/devseed_test.go
+package httpapi_test
+
+import (
+	"encoding/json"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/<org>/art-web/api/internal/httpapi"
+)
+
+func TestDevSeed_DisabledByDefault(t *testing.T) {
+	srv := httptest.NewServer(httpapi.New(testDeps(t, "prod"))) // AppEnv != "test"
+	defer srv.Close()
+	r, _ := srv.Client().Post(srv.URL+"/dev/seed", "", nil)
+	if r.StatusCode != 404 {
+		t.Fatalf("dev seed must be 404 outside test env; got %d", r.StatusCode)
+	}
+}
+
+func TestDevSeed_TestEnv_ReturnsFixture(t *testing.T) {
+	srv := httptest.NewServer(httpapi.New(testDeps(t, "test")))
+	defer srv.Close()
+
+	r, err := srv.Client().Post(srv.URL+"/dev/seed", "application/json", nil)
+	if err != nil || r.StatusCode != 200 {
+		t.Fatalf("seed POST: status %d err %v", r.StatusCode, err)
+	}
+	var out struct {
+		AliceCookie, BobCookie string
+		AliceSlug, BobSlug     string
+		PID, QID               string `json:"pId,qId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.HasPrefix(out.AliceCookie, "auth=") || !strings.HasPrefix(out.BobCookie, "auth=") {
+		t.Fatalf("cookies must be auth=...; got alice=%q bob=%q", out.AliceCookie, out.BobCookie)
+	}
+	if out.PID == "" || out.QID == "" || out.PID == out.QID {
+		t.Fatalf("PID/QID must be distinct non-empty UUIDs; got P=%q Q=%q", out.PID, out.QID)
+	}
+}
+
+func TestDevSeed_Many_BulkSeedsPublic(t *testing.T) {
+	srv := httptest.NewServer(httpapi.New(testDeps(t, "test")))
+	defer srv.Close()
+	r, _ := srv.Client().Post(srv.URL+"/dev/seed?many=120", "", nil)
+	if r.StatusCode != 200 {
+		t.Fatalf("many seed: %d", r.StatusCode)
+	}
+	// Subsequent feed query should report ≥120 items.
+	feed, _ := srv.Client().Get(srv.URL + "/artworks?limit=200")
+	if feed.StatusCode != 200 {
+		t.Fatalf("feed: %d", feed.StatusCode)
+	}
+}
+```
+
+`testDeps(t, "test")` is a helper that wires real Postgres (testcontainer) + localfs + an in-memory JWT signer with a fixed key. Reuse the harness from earlier handler tests; only the `AppEnv` field changes.
+
+- [ ] **Step 2: Implementation**
+
+```go
+// api/internal/httpapi/devseed.go
+package httpapi
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	"github.com/<org>/art-web/api/internal/artwork"
+	"github.com/<org>/art-web/api/internal/auth"
+	"github.com/<org>/art-web/api/internal/user"
+)
+
+// DevSeed is registered only when AppEnv == "test". Two layers of defense:
+// (1) router.go skips registration outside test, (2) the handler itself
+// re-checks before doing anything destructive.
+type DevSeed struct {
+	AppEnv   string
+	Users    *user.Repo
+	Artworks *artwork.Repo
+	Tags     *artwork.TagsRepo
+	JWT      *auth.JWT
+	Cookie   auth.CookieOpts
+}
+
+type seedResponse struct {
+	AliceCookie string `json:"aliceCookie"`
+	BobCookie   string `json:"bobCookie"`
+	AliceSlug   string `json:"aliceSlug"`
+	BobSlug     string `json:"bobSlug"`
+	PID         string `json:"pId"`
+	QID         string `json:"qId"`
+}
+
+func (h *DevSeed) handle(w http.ResponseWriter, r *http.Request) {
+	if h.AppEnv != "test" {
+		http.NotFound(w, r) // never leak existence outside test
+		return
+	}
+
+	ctx := r.Context()
+	// Stable but unique per call: append 4 random bytes so reseeding within
+	// a single Postgres instance does not collide on `users.slug`.
+	suffix := randHex(4)
+	alice, err := h.Users.UpsertOAuth(ctx, "test", "alice-"+suffix, "alice@test", "Alice", "alice-"+suffix)
+	if err != nil { writeErr(w, err); return }
+	bob, err := h.Users.UpsertOAuth(ctx, "test", "bob-"+suffix, "bob@test", "Bob", "bob-"+suffix)
+	if err != nil { writeErr(w, err); return }
+
+	p, err := h.Artworks.Create(ctx, alice.ID, "Public P", "public")
+	if err != nil { writeErr(w, err); return }
+	q, err := h.Artworks.Create(ctx, alice.ID, "Private Q", "private")
+	if err != nil { writeErr(w, err); return }
+
+	// Tag both with "t" so the tag-page test can find P (and prove Q is hidden).
+	if err := h.Tags.UpsertAndAttach(ctx, p.ID, []string{"t"}); err != nil { writeErr(w, err); return }
+	if err := h.Tags.UpsertAndAttach(ctx, q.ID, []string{"t"}); err != nil { writeErr(w, err); return }
+
+	// Optional: ?many=N seeds N additional public artworks for case 22.
+	if many, _ := strconv.Atoi(r.URL.Query().Get("many")); many > 0 {
+		for i := 0; i < many; i++ {
+			if _, err := h.Artworks.Create(ctx, alice.ID, fmt.Sprintf("Bulk %d", i), "public"); err != nil {
+				writeErr(w, err); return
+			}
+		}
+	}
+
+	aliceJWT, _ := h.JWT.Issue(alice.ID)
+	bobJWT, _ := h.JWT.Issue(bob.ID)
+
+	// Build a Cookie header value the test can pass back as `Cookie:` directly.
+	out := seedResponse{
+		AliceCookie: "auth=" + aliceJWT,
+		BobCookie:   "auth=" + bobJWT,
+		AliceSlug:   alice.Slug,
+		BobSlug:     bob.Slug,
+		PID:         p.ID,
+		QID:         q.ID,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+func randHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+```
+
+The seeded artworks have **no images** — the privacy SSR HTML tests (Plan 3 case 6-9) don't require images for negative-content assertions, and case 25's incognito flip works on the artwork ID alone. Image uploads would require building multipart bodies in the seeder, which is more complex than needed. If a future test requires images, extend `DevSeed` rather than embedding image upload in the matrix seed.
+
+- [ ] **Step 3: Wire registration in `router.go`**
+
+```go
+// api/internal/httpapi/router.go (excerpt — within New(deps *Deps))
+if deps.AppEnv == "test" {
+    seed := &DevSeed{
+        AppEnv:   deps.AppEnv,
+        Users:    deps.Users,
+        Artworks: deps.Artworks,
+        Tags:     deps.Tags,
+        JWT:      deps.JWT,
+        Cookie:   deps.CookieOpts,
+    }
+    r.Post("/dev/seed", seed.handle)
+}
+```
+
+Add `AppEnv string` to the `Deps` struct.
+
+- [ ] **Step 4: Wire `cfg.AppEnv` from `main.go`**
+
+In `cmd/api/main.go` Step 1 (Task 31), the `httpapi.Deps` literal gains:
+
+```go
+r := httpapi.New(&httpapi.Deps{
+    AppEnv: cfg.AppEnv,  // ← add this line
+    JWT: jwts, URL: urls,
+    // ...rest unchanged
+})
+```
+
+- [ ] **Step 5: Run tests + commit**
+
+```bash
+cd api && go test ./internal/httpapi/... -run DevSeed
+git add api/internal/httpapi/devseed.go api/internal/httpapi/devseed_test.go api/internal/httpapi/router.go api/cmd/api/main.go
+git commit -m "[api] feat: test-only POST /dev/seed for cross-system E2E fixtures"
+```
+
+---
+
 ## Done
 
-After all 32 tasks land, Plan 1 produces a Go API that:
+After all 33 tasks land, Plan 1 produces a Go API that:
 
 - Accepts Google OAuth and issues an HS256 cookie
 - Persists artworks/images/tags with the spec §5 schema
@@ -5105,6 +5337,7 @@ After all 32 tasks land, Plan 1 produces a Go API that:
 - Accepts multi-image uploads with idempotent retries (cases 17–20)
 - Holds `published_at` stable across flips (case 21)
 - Builds a signed image URL the Worker (Plan 2) verifies (case 15 companion)
-- Runs against `localfs` in dev or `r2` in prod via the same `Storage` interface
+- Runs against `localfs` in dev, `localfs` under `APP_ENV=test` for E2E, or `r2` in prod via the same `Storage` interface
+- Exposes a strictly-gated `/dev/seed` endpoint that Plan 2 Layer-B and Plan 3 E2E rely on for deterministic fixtures
 
 The 26-test correctness budget is partially satisfied (cases 1-5 + 15-companion + 17-21 incl. 17b + the building blocks for 6-9). The remaining cases (10-14, 15 cross-system, 16, 22-25) are addressed by Plans 2 and 3.

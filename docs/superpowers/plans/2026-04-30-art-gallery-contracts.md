@@ -300,7 +300,7 @@ type ApiError = {
 | `CDN_ORIGIN` | API only | base URL emitted in image responses; defaults `https://cdn.example.com` |
 | `COOKIE_DOMAIN` | API only | e.g. `.example.com` in prod; empty in dev |
 | `ALLOWED_ORIGIN` | API only | CORS Access-Control-Allow-Origin; the FE host (e.g. `https://example.com`) |
-| `APP_ENV` | API only | `dev` sets `Secure=false` on the auth cookie |
+| `APP_ENV` | API only | `dev` sets `Secure=false` on the auth cookie. `test` additionally (a) swaps `Storage` for `localfs.Store` so docker-compose runs without R2 credentials, and (b) registers a test-only `POST /dev/seed` route that mints fixture cookies + artworks for Plan 2 Layer-B and Plan 3 E2E. The route returns 404 outside test env (router skips registration AND handler re-checks). See Plan 1 Task 33. |
 | `NEXT_PUBLIC_API_BASE` | Web only | e.g. `https://api.example.com` |
 | `NEXT_PUBLIC_CDN_BASE` | Web only | optional dev override; if unset, the loader uses the host of the URL the API returned |
 
@@ -370,6 +370,7 @@ All `v` paths are major-version pinned via the import path; minor/patch resolves
 | `tailwindcss` | `^3.4.0` | web |
 | `jsdom` | `^24.0.0` | web |
 | `image-size` | `^1.1.1` | worker + web |
+| `blurhash` | `^2.0.5` | web (placeholder decode — upstream package, not an in-tree decoder) |
 | `pngjs` | `^7.0.0` | web (blurhash placeholder) |
 | `@vitejs/plugin-react` | `^4.0.0` | web |
 

@@ -78,7 +78,9 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "blurhash": "^2.0.5",
     "next": "14.2.0",
+    "pngjs": "^7.0.0",
     "react": "18.3.0",
     "react-dom": "18.3.0"
   },
@@ -349,11 +351,23 @@ export async function api<T = unknown>(args: ApiArgs): Promise<T> {
 }
 
 // Helper for RSC handlers that need to forward the user's cookie to the API.
-import { cookies, headers } from "next/headers";
+//
+// We build the header explicitly via getAll() rather than relying on
+// `cookies().toString()`. The toString shape is not part of Next's
+// documented public API and shifts between minor releases (it has shipped
+// `name=val; name2=val2`, `name=val&name2=val2`, and a `[object …]`
+// stringification across the 13.x → 14.x line). Building the value we
+// know the API expects keeps us insulated from that drift.
+import { cookies } from "next/headers";
 
 export function forwardCookie(): string | undefined {
-  const c = cookies().toString();
-  return c || undefined;
+  const all = cookies().getAll();
+  if (all.length === 0) return undefined;
+  return all.map((c) => `${c.name}=${c.value}`).join("; ");
+}
+
+export function hasAuthCookie(): boolean {
+  return cookies().get("auth") !== undefined;
 }
 ```
 
@@ -470,74 +484,22 @@ describe("blurhashToDataURL", () => {
 });
 ```
 
-- [ ] **Step 2: Implementation** — uses a minimal in-tree BlurHash decoder (avoids the npm `blurhash` package dependency to keep bundle slim; blurhash decoding is ~80 lines)
+- [ ] **Step 2: Implementation** — uses the canonical `blurhash` npm package for the AC-component decode
+
+We use the upstream `blurhash` package rather than an in-tree decoder. An earlier draft of this plan inlined the algorithm and shipped a *wrong* AC-component decode (missing the `sign(v) * (v/m)² * maxAC` step), which produced placeholders with muddy/incorrect colors. The bug was invisible to a "starts with `data:image/png;base64,` and length > 120" assertion, so it would have shipped silently. The npm package is ~3 KB minified and authoritative — not worth maintaining a buggy fork to save it.
 
 ```ts
 // web/lib/blurhash.ts
 // Decodes a BlurHash string into a tiny base64-encoded PNG suitable for
-// `next/image`'s `blurDataURL` prop. We intentionally inline the decode
-// instead of pulling the `blurhash` npm package because we only need
-// 32×32 output and the algorithm is small.
-
-const FALLBACK = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
-
-const CHARSET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz#$%*+,-.:;=?@[]^_{|}~";
-
-function dec83(s: string): number {
-  let v = 0;
-  for (const c of s) v = v * 83 + CHARSET.indexOf(c);
-  return v;
-}
-
-function srgb(linear: number): number {
-  const n = Math.max(0, Math.min(1, linear));
-  return n <= 0.0031308 ? Math.round(n * 12.92 * 255)
-                        : Math.round((1.055 * n ** (1 / 2.4) - 0.055) * 255);
-}
-
-function decode(blurhash: string, width: number, height: number): Uint8ClampedArray {
-  const sizeFlag = dec83(blurhash[0]);
-  const numY = Math.floor(sizeFlag / 9) + 1;
-  const numX = (sizeFlag % 9) + 1;
-  const max = (dec83(blurhash[1]) + 1) / 166;
-  const colors: [number, number, number][] = [];
-  for (let i = 0; i < numX * numY; i++) {
-    if (i === 0) {
-      const v = dec83(blurhash.substring(2, 6));
-      colors.push([(v >> 16) / 255, ((v >> 8) & 255) / 255, (v & 255) / 255]);
-    } else {
-      const v = dec83(blurhash.substring(4 + i * 2, 6 + i * 2));
-      const q = (v - 0) / 19;
-      const r = max * (Math.floor(q / 361) - 9) / 9;
-      const g = max * ((Math.floor(q / 19) % 19) - 9) / 9;
-      const b = max * ((q % 19) - 9) / 9;
-      colors.push([r, g, b]);
-    }
-  }
-  const px = new Uint8ClampedArray(width * height * 4);
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      let r = 0, g = 0, b = 0;
-      for (let j = 0; j < numY; j++) {
-        for (let i = 0; i < numX; i++) {
-          const basis = Math.cos((Math.PI * x * i) / width) * Math.cos((Math.PI * y * j) / height);
-          const c = colors[i + j * numX];
-          r += c[0] * basis;
-          g += c[1] * basis;
-          b += c[2] * basis;
-        }
-      }
-      const idx = 4 * (x + y * width);
-      px[idx]     = srgb(r);
-      px[idx + 1] = srgb(g);
-      px[idx + 2] = srgb(b);
-      px[idx + 3] = 255;
-    }
-  }
-  return px;
-}
-
+// `next/image`'s `blurDataURL` prop. Two-step pipeline:
+//   1. blurhash.decode → RGBA pixels
+//   2. pngjs → base64-encoded PNG
+import { decode as decodeBlurhash } from "blurhash";
 import { PNG } from "pngjs/browser";
+
+// 1×1 transparent PNG. Returned for empty/malformed input so the caller
+// never crashes the render — blurhash is visual sugar, not load-bearing.
+const FALLBACK = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 
 function rgbaToBase64Png(px: Uint8ClampedArray, w: number, h: number): string {
   const png = new PNG({ width: w, height: h });
@@ -549,7 +511,7 @@ function rgbaToBase64Png(px: Uint8ClampedArray, w: number, h: number): string {
 export function blurhashToDataURL(hash: string, w = 32, h = 32): string {
   if (!hash || hash.length < 6) return FALLBACK;
   try {
-    const px = decode(hash, w, h);
+    const px = decodeBlurhash(hash, w, h);
     return rgbaToBase64Png(px, w, h);
   } catch {
     return FALLBACK;
@@ -557,14 +519,15 @@ export function blurhashToDataURL(hash: string, w = 32, h = 32): string {
 }
 ```
 
-`pngjs/browser` is ~20 KB gzipped. Add it to `web/package.json` dependencies (`"pngjs": "^7.0.0"`) before running the tests.
+`blurhash` ships its own TypeScript types so no `@types/blurhash` is needed. `pngjs/browser` provides a Buffer-based PNG encoder; in Next 14's RSC + jsdom-test environment Buffer is polyfilled.
 
-- [ ] **Step 3: Run + commit**
+- [ ] **Step 3: Add deps + run + commit**
 
 ```bash
-cd web && npm install pngjs && npm test -- blurhash
+cd web && npm install blurhash@^2.0 pngjs@^7.0
+npm test -- blurhash
 git add web/lib/blurhash.ts web/lib/blurhash.test.ts web/package.json web/package-lock.json
-git commit -m "[web] feat: BlurHash → tiny base64 PNG for next/image blurDataURL"
+git commit -m "[web] feat: BlurHash → tiny base64 PNG using upstream blurhash package"
 ```
 
 ---
@@ -833,17 +796,15 @@ git commit -m "[web] feat(component): InfiniteFeed with deduping IntersectionObs
 ```tsx
 // web/components/Nav.tsx
 import Link from "next/link";
-import { cookies } from "next/headers";
-import { api } from "@/lib/api";
+import { api, forwardCookie, hasAuthCookie } from "@/lib/api";
 import type { User } from "@/lib/types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
 
 export async function Nav() {
   let me: User | null = null;
-  const cookie = cookies().toString();
-  if (cookie.includes("auth=")) {
-    try { me = await api<User>({ base: API_BASE, path: "/me", cookie }); }
+  if (hasAuthCookie()) {
+    try { me = await api<User>({ base: API_BASE, path: "/me", cookie: forwardCookie() }); }
     catch { /* 401 = not signed in */ }
   }
   return (
@@ -968,8 +929,8 @@ git commit -m "[web] feat: home feed with SSR-first paint + client infinite scro
 
 ```tsx
 // web/app/u/[slug]/page.tsx
-import { cookies } from "next/headers";
-import { api } from "@/lib/api";
+import { notFound } from "next/navigation";
+import { api, ApiClientError, forwardCookie } from "@/lib/api";
 import { Masonry } from "@/components/Masonry";
 import { ArtCard } from "@/components/ArtCard";
 import type { UserProfile } from "@/lib/types";
@@ -981,10 +942,19 @@ export const fetchCache = "force-no-store";
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
 
 export default async function Profile({ params }: { params: { slug: string } }) {
-  const cookie = cookies().toString();
-  const data = await api<UserProfile>({
-    base: API_BASE, path: `/users/${encodeURIComponent(params.slug)}`, cookie,
-  });
+  let data: UserProfile;
+  try {
+    data = await api<UserProfile>({
+      base: API_BASE,
+      path: `/users/${encodeURIComponent(params.slug)}`,
+      cookie: forwardCookie(),
+    });
+  } catch (e) {
+    // 404 → render Next's not-found UI (no leaked metadata).
+    // Anything else propagates to the error boundary so ops sees it.
+    if (e instanceof ApiClientError && e.status === 404) notFound();
+    throw e;
+  }
   return (
     <main className="p-4">
       <header className="mb-4">
@@ -1018,11 +988,10 @@ git commit -m "[web] feat: profile page with force-dynamic + cookie-forwarded fe
 
 ```tsx
 // web/app/art/[id]/page.tsx
-import { cookies } from "next/headers";
 import { notFound } from "next/navigation";
 import Image from "next/image";
 import Link from "next/link";
-import { api, ApiClientError } from "@/lib/api";
+import { api, ApiClientError, forwardCookie } from "@/lib/api";
 import type { ArtworkDetail } from "@/lib/types";
 import { blurhashToDataURL } from "@/lib/blurhash";
 
@@ -1032,10 +1001,9 @@ export const fetchCache = "force-no-store";
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
 
 export default async function Art({ params }: { params: { id: string } }) {
-  const cookie = cookies().toString();
   let data: ArtworkDetail;
   try {
-    data = await api<ArtworkDetail>({ base: API_BASE, path: `/artworks/${params.id}`, cookie });
+    data = await api<ArtworkDetail>({ base: API_BASE, path: `/artworks/${params.id}`, cookie: forwardCookie() });
   } catch (e) {
     if (e instanceof ApiClientError && e.status === 404) notFound();
     throw e;
@@ -1140,17 +1108,39 @@ git commit -m "[web] feat: tag page (public-only, ISR cacheable)"
 
 - [ ] **Step 1: Server page**
 
+The page is server-rendered specifically so it can auth-gate before the form ever paints. Anonymous viewers get a 302 to the API's OAuth start route — we don't render the form just to have submission fail with a generic error 5 seconds later.
+
 ```tsx
 // web/app/upload/page.tsx
+import { redirect } from "next/navigation";
+import { api, ApiClientError, forwardCookie, hasAuthCookie } from "@/lib/api";
 import { ArtworkUploader } from "@/components/ArtworkUploader";
+import type { User } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
-export default function UploadPage() {
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
+
+export default async function UploadPage() {
+  // Cheap check first — no API round-trip needed if we don't even have a cookie.
+  if (!hasAuthCookie()) redirect(`${API_BASE}/auth/google/start`);
+
+  // Cookie may be present but stale (expired JWT, invalidated session) —
+  // verify with /me. 401 → redirect to OAuth start; any other failure
+  // bubbles up to Next's error boundary so ops sees it.
+  try {
+    await api<User>({ base: API_BASE, path: "/me", cookie: forwardCookie() });
+  } catch (e) {
+    if (e instanceof ApiClientError && e.status === 401) {
+      redirect(`${API_BASE}/auth/google/start`);
+    }
+    throw e;
+  }
+
   return (
     <main className="max-w-2xl mx-auto p-4">
       <h1 className="text-2xl mb-3">New artwork</h1>
-      <ArtworkUploader apiBase={process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080"} />
+      <ArtworkUploader apiBase={API_BASE} />
     </main>
   );
 }
@@ -1425,27 +1415,31 @@ export default async function globalSetup() {
 ```ts
 // web/e2e/_helpers.ts
 // These helpers talk directly to the API to set up the matrix:
-//   user A owns artwork P (public, tag "t") and artwork Q (private, tag "t")
-//   user B is another signed-in user
+//   user A (alice) owns artwork P (public, tag "t") and artwork Q (private, tag "t")
+//   user B (bob) is another signed-in user
 //   anon = no cookie
+//
+// The /dev/seed endpoint is registered by Plan 1 Task 33, gated by
+// APP_ENV=test. Outside test env it returns 404 (the route is not
+// registered AND the handler re-checks). The API in docker-compose.e2e.yml
+// runs with APP_ENV=test, so this just works inside CI.
 
 const API = process.env.API_BASE || "http://localhost:8080";
 
-// In v1 the OAuth flow requires a real Google account, so test seeding
-// uses a `/dev/seed` endpoint exposed only when APP_ENV=test. Plan 1 adds
-// this endpoint as a test-only build tag (see Plan 1 follow-up).
-export async function seedMatrix(): Promise<{
+export async function seedMatrix(opts: { many?: number } = {}): Promise<{
   aliceCookie: string; bobCookie: string;
   aliceSlug: string; bobSlug: string;
   pId: string; qId: string;
 }> {
-  const r = await fetch(`${API}/dev/seed`, { method: "POST" });
-  if (!r.ok) throw new Error("seed failed; ensure API has APP_ENV=test");
+  const url = new URL(`${API}/dev/seed`);
+  if (opts.many) url.searchParams.set("many", String(opts.many));
+  const r = await fetch(url, { method: "POST" });
+  if (!r.ok) {
+    const body = await r.text().catch(() => "");
+    throw new Error(`seed failed (${r.status}); ensure API runs with APP_ENV=test. Body: ${body}`);
+  }
   return r.json();
 }
-```
-
-The `/dev/seed` endpoint is added by a small follow-up to Plan 1: when `APP_ENV=test`, register a `POST /dev/seed` route that creates two users + P + Q + tag binding and returns their cookies. Keep this strictly behind the env check.
 
 - [ ] **Step 4: Commit**
 
@@ -1548,7 +1542,9 @@ test.beforeAll(async () => { env = await seedMatrix(); });
 
 test("case 22 — infinite scroll does not duplicate items", async ({ page }) => {
   // Seed enough public artworks to trigger ≥5 page fetches (~120 items).
-  await page.request.post("/dev/seed?many=120"); // helper endpoint variant
+  // Hit the API directly — Playwright's `page.request` honors baseURL,
+  // which points at the web app (port 3000), not the API (port 8080).
+  await seedMatrix({ many: 120 });
   await page.goto("/");
   for (let i = 0; i < 5; i++) {
     await page.evaluate(() => window.scrollBy(0, document.body.scrollHeight));
@@ -1602,10 +1598,15 @@ test("case 25 — flip private + incognito → disappearance", async ({ browser 
     body: JSON.stringify({ visibility: "private" }),
   });
 
-  // Wait for CDN purge window (≤30s per spec §11).
-  await ip.waitForTimeout(30000);
-  await ip.reload();
-  expect(await ip.content()).not.toContain(env.pId);
+  // Poll up to 60s for the profile page to drop P. Spec §11 says "<30s" for
+  // CDN purge; we ceiling at 60s so a slightly slow purge does not flake the
+  // test. Sleeping a flat 30s wastes time when purge is fast and flakes when
+  // purge is slow.
+  await expect.poll(async () => {
+    await ip.reload();
+    return (await ip.content()).includes(env.pId);
+  }, { timeout: 60_000, intervals: [500, 1000, 2000, 4000] }).toBe(false);
+
   await ip.goto("/");
   expect(await ip.content()).not.toContain(env.pId);
   await ip.goto(`/tag/t`);
@@ -1629,9 +1630,16 @@ git commit -m "[web] test: UX cases 22-25 (no-dupes, no-CLS, lazy, flip+incognit
 
 **Files:**
 - Create: `docker-compose.e2e.yml` (at repo root)
-- Create: `e2e/.env.e2e` (at repo root)
+- Create: `api/Dockerfile`
+- Create: `worker/Dockerfile.e2e`
+- Create: `worker/scripts/e2e-server.ts`
+- Create: `web/Dockerfile`
 
-- [ ] **Step 1: Compose file**
+**Why the Worker is harder than the others.** `wrangler dev` requires `wrangler login` against Cloudflare, which can't run unattended in CI. Miniflare standalone runs the Worker but cannot emulate the `env.IMAGES` binding offline. The clean compromise: ship a small Node entrypoint (`worker/scripts/e2e-server.ts`) that imports the same `handle(req, env)` function the production Worker exports, wraps a MinIO-backed S3 client to look like R2, and stubs IMAGES with a pass-through. This exercises the *real* canonicalization + HMAC + Cache-Control logic; only the actual pixel resize is mocked. Layer-B (Plan 2 Task 11) is what proves the resize works.
+
+`Cache-Control` headers are set per-branch by the production handler (Plan 2 Task 5), so privacy + cache invariants in the SSR HTML and UX tests still pin the same logic the production Worker runs.
+
+- [ ] **Step 1: Compose file with healthchecks on every service**
 
 ```yaml
 # docker-compose.e2e.yml — at repo root, NOT inside web/
@@ -1660,69 +1668,251 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports: ["9000:9000"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000/minio/health/ready || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   api:
-    build: ./api
+    build:
+      context: ./api
+      dockerfile: Dockerfile
     environment:
       ADDR: ":8080"
+      # APP_ENV=test triggers two behaviors in Plan 1 main.go:
+      #   1. loadConfig swaps Storage for localfs (no R2 credentials needed)
+      #   2. router registers POST /dev/seed for cross-system test fixtures
       APP_ENV: test
       DATABASE_URL: postgres://art:art@postgres:5432/artweb?sslmode=disable
-      JWT_SIGNING_KEY: "30313233343536373839616263646566303132333435363738396162636465666"
-      WORKER_SIGNING_KEY: "30313233343536373839616263646566303132333435363738396162636465666"
-      CDN_ORIGIN: "http://localhost:8787"
+      JWT_SIGNING_KEY: "3031323334353637383961626364656630313233343536373839616263646566"
+      WORKER_SIGNING_KEY: "3031323334353637383961626364656630313233343536373839616263646566"
+      CDN_ORIGIN: "http://worker:8787"   # API generates URLs the worker container resolves
       FRONTEND_URL: "http://localhost:3000/"
-      R2_BUCKET: art-dev
-      # In compose we override Storage to localfs by setting APP_ENV=test
-      # in main.go's loadConfig path.
     depends_on:
       postgres: { condition: service_healthy }
     ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   worker:
-    build: ./worker
+    build:
+      context: ./worker
+      dockerfile: Dockerfile.e2e
     environment:
-      WORKER_SIGNING_KEY: "30313233343536373839616263646566303132333435363738396162636465666"
+      PORT: "8787"
+      WORKER_SIGNING_KEY: "3031323334353637383961626364656630313233343536373839616263646566"
+      S3_ENDPOINT: "http://minio:9000"
+      S3_ACCESS_KEY_ID: "minioadmin"
+      S3_SECRET_ACCESS_KEY: "minioadmin"
+      R2_BUCKET: "art-dev"
+    depends_on:
+      minio: { condition: service_healthy }
     ports: ["8787:8787"]
-    # Note: env.IMAGES binding requires Cloudflare credentials. For E2E we
-    # use miniflare with a local IMAGES fake that pass-throughs bytes.
-    # Width verification (case 15) is gated to a separate workflow.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8787/healthz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   web:
-    build: ./web
+    build:
+      context: ./web
+      dockerfile: Dockerfile
     environment:
-      NEXT_PUBLIC_API_BASE: "http://localhost:8080"
-      NEXT_PUBLIC_CDN_BASE: "http://localhost:8787"
-    depends_on: [api, worker]
+      NEXT_PUBLIC_API_BASE: "http://api:8080"
+      NEXT_PUBLIC_CDN_BASE: "http://localhost:8787"   # browser-side; resolves to host port
+      API_BASE_INTERNAL: "http://api:8080"            # server-side fetch uses internal hostname
+    depends_on:
+      api:    { condition: service_healthy }
+      worker: { condition: service_healthy }
     ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || wget -qO- http://localhost:3000/ || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 ```
 
-- [ ] **Step 2: Add `Dockerfile`s**
+- [ ] **Step 2: Worker E2E entrypoint (`worker/scripts/e2e-server.ts`)**
 
-Each subtree needs a Dockerfile. Add `api/Dockerfile`, `worker/Dockerfile`, `web/Dockerfile`. Standard multi-stage builds (~15 lines each). Sample:
+Imports the production `handle()`, wraps MinIO as an R2-shaped object, stubs `IMAGES` with pass-through. ~60 lines.
+
+```ts
+// worker/scripts/e2e-server.ts
+import { createServer } from "node:http";
+import { Readable } from "node:stream";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { handle, type Env, type ImagesBinding } from "../src/index";
+
+const PORT = parseInt(process.env.PORT ?? "8787", 10);
+const SIGNING_KEY = process.env.WORKER_SIGNING_KEY ?? "";
+const BUCKET = process.env.R2_BUCKET ?? "art-dev";
+
+const s3 = new S3Client({
+  endpoint: process.env.S3_ENDPOINT ?? "http://minio:9000",
+  region: "auto",
+  forcePathStyle: true,
+  credentials: {
+    accessKeyId: process.env.S3_ACCESS_KEY_ID ?? "minioadmin",
+    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY ?? "minioadmin",
+  },
+});
+
+// Minimal R2 shim — handle() only calls .get(); other methods are typed but unused.
+const r2 = {
+  async get(key: string) {
+    try {
+      const out = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+      const bytes = await out.Body!.transformToByteArray();
+      return {
+        body: Readable.toWeb(Readable.from(Buffer.from(bytes))) as ReadableStream,
+      };
+    } catch {
+      return null;
+    }
+  },
+} as unknown as Env["R2"];
+
+// IMAGES stub — no real resize. Plan 2's Layer-B integration test (Task 11)
+// is what proves the real binding works; this stub just ensures privacy +
+// Cache-Control logic flows correctly through the production handler.
+const images: ImagesBinding = {
+  input(stream) {
+    return {
+      transform() { return this; },
+      async output(opts) {
+        return {
+          response: () => new Response(stream, {
+            status: 200,
+            headers: { "Content-Type": opts.format },
+          }),
+        };
+      },
+    } as never;
+  },
+};
+
+const env: Env = { R2: r2, IMAGES: images, WORKER_SIGNING_KEY: SIGNING_KEY };
+
+const server = createServer(async (nodeReq, nodeRes) => {
+  // Compose-internal /healthz so the docker healthcheck has a definitive signal.
+  if (nodeReq.url === "/healthz") {
+    nodeRes.writeHead(200, { "Content-Type": "text/plain" });
+    nodeRes.end("ok");
+    return;
+  }
+
+  const url = `http://localhost:${PORT}${nodeReq.url}`;
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(nodeReq.headers)) {
+    if (typeof v === "string") headers.set(k, v);
+    else if (Array.isArray(v)) headers.set(k, v.join(","));
+  }
+  try {
+    const resp = await handle(new Request(url, { method: nodeReq.method, headers }), env);
+    const respHeaders: Record<string, string> = {};
+    resp.headers.forEach((v, k) => { respHeaders[k] = v; });
+    nodeRes.writeHead(resp.status, respHeaders);
+    if (resp.body) {
+      const reader = resp.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        nodeRes.write(value);
+      }
+    }
+    nodeRes.end();
+  } catch (err) {
+    nodeRes.writeHead(500, { "Content-Type": "text/plain" });
+    nodeRes.end(`worker error: ${(err as Error).message}`);
+  }
+});
+
+server.listen(PORT, () => console.log(`worker e2e server on :${PORT}`));
+```
+
+`@aws-sdk/client-s3` is added to `worker/package.json` *only* under devDependencies — production wrangler deploys never run this script:
+
+```json
+"devDependencies": {
+  ...,
+  "@aws-sdk/client-s3": "^3.600.0",
+  "tsx": "^4.7.0"
+}
+```
+
+- [ ] **Step 3: Dockerfiles**
 
 ```dockerfile
 # api/Dockerfile
-# Go version pinned to match contracts §13 (must be ≥1.24 per Plan 1 §0
-# tech stack — t.Context() is a 1.24+ feature used throughout the test
-# suite). Bumping this without updating contracts §13 is a contract drift.
+# Go version pinned per contracts §13 (must be ≥1.24 — t.Context() is a
+# 1.24+ feature used throughout the test suite).
+#
+# Runtime is alpine, not distroless. Distroless ships no shell, which
+# means docker-compose's CMD-SHELL healthcheck (`wget -qO- /healthz`)
+# cannot run inside the container. Alpine adds ~5 MB but lets the
+# healthcheck work without an extra Go-built healthcheck binary.
 FROM golang:1.24-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN go build -o /bin/api ./cmd/api
+RUN CGO_ENABLED=0 go build -o /bin/api ./cmd/api
 
-FROM gcr.io/distroless/base-debian12
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates wget
 COPY --from=build /bin/api /api
 EXPOSE 8080
 ENTRYPOINT ["/api"]
 ```
 
-- [ ] **Step 3: Commit**
+```dockerfile
+# worker/Dockerfile.e2e
+# E2E-only image. Production worker deploys via `wrangler deploy` and
+# never builds this image.
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY tsconfig.json ./
+EXPOSE 8787
+CMD ["npx", "tsx", "scripts/e2e-server.ts"]
+```
+
+```dockerfile
+# web/Dockerfile
+FROM node:20-alpine AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM node:20-alpine
+WORKDIR /app
+COPY --from=build /app/.next ./.next
+COPY --from=build /app/public ./public
+COPY --from=build /app/package.json ./package.json
+COPY --from=build /app/node_modules ./node_modules
+EXPOSE 3000
+CMD ["npm", "run", "start"]
+```
+
+- [ ] **Step 4: API healthcheck endpoint**
+
+The compose healthcheck queries `/healthz`. Add the route to Plan 1's router (or wire it as a tiny Plan 1 follow-up): `GET /healthz` returns `200 OK` with body `ok`. Keep it pre-middleware so it works even before DB connects.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add docker-compose.e2e.yml api/Dockerfile worker/Dockerfile web/Dockerfile
-git commit -m "[web] chore: docker-compose for full-stack E2E with shared signing key"
+git add docker-compose.e2e.yml api/Dockerfile worker/Dockerfile.e2e worker/scripts/e2e-server.ts web/Dockerfile
+git commit -m "[web] chore: docker-compose for full-stack E2E with miniflare-free worker container"
 ```
 
 ---
@@ -1812,10 +2002,13 @@ git commit -m "[web] ci: web unit + cross-system E2E workflows"
 After all 22 tasks land, Plan 3 produces a Next.js frontend that:
 
 - Renders a public masonry feed at `/` with infinite scroll, no duplicates, no layout shift, lazy loading
-- Renders viewer-aware `/u/[slug]` and `/art/[id]` with `force-dynamic` + `no-store`
+- Renders viewer-aware `/u/[slug]` and `/art/[id]` with `force-dynamic` + `no-store`; both fall through to Next's `notFound()` on 404 (no leaked metadata)
+- `/upload` server-side checks `/me` and redirects anonymous viewers to OAuth start before painting the form
 - Owners see their drafts; anonymous and other-user requests get private content scrubbed from the HTML
-- Uses `next/image` with the contracts §6 allowlist via `cf-loader`, AVIF/WebP via `fmt=auto`, blurhash placeholders
-- Has 4 Playwright privacy tests (cases 6-9) and 4 UX tests (cases 22-25) running against a docker-compose'd full stack
+- Uses `next/image` with the contracts §6 allowlist via `cf-loader`, AVIF/WebP via `fmt=auto`, and the upstream `blurhash` package for placeholders (no buggy in-tree decoder)
+- Forwards cookies via an explicit `forwardCookie()` helper that does not depend on the undocumented `cookies().toString()` shape
+- Has 4 Playwright privacy tests (cases 6-9) and 4 UX tests (cases 22-25) running against a docker-compose'd full stack with healthchecks on every service so `up --wait` actually waits for readiness
 - Treats the API and Worker as pure consumers — no NextAuth, no client-side auth state
+- Worker container in compose runs the production `handle()` function via a small Node entrypoint that wraps MinIO as R2 and stubs IMAGES with pass-through; `wrangler dev` is reserved for Layer-B (Plan 2 Task 11) where real resize is verified
 
 Combined with Plans 1 and 2, all 26 critical-correctness tests from spec §8.6 are covered (including 17b fingerprint mismatch), and §12 acceptance criteria (Lighthouse ≥ 90 on the home feed under 4G with 50 images) is achievable given the rendering choices.

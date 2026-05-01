@@ -26,9 +26,9 @@
 | 2 | Allowlist constants module | unit |
 | 3 | Canonical path validator | unit |
 | 4 | HMAC verifier (WebCrypto) | unit |
-| 5 | Worker fetch handler — public path | unit |
-| 6 | Worker fetch handler — private path | unit |
-| 7 | Worker fetch handler — cache headers | unit |
+| 5 | Worker fetch handler — full handler with public path + IMAGES test fake + JPEG fixture | unit |
+| 6 | Worker fetch handler — private path with HMAC verify | unit |
+| 7 | Additional transform-call assertions (fmt negotiation, q default) | unit |
 | 8 | Privacy matrix tests (cases 10–14) | unit |
 | 9 | Cache-key safety test (case 16) | unit |
 | 10 | Test signer (TS port of Plan 1's signer) | unit |
@@ -119,7 +119,9 @@ ip = "127.0.0.1"
 port = 8787
 ```
 
-- [ ] **Step 4: vitest.config.ts (Layer A — in-process tests)**
+- [ ] **Step 4: vitest.config.ts (Layer A — in-process tests, minimal)**
+
+This file is rewritten in Task 6 once `WORKER_SIGNING_KEY` is needed. Tasks 2–5 don't read `env.WORKER_SIGNING_KEY`, so the bare config below is enough to compile and run early-task tests.
 
 ```ts
 // worker/vitest.config.ts
@@ -131,9 +133,10 @@ export default defineWorkersConfig({
       workers: {
         wrangler: { configPath: "./wrangler.toml" },
         miniflare: {
-          // Bind a fake IMAGES binding for tests that does pass-through.
-          // Real resize is only exercised in Layer-B integration tests.
-          serviceBindings: {},
+          r2Buckets: ["R2"],
+          // IMAGES is intentionally not bound — Layer-A tests inject a
+          // fake via `mkTestEnv()` (Task 5). Layer-B (Task 11) hits the
+          // real binding under `wrangler dev`.
         },
       },
     },
@@ -316,44 +319,42 @@ This is the verifier counterpart to Plan 1 Task 8's signer. The string-to-sign f
 import { describe, it, expect } from "vitest";
 import { verifySignature } from "../src/sign";
 
-const TEST_KEY_HEX = "30313233343536373839616263646566303132333435363738396162636465666"; // "0123456789abcdef" * 2 in hex
-const TEST_KEY_BYTES = (() => {
-  // The Go test uses the literal ASCII string "0123456789abcdef0123456789abcdef" as the key.
-  // We replicate exactly: encode that ASCII as bytes.
-  return new TextEncoder().encode("0123456789abcdef0123456789abcdef");
-})();
+// The Go signer test in Plan 1 uses the literal ASCII string
+// "0123456789abcdef0123456789abcdef" as the key (32 bytes). We use the
+// same bytes here so the locked HMAC vector matches.
+const TEST_KEY_BYTES = new TextEncoder().encode("0123456789abcdef0123456789abcdef");
 
 describe("verifySignature", () => {
   it("accepts the locked vector from Plan 1 Task 8", async () => {
     // Paste the hex produced by the Go test; this is the contract anchor.
-    const expected = "<PASTE-FROM-PLAN-1-TASK-8>";
+    const expected = "c018a64c183bc6d6348dbf8e2780d287e3550b6945037fa4bedf05f5aa663654";
     const ok = await verifySignature(TEST_KEY_BYTES, "/private/aaa/bbb.jpg", 1700000000, expected);
     expect(ok).toBe(true);
   });
 
   it("rejects a tampered signature", async () => {
     // Flip one nibble of a known-good signature; expect rejection.
-    const expected = "<PASTE-FROM-PLAN-1-TASK-8>";
+    const expected = "c018a64c183bc6d6348dbf8e2780d287e3550b6945037fa4bedf05f5aa663654";
     const tampered = expected.slice(0, -1) + (expected.slice(-1) === "0" ? "1" : "0");
     const ok = await verifySignature(TEST_KEY_BYTES, "/private/aaa/bbb.jpg", 1700000000, tampered);
     expect(ok).toBe(false);
   });
 
   it("rejects a different canonical path", async () => {
-    const expected = "<PASTE-FROM-PLAN-1-TASK-8>";
+    const expected = "c018a64c183bc6d6348dbf8e2780d287e3550b6945037fa4bedf05f5aa663654";
     const ok = await verifySignature(TEST_KEY_BYTES, "/private/aaa/ccc.jpg", 1700000000, expected);
     expect(ok).toBe(false);
   });
 
   it("rejects a different exp", async () => {
-    const expected = "<PASTE-FROM-PLAN-1-TASK-8>";
+    const expected = "c018a64c183bc6d6348dbf8e2780d287e3550b6945037fa4bedf05f5aa663654";
     const ok = await verifySignature(TEST_KEY_BYTES, "/private/aaa/bbb.jpg", 1700000001, expected);
     expect(ok).toBe(false);
   });
 });
 ```
 
-The placeholder `<PASTE-FROM-PLAN-1-TASK-8>` is replaced with the hex value the Go test produced. This is the cross-language anchor.
+The hex constant above (`c018a64c183bc6d6348dbf8e2780d287e3550b6945037fa4bedf05f5aa663654`) matches the locked Go vector in `api/internal/auth/sign_test.go::TestSign_FixedVector` (Plan 1 Task 8). This is the cross-language anchor — if either side recomputes a different value, the test fails on first run with no manual fill-in step.
 
 - [ ] **Step 2: Implementation using WebCrypto**
 
@@ -424,131 +425,192 @@ git commit -m "[worker] feat: WebCrypto HMAC verifier with constant-time hex com
 
 ---
 
-## Task 5: Worker fetch handler — public path
+## Task 5: Worker fetch handler — full handler with public path + IMAGES test fake
 
 **Files:**
 - Modify: `worker/src/index.ts`
+- Create: `worker/test/_imagesFake.ts`
+- Create: `worker/test/_env.ts`
+- Create: `worker/test/fixtures/tiny.jpg` (binary, ~1 KB)
 - Create: `worker/test/handler_public.spec.ts`
 
-- [ ] **Step 1: Failing test against an in-Worker R2 binding**
+**Why this task pulls in the IMAGES fake:** the `env.IMAGES` binding is not natively faked by `vitest-pool-workers` — there's no offline implementation in miniflare. We could split the public-path handler from the IMAGES fake into separate tasks, but then Task 5's success-path test ("200 + Cache-Control") cannot be authored or verified. Pulling the fake in here keeps every task green when it lands and avoids a previous version of this plan that had unreachable Cache-Control logic and a `globalThis` side-channel that doesn't cross the workerd isolate boundary.
+
+**The injection pattern:** `index.ts` exports both a `handle(req, env)` function and the conventional `default { fetch: handle }`. Tests import `handle` directly and pass an `env` object built from `cloudflare:test`'s real `env` (for R2 + WORKER_SIGNING_KEY) spread with a fake `IMAGES` binding. No globals, no module-level mutable state.
+
+- [ ] **Step 1: IMAGES test fake**
+
+```ts
+// worker/test/_imagesFake.ts
+// Records each transform pipeline call so tests can assert width/fmt/q
+// shape. The output is a pass-through of the source stream — Layer-A tests
+// don't verify pixel-level resize (that's Layer-B, Task 11).
+export type ImagesCall = { width?: number; format: string; quality: number };
+
+export class ImagesFake {
+  public calls: ImagesCall[] = [];
+
+  input(stream: ReadableStream): ImagesPipeline {
+    return new ImagesPipeline(this, stream);
+  }
+}
+
+class ImagesPipeline {
+  private widthHint?: number;
+  constructor(private fake: ImagesFake, private stream: ReadableStream) {}
+  transform(opts: { width?: number }): ImagesPipeline {
+    this.widthHint = opts.width;
+    return this;
+  }
+  async output(opts: { format: string; quality: number }): Promise<{ response(): Response }> {
+    this.fake.calls.push({ width: this.widthHint, format: opts.format, quality: opts.quality });
+    return {
+      response: () => new Response(this.stream, {
+        status: 200,
+        headers: { "Content-Type": opts.format },
+      }),
+    };
+  }
+}
+```
+
+- [ ] **Step 2: Test env helper**
+
+```ts
+// worker/test/_env.ts
+// `wpwEnv` is the worker's bindings as configured by `vitest.config.ts` —
+// real workerd-bound R2 and WORKER_SIGNING_KEY. We spread it so tests get
+// the real R2 (so .put / .get round-trip) and override IMAGES with a fake.
+import { env as wpwEnv } from "cloudflare:test";
+import { ImagesFake } from "./_imagesFake";
+import type { Env } from "../src/index";
+
+export type TestEnv = Env & { _images: ImagesFake };
+
+export function mkTestEnv(): TestEnv {
+  const fake = new ImagesFake();
+  return {
+    ...(wpwEnv as unknown as Env),
+    IMAGES: fake as unknown as Env["IMAGES"],
+    _images: fake,
+  };
+}
+```
+
+- [ ] **Step 3: JPEG fixture**
+
+The tests write source bytes into R2 so the handler can read them and feed them to `IMAGES.input(stream)`. The fake passes the bytes through unchanged, so technically any non-empty buffer works for Layer-A — but a real ~1 KB JPEG keeps the fixture honest in case a future test decodes the response (e.g. with `image-size`) before Layer-B runs.
+
+Generate once with ImageMagick and commit:
+
+```bash
+cd worker && mkdir -p test/fixtures
+convert -size 16x16 xc:steelblue test/fixtures/tiny.jpg
+```
+
+(The same `tiny.jpg` is reused by Tasks 6, 8, and 9; Task 11 ships a separate `2400px.jpg` because the round-trip test verifies pixel width.)
+
+- [ ] **Step 4: Failing tests**
 
 ```ts
 // worker/test/handler_public.spec.ts
 import { describe, it, expect, beforeEach } from "vitest";
-import { env, SELF } from "cloudflare:test";
-import worker from "../src/index";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { handle } from "../src/index";
+import { mkTestEnv, type TestEnv } from "./_env";
 
+const TINY_JPEG = await readFile(fileURLToPath(new URL("./fixtures/tiny.jpg", import.meta.url)));
+
+let env: TestEnv;
 beforeEach(async () => {
-  // Seed R2 with a tiny JPEG.
-  const jpeg = new Uint8Array([
-    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
-    // ... minimal valid JPEG header; full bytes generated in Task 11 fixtures
-  ]);
-  await env.R2.put("public/abc/img1.jpg", jpeg, {
+  env = mkTestEnv();
+  await env.R2.put("public/abc/img1.jpg", TINY_JPEG, {
     httpMetadata: { contentType: "image/jpeg" },
   });
 });
 
 describe("public path", () => {
-  it("returns 200 + correct Cache-Control for /img/public/...", async () => {
-    const r = await worker.fetch(new Request("https://cdn.example.com/img/public/abc/img1.jpg"), env);
+  it("returns 200 + immutable Cache-Control on success", async () => {
+    const r = await handle(
+      new Request("https://cdn.example.com/img/public/abc/img1.jpg?w=800"), env);
     expect(r.status).toBe(200);
     expect(r.headers.get("Cache-Control")).toBe("public, max-age=31536000, immutable");
+    expect(env._images.calls).toEqual([{ width: 800, format: "image/jpeg", quality: 85 }]);
   });
 
-  it("returns 404 when the R2 object is missing", async () => {
-    const r = await worker.fetch(new Request("https://cdn.example.com/img/public/abc/missing.jpg"), env);
+  it("returns 404 when R2 object is missing", async () => {
+    const r = await handle(
+      new Request("https://cdn.example.com/img/public/abc/missing.jpg"), env);
     expect(r.status).toBe(404);
   });
 
   it("returns 404 for path outside /img/", async () => {
-    const r = await worker.fetch(new Request("https://cdn.example.com/somewhere"), env);
+    const r = await handle(new Request("https://cdn.example.com/somewhere"), env);
     expect(r.status).toBe(404);
+  });
+
+  it("returns 400 for canonicalization-ambiguous path", async () => {
+    const r = await handle(
+      new Request("https://cdn.example.com/img/public/../foo.jpg"), env);
+    expect(r.status).toBe(400);
   });
 });
 ```
 
-- [ ] **Step 2: Build the public branch of the handler**
+- [ ] **Step 5: Implement handler**
 
 ```ts
 // worker/src/index.ts
-import { ALLOWED_WIDTHS, ALLOWED_FORMATS, ALLOWED_QUALITIES, isAllowedWidth } from "./allowlist";
+import { ALLOWED_FORMATS, ALLOWED_QUALITIES, isAllowedWidth } from "./allowlist";
 import { validateCanonicalPath } from "./path";
 import { verifySignature } from "./sign";
 
 const IMG_PREFIX = "/img/";
 
-interface Env {
+export interface Env {
   R2: R2Bucket;
   IMAGES: ImagesBinding;
   WORKER_SIGNING_KEY: string; // hex-encoded
 }
 
-interface ImagesBinding {
+export interface ImagesBinding {
   input(stream: ReadableStream): ImagesPipeline;
 }
-interface ImagesPipeline {
+export interface ImagesPipeline {
   transform(opts: { width?: number }): ImagesPipeline;
   output(opts: { format: string; quality?: number }): Promise<ImagesOutput>;
 }
-interface ImagesOutput {
+export interface ImagesOutput {
   response(): Response;
 }
 
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-    if (!url.pathname.startsWith(IMG_PREFIX)) {
-      return new Response("Not found", { status: 404 });
-    }
-    const canonicalPath = "/" + url.pathname.slice(IMG_PREFIX.length);
-    if (validateCanonicalPath(canonicalPath)) {
-      return new Response("Bad request", { status: 400 });
-    }
+// Single-pass handler. Each branch terminates with its own Response so a
+// later branch never overwrites a 4xx body with a 200's Cache-Control —
+// the bug class an earlier draft of this plan introduced via a shared
+// `readAndTransform` helper.
+export async function handle(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  if (!url.pathname.startsWith(IMG_PREFIX)) {
+    return new Response("Not found", { status: 404 });
+  }
+  const canonicalPath = "/" + url.pathname.slice(IMG_PREFIX.length);
+  if (validateCanonicalPath(canonicalPath)) {
+    return new Response("Bad request", { status: 400 });
+  }
 
-    let isPrivate: boolean;
-    if (canonicalPath.startsWith("/private/")) {
-      // Private branch — see Task 6.
-      return new Response("Unauthorized", { status: 401 }); // placeholder
-    } else if (canonicalPath.startsWith("/public/")) {
-      isPrivate = false;
-    } else {
-      return new Response("Not found", { status: 404 });
-    }
+  let isPrivate: boolean;
+  if (canonicalPath.startsWith("/private/")) {
+    // Private branch — Task 6 replaces this stub with HMAC verification.
+    return new Response("Unauthorized", { status: 401 });
+  } else if (canonicalPath.startsWith("/public/")) {
+    isPrivate = false;
+  } else {
+    return new Response("Not found", { status: 404 });
+  }
 
-    const transformed = await readAndTransform(request, env, canonicalPath, url);
-    if (!transformed) return new Response("Not found", { status: 404 });
-    if (transformed instanceof Response) return transformed; // early-return for 4xx
-
-    const headers = new Headers(transformed.headers);
-    headers.set("Cache-Control", isPrivate
-      ? "private, no-store"
-      : "public, max-age=31536000, immutable");
-    return new Response(transformed.body, { status: transformed.status, headers });
-  },
-};
-
-async function readAndTransform(
-  request: Request,
-  env: Env,
-  canonicalPath: string,
-  url: URL,
-): Promise<Response | null> {
-  const params = parseTransformParams(url);
-  if (params instanceof Response) return params; // 400
-
-  const r2Key = canonicalPath.slice(1);
-  const obj = await env.R2.get(r2Key);
-  if (!obj) return null;
-
-  const fmt = params.fmt === "auto" ? negotiateFormat(request) : `image/${params.fmt}`;
-  let pipeline = env.IMAGES.input(obj.body);
-  if (params.w !== undefined) pipeline = pipeline.transform({ width: params.w });
-  const out = await pipeline.output({ format: fmt, quality: params.q });
-  return out.response();
-}
-
-function parseTransformParams(url: URL): { w?: number; fmt: string; q: number } | Response {
+  // Validate transform params before any R2 read so a malformed request
+  // never racks up R2 GET cost.
   const wRaw = url.searchParams.get("w");
   let w: number | undefined;
   if (wRaw !== null) {
@@ -556,13 +618,32 @@ function parseTransformParams(url: URL): { w?: number; fmt: string; q: number } 
     if (!isAllowedWidth(parsed)) return new Response("Bad request: w not in allowlist", { status: 400 });
     w = parsed;
   }
-  const fmt = url.searchParams.get("fmt") ?? "auto";
-  if (!ALLOWED_FORMATS.has(fmt)) return new Response("Bad request: fmt not in allowlist", { status: 400 });
+  const fmtParam = url.searchParams.get("fmt") ?? "auto";
+  if (!ALLOWED_FORMATS.has(fmtParam)) return new Response("Bad request: fmt not in allowlist", { status: 400 });
   const qRaw = url.searchParams.get("q");
   const q = qRaw === null ? 85 : parseInt(qRaw, 10);
   if (!ALLOWED_QUALITIES.has(q)) return new Response("Bad request: q not in allowlist", { status: 400 });
-  return { w, fmt, q };
+
+  const r2Key = canonicalPath.slice(1);
+  const obj = await env.R2.get(r2Key);
+  if (!obj) return new Response("Not found", { status: 404 });
+
+  const fmt = fmtParam === "auto" ? negotiateFormat(request) : `image/${fmtParam}`;
+  let pipeline = env.IMAGES.input(obj.body);
+  if (w !== undefined) pipeline = pipeline.transform({ width: w });
+  const transformed = (await pipeline.output({ format: fmt, quality: q })).response();
+
+  const headers = new Headers(transformed.headers);
+  headers.set(
+    "Cache-Control",
+    isPrivate ? "private, no-store" : "public, max-age=31536000, immutable",
+  );
+  return new Response(transformed.body, { status: transformed.status, headers });
 }
+
+export default {
+  fetch: handle,
+};
 
 function negotiateFormat(request: Request): string {
   const accept = request.headers.get("Accept") || "";
@@ -570,14 +651,22 @@ function negotiateFormat(request: Request): string {
   if (accept.includes("image/webp")) return "image/webp";
   return "image/jpeg";
 }
+
+export function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
 ```
 
-- [ ] **Step 3: Run + commit**
+- [ ] **Step 6: Run + commit**
 
 ```bash
 cd worker && npm test -- handler_public
-git add worker/src/index.ts worker/test/handler_public.spec.ts
-git commit -m "[worker] feat: public path branch of fetch handler"
+git add worker/src/index.ts worker/test/_imagesFake.ts worker/test/_env.ts worker/test/fixtures/tiny.jpg worker/test/handler_public.spec.ts
+git commit -m "[worker] feat: full fetch handler with public path + IMAGES test fake"
 ```
 
 ---
@@ -586,15 +675,17 @@ git commit -m "[worker] feat: public path branch of fetch handler"
 
 **Files:**
 - Modify: `worker/src/index.ts`
+- Modify: `worker/vitest.config.ts` (bind `WORKER_SIGNING_KEY`)
+- Create: `worker/test/_signer.ts` (test-only signer helper)
 - Create: `worker/test/handler_private.spec.ts`
-- Create: `worker/test/_signer.ts` (test-only signer)
 
 - [ ] **Step 1: Test-only signer — same algorithm as Plan 1's signer**
 
 ```ts
 // worker/test/_signer.ts
-// In-test ONLY. Never imported from src/. The Worker should not contain
-// signing logic — only verification.
+// In-test ONLY. Never imported from src/. The Worker holds verification
+// logic only — never signing — so an attacker who breaches the Worker
+// cannot mint new signed URLs.
 import { computeSignature } from "../src/sign";
 
 export async function makeSignedURL(
@@ -614,105 +705,9 @@ export async function makeSignedURL(
 }
 ```
 
-- [ ] **Step 2: Failing tests** — covers cases 11, 12, 13, 14 from §8.6.1
+- [ ] **Step 2: Bind `WORKER_SIGNING_KEY` in `vitest.config.ts`**
 
-```ts
-// worker/test/handler_private.spec.ts
-import { describe, it, expect, beforeEach } from "vitest";
-import { env } from "cloudflare:test";
-import worker from "../src/index";
-import { makeSignedURL } from "./_signer";
-
-const KEY = new TextEncoder().encode("0123456789abcdef0123456789abcdef");
-
-beforeEach(async () => {
-  await env.R2.put("private/abc/img1.jpg",
-    new Uint8Array([0xff, 0xd8, 0xff /* minimal JPEG */]),
-    { httpMetadata: { contentType: "image/jpeg" } });
-  // The test environment binds WORKER_SIGNING_KEY to the same hex string.
-  // Configure via test setup; see vitest.config.ts.
-});
-
-describe("private path", () => {
-  it("case 11 — no sig returns 401", async () => {
-    const r = await worker.fetch(
-      new Request("https://cdn.example.com/img/private/abc/img1.jpg?w=800"), env);
-    expect(r.status).toBe(401);
-  });
-
-  it("case 12 — valid sig + future exp returns 200 with private/no-store", async () => {
-    const url = await makeSignedURL("https://cdn.example.com", KEY,
-      "private/abc/img1.jpg", Math.floor(Date.now()/1000) + 300, { w: "800" });
-    const r = await worker.fetch(new Request(url), env);
-    expect(r.status).toBe(200);
-    expect(r.headers.get("Cache-Control")).toBe("private, no-store");
-  });
-
-  it("rejects expired exp with 401", async () => {
-    const url = await makeSignedURL("https://cdn.example.com", KEY,
-      "private/abc/img1.jpg", Math.floor(Date.now()/1000) - 60, {});
-    const r = await worker.fetch(new Request(url), env);
-    expect(r.status).toBe(401);
-  });
-
-  it("rejects tampered sig with 401", async () => {
-    const url = await makeSignedURL("https://cdn.example.com", KEY,
-      "private/abc/img1.jpg", Math.floor(Date.now()/1000) + 300, {});
-    const tampered = url.replace(/sig=([0-9a-f])/, (m, c) => `sig=${c === "0" ? "1" : "0"}`);
-    const r = await worker.fetch(new Request(tampered), env);
-    expect(r.status).toBe(401);
-  });
-
-  it("case 13 — out-of-allowlist width returns 400", async () => {
-    const url = await makeSignedURL("https://cdn.example.com", KEY,
-      "private/abc/img1.jpg", Math.floor(Date.now()/1000) + 300, { w: "99999" });
-    const r = await worker.fetch(new Request(url), env);
-    expect(r.status).toBe(400);
-  });
-
-  it("case 14 — out-of-allowlist fmt returns 400", async () => {
-    const url = await makeSignedURL("https://cdn.example.com", KEY,
-      "private/abc/img1.jpg", Math.floor(Date.now()/1000) + 300, { fmt: "svg" });
-    const r = await worker.fetch(new Request(url), env);
-    expect(r.status).toBe(400);
-  });
-});
-```
-
-- [ ] **Step 3: Replace the placeholder private branch in `src/index.ts`**
-
-```ts
-// worker/src/index.ts (replace the placeholder)
-if (canonicalPath.startsWith("/private/")) {
-  isPrivate = true;
-  const sig = url.searchParams.get("sig");
-  const expStr = url.searchParams.get("exp");
-  if (!sig || !expStr) return new Response("Unauthorized", { status: 401 });
-  const exp = parseInt(expStr, 10);
-  if (!Number.isFinite(exp) || Date.now() / 1000 > exp) {
-    return new Response("Unauthorized", { status: 401 });
-  }
-  const keyBytes = hexToBytes(env.WORKER_SIGNING_KEY);
-  const ok = await verifySignature(keyBytes, canonicalPath, exp, sig);
-  if (!ok) return new Response("Unauthorized", { status: 401 });
-}
-```
-
-Add a `hexToBytes` helper:
-
-```ts
-function hexToBytes(hex: string): Uint8Array {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) {
-    out[i] = parseInt(hex.substr(i * 2, 2), 16);
-  }
-  return out;
-}
-```
-
-**Important:** the test setup binds `WORKER_SIGNING_KEY` as the **hex encoding** of the key bytes. The Go signer test in Plan 1 uses the literal ASCII string `"0123456789abcdef0123456789abcdef"` (32 ASCII bytes). Hex-encode that for the env var: each ASCII char → 2 hex chars. So the env value becomes `30313233343536373839616263646566303132333435363738396162636465666` (66 chars). Set this in `vitest.config.ts` via `miniflare.bindings`.
-
-Update `vitest.config.ts`:
+The Go signer test in Plan 1 uses the literal ASCII string `"0123456789abcdef0123456789abcdef"` as the key (32 ASCII bytes). The Worker reads `env.WORKER_SIGNING_KEY` as a hex-encoded string and decodes it via `hexToBytes`. Each ASCII char of the source key → 2 hex chars, so the env value is exactly 64 hex chars: 32 chars from `"0123456789abcdef"` repeated twice.
 
 ```ts
 // worker/vitest.config.ts (replace contents)
@@ -727,10 +722,12 @@ export default defineWorkersConfig({
           bindings: {
             WORKER_SIGNING_KEY:
               "30313233343536373839616263646566" +
-              "30313233343536373839616263646566", // hex of "0123456789abcdef" repeated
+              "30313233343536373839616263646566", // 64 hex chars = ASCII "0123456789abcdef" twice
           },
           r2Buckets: ["R2"],
-          // No real Images binding in Layer A — see Task 7 for the test fake.
+          // IMAGES is not bound by miniflare — Layer-A tests inject the
+          // ImagesFake via `mkTestEnv()` (Task 5 step 2). Layer-B tests
+          // (Task 11) hit the real binding under `wrangler dev`.
         },
       },
     },
@@ -738,154 +735,184 @@ export default defineWorkersConfig({
 });
 ```
 
-- [ ] **Step 4: Run + commit**
+- [ ] **Step 3: Failing tests — covers cases 11, 12, 13, 14 from §8.6.1**
+
+```ts
+// worker/test/handler_private.spec.ts
+import { describe, it, expect, beforeEach } from "vitest";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { handle } from "../src/index";
+import { mkTestEnv, type TestEnv } from "./_env";
+import { makeSignedURL } from "./_signer";
+
+const KEY = new TextEncoder().encode("0123456789abcdef0123456789abcdef");
+const TINY_JPEG = await readFile(fileURLToPath(new URL("./fixtures/tiny.jpg", import.meta.url)));
+
+let env: TestEnv;
+beforeEach(async () => {
+  env = mkTestEnv();
+  await env.R2.put("private/abc/img1.jpg", TINY_JPEG, {
+    httpMetadata: { contentType: "image/jpeg" },
+  });
+});
+
+describe("private path", () => {
+  it("case 11 — no sig returns 401", async () => {
+    const r = await handle(
+      new Request("https://cdn.example.com/img/private/abc/img1.jpg?w=800"), env);
+    expect(r.status).toBe(401);
+  });
+
+  it("case 12 — valid sig + future exp returns 200 with private/no-store", async () => {
+    const url = await makeSignedURL("https://cdn.example.com", KEY,
+      "private/abc/img1.jpg", Math.floor(Date.now()/1000) + 300, { w: "800" });
+    const r = await handle(new Request(url), env);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("Cache-Control")).toBe("private, no-store");
+  });
+
+  it("rejects expired exp with 401", async () => {
+    const url = await makeSignedURL("https://cdn.example.com", KEY,
+      "private/abc/img1.jpg", Math.floor(Date.now()/1000) - 60, {});
+    const r = await handle(new Request(url), env);
+    expect(r.status).toBe(401);
+  });
+
+  it("rejects tampered sig with 401", async () => {
+    const url = await makeSignedURL("https://cdn.example.com", KEY,
+      "private/abc/img1.jpg", Math.floor(Date.now()/1000) + 300, {});
+    const tampered = url.replace(/sig=([0-9a-f])/, (_, c) => `sig=${c === "0" ? "1" : "0"}`);
+    const r = await handle(new Request(tampered), env);
+    expect(r.status).toBe(401);
+  });
+
+  it("case 13 — out-of-allowlist width returns 400", async () => {
+    const url = await makeSignedURL("https://cdn.example.com", KEY,
+      "private/abc/img1.jpg", Math.floor(Date.now()/1000) + 300, { w: "99999" });
+    const r = await handle(new Request(url), env);
+    expect(r.status).toBe(400);
+  });
+
+  it("case 14 — out-of-allowlist fmt returns 400", async () => {
+    const url = await makeSignedURL("https://cdn.example.com", KEY,
+      "private/abc/img1.jpg", Math.floor(Date.now()/1000) + 300, { fmt: "svg" });
+    const r = await handle(new Request(url), env);
+    expect(r.status).toBe(400);
+  });
+});
+```
+
+- [ ] **Step 4: Replace the placeholder private branch in `src/index.ts`**
+
+In `handle()`, replace:
+
+```ts
+  if (canonicalPath.startsWith("/private/")) {
+    // Private branch — Task 6 replaces this stub with HMAC verification.
+    return new Response("Unauthorized", { status: 401 });
+  } else if (canonicalPath.startsWith("/public/")) {
+```
+
+with the real verification:
+
+```ts
+  let isPrivate: boolean;
+  if (canonicalPath.startsWith("/private/")) {
+    isPrivate = true;
+    const sig = url.searchParams.get("sig");
+    const expStr = url.searchParams.get("exp");
+    if (!sig || !expStr) return new Response("Unauthorized", { status: 401 });
+    const exp = parseInt(expStr, 10);
+    if (!Number.isFinite(exp) || Date.now() / 1000 > exp) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+    const keyBytes = hexToBytes(env.WORKER_SIGNING_KEY);
+    const ok = await verifySignature(keyBytes, canonicalPath, exp, sig);
+    if (!ok) return new Response("Unauthorized", { status: 401 });
+  } else if (canonicalPath.startsWith("/public/")) {
+```
+
+(The `let isPrivate: boolean;` declaration moves up next to the branch that needs to differentiate, since after Task 6 the private branch flows through to the same R2 + transform path the public branch uses. Remove the now-orphaned `let isPrivate: boolean;` declaration that previously sat below the if/else.)
+
+- [ ] **Step 5: Run + commit**
 
 ```bash
 cd worker && npm test -- handler_private
-git add worker/src/index.ts worker/test/handler_private.spec.ts worker/test/_signer.ts worker/vitest.config.ts
+git add worker/src/index.ts worker/vitest.config.ts worker/test/_signer.ts worker/test/handler_private.spec.ts
 git commit -m "[worker] feat: private path with HMAC verify (cases 11-14)"
 ```
 
 ---
 
-## Task 7: Worker fetch handler — IMAGES binding fake + cache headers
+## Task 7: Additional transform-call assertions
 
 **Files:**
-- Create: `worker/test/_imagesFake.ts`
-- Modify: `worker/vitest.config.ts`
-- Create: `worker/test/handler_cache.spec.ts`
+- Create: `worker/test/handler_transform.spec.ts`
 
-The `env.IMAGES` binding is not natively faked by `vitest-pool-workers`. We bind a JS object that conforms to the same shape and asserts the Worker called `transform()` with the expected width.
+The `ImagesFake` and `mkTestEnv()` helper landed in Task 5 (where they were needed for the public-path success test). This task adds the assertions that pin format negotiation and quality forwarding to the contracts §6 allowlist — separate from Task 5 because they're orthogonal to the success path and to keep each spec file focused.
 
-- [ ] **Step 1: Implement the fake**
+- [ ] **Step 1: Failing tests**
 
 ```ts
-// worker/test/_imagesFake.ts
-// Tracks calls so tests can assert the Worker passed the right width/fmt/q.
-export type ImagesCall = { width?: number; format: string; quality: number };
+// worker/test/handler_transform.spec.ts
+import { describe, it, expect, beforeEach } from "vitest";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { handle } from "../src/index";
+import { mkTestEnv, type TestEnv } from "./_env";
 
-export class ImagesFake {
-  public calls: ImagesCall[] = [];
+const TINY_JPEG = await readFile(fileURLToPath(new URL("./fixtures/tiny.jpg", import.meta.url)));
 
-  input(stream: ReadableStream): Pipeline {
-    return new Pipeline(this, stream);
-  }
-}
-
-class Pipeline {
-  private widthHint?: number;
-  constructor(private fake: ImagesFake, private stream: ReadableStream) {}
-  transform(opts: { width?: number }): Pipeline {
-    this.widthHint = opts.width;
-    return this;
-  }
-  async output(opts: { format: string; quality: number }): Promise<{ response(): Response }> {
-    this.fake.calls.push({ width: this.widthHint, format: opts.format, quality: opts.quality });
-    // Pass-through bytes; record-only, no real resize.
-    return {
-      response: () => new Response(this.stream, {
-        status: 200,
-        headers: { "Content-Type": opts.format },
-      }),
-    };
-  }
-}
-```
-
-- [ ] **Step 2: Bind the fake in vitest config**
-
-`vitest-pool-workers` doesn't currently let you bind arbitrary JS objects to a Worker via `bindings:`. The cleanest path: **inject the fake at test time** by exposing a setter on the module:
-
-```ts
-// worker/src/index.ts (top-level export)
-export const _testHooks = {
-  imagesOverride: undefined as undefined | { input: (s: ReadableStream) => any },
-};
-```
-
-And in the handler:
-
-```ts
-const images = (typeof globalThis !== "undefined" && (globalThis as any).__IMAGES_OVERRIDE__) ?? env.IMAGES;
-```
-
-Or use a wrapper function. The simplest model — and what we'll use — is to make the handler accept `env` and check a side-channel:
-
-```ts
-function imagesFor(env: Env): ImagesBinding {
-  const override = (globalThis as any).__IMAGES_OVERRIDE__;
-  return override ?? env.IMAGES;
-}
-```
-
-In tests:
-
-```ts
-import { ImagesFake } from "./_imagesFake";
-
-beforeEach(() => {
-  (globalThis as any).__IMAGES_OVERRIDE__ = new ImagesFake();
-});
-afterEach(() => {
-  delete (globalThis as any).__IMAGES_OVERRIDE__;
-});
-```
-
-The Layer-B integration test (Task 11) does NOT set this override, so it exercises the real binding.
-
-- [ ] **Step 3: Failing test — verifies Cache-Control + that transform was called**
-
-```ts
-// worker/test/handler_cache.spec.ts
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { env } from "cloudflare:test";
-import worker from "../src/index";
-import { ImagesFake } from "./_imagesFake";
-
-let fake: ImagesFake;
-
+let env: TestEnv;
 beforeEach(async () => {
-  fake = new ImagesFake();
-  (globalThis as any).__IMAGES_OVERRIDE__ = fake;
-  await env.R2.put("public/abc/img1.jpg", new Uint8Array([0xff, 0xd8]), {
+  env = mkTestEnv();
+  await env.R2.put("public/abc/img1.jpg", TINY_JPEG, {
     httpMetadata: { contentType: "image/jpeg" },
   });
 });
 
-afterEach(() => { delete (globalThis as any).__IMAGES_OVERRIDE__; });
-
-describe("transform call", () => {
-  it("forwards w/fmt/q to IMAGES binding", async () => {
-    const r = await worker.fetch(
-      new Request("https://cdn.example.com/img/public/abc/img1.jpg?w=800&fmt=webp&q=85"), env);
-    expect(r.status).toBe(200);
-    expect(fake.calls).toEqual([{ width: 800, format: "image/webp", quality: 85 }]);
-    expect(r.headers.get("Cache-Control")).toBe("public, max-age=31536000, immutable");
+describe("transform call shape", () => {
+  it("forwards explicit fmt=webp + q=90 to the binding", async () => {
+    await handle(
+      new Request("https://cdn.example.com/img/public/abc/img1.jpg?w=800&fmt=webp&q=90"), env);
+    expect(env._images.calls).toEqual([{ width: 800, format: "image/webp", quality: 90 }]);
   });
 
-  it("auto fmt + Accept: avif → image/avif passed through", async () => {
-    await worker.fetch(
+  it("auto fmt + Accept: image/avif → image/avif passed through", async () => {
+    await handle(
       new Request("https://cdn.example.com/img/public/abc/img1.jpg?w=240",
         { headers: { Accept: "image/avif,image/*" } }), env);
-    expect(fake.calls[0].format).toBe("image/avif");
+    expect(env._images.calls[0].format).toBe("image/avif");
+  });
+
+  it("auto fmt + Accept: image/webp → image/webp passed through", async () => {
+    await handle(
+      new Request("https://cdn.example.com/img/public/abc/img1.jpg?w=240",
+        { headers: { Accept: "image/webp,*/*" } }), env);
+    expect(env._images.calls[0].format).toBe("image/webp");
+  });
+
+  it("auto fmt with no Accept → image/jpeg fallback", async () => {
+    await handle(
+      new Request("https://cdn.example.com/img/public/abc/img1.jpg?w=240"), env);
+    expect(env._images.calls[0].format).toBe("image/jpeg");
+  });
+
+  it("missing q defaults to 85", async () => {
+    await handle(
+      new Request("https://cdn.example.com/img/public/abc/img1.jpg?w=800&fmt=jpeg"), env);
+    expect(env._images.calls[0].quality).toBe(85);
   });
 });
 ```
 
-- [ ] **Step 4: Wire `imagesFor()` in `src/index.ts`**
-
-Replace the `env.IMAGES` reference in `readAndTransform`:
-
-```ts
-let pipeline = imagesFor(env).input(obj.body);
-```
-
-- [ ] **Step 5: Run + commit**
+- [ ] **Step 2: Run + commit**
 
 ```bash
-cd worker && npm test -- handler_cache
-git add worker/src/index.ts worker/test/_imagesFake.ts worker/test/handler_cache.spec.ts
-git commit -m "[worker] feat: IMAGES binding test fake + transform-call assertions"
+cd worker && npm test -- handler_transform
+git add worker/test/handler_transform.spec.ts
+git commit -m "[worker] test: transform-call shape assertions (fmt negotiation, q default)"
 ```
 
 ---
@@ -901,34 +928,34 @@ This consolidates the cases already partially covered in Tasks 5+6 into a single
 
 ```ts
 // worker/test/privacy_matrix.spec.ts
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { env } from "cloudflare:test";
-import worker from "../src/index";
-import { ImagesFake } from "./_imagesFake";
+import { describe, it, expect, beforeEach } from "vitest";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { handle } from "../src/index";
+import { mkTestEnv, type TestEnv } from "./_env";
 import { makeSignedURL } from "./_signer";
 
 const KEY = new TextEncoder().encode("0123456789abcdef0123456789abcdef");
+const TINY_JPEG = await readFile(fileURLToPath(new URL("./fixtures/tiny.jpg", import.meta.url)));
 
-let fake: ImagesFake;
+let env: TestEnv;
 beforeEach(async () => {
-  fake = new ImagesFake();
-  (globalThis as any).__IMAGES_OVERRIDE__ = fake;
-  await env.R2.put("public/A/p.jpg",  new Uint8Array([0xff, 0xd8]));
-  await env.R2.put("private/A/q.jpg", new Uint8Array([0xff, 0xd8]));
+  env = mkTestEnv();
+  await env.R2.put("public/A/p.jpg",  TINY_JPEG, { httpMetadata: { contentType: "image/jpeg" } });
+  await env.R2.put("private/A/q.jpg", TINY_JPEG, { httpMetadata: { contentType: "image/jpeg" } });
 });
-afterEach(() => { delete (globalThis as any).__IMAGES_OVERRIDE__; });
 
 describe("privacy matrix (Worker rows)", () => {
   it("row 10 — public ?w=800 returns 200, immutable cache", async () => {
-    const r = await worker.fetch(
+    const r = await handle(
       new Request("https://cdn.example.com/img/public/A/p.jpg?w=800"), env);
     expect(r.status).toBe(200);
     expect(r.headers.get("Cache-Control")).toBe("public, max-age=31536000, immutable");
-    expect(fake.calls[0].width).toBe(800);
+    expect(env._images.calls[0].width).toBe(800);
   });
 
   it("row 11 — private without sig returns 401", async () => {
-    const r = await worker.fetch(
+    const r = await handle(
       new Request("https://cdn.example.com/img/private/A/q.jpg?w=800"), env);
     expect(r.status).toBe(401);
   });
@@ -936,23 +963,23 @@ describe("privacy matrix (Worker rows)", () => {
   it("row 12 — private with valid sig returns 200, no-store", async () => {
     const url = await makeSignedURL("https://cdn.example.com", KEY,
       "private/A/q.jpg", Math.floor(Date.now()/1000) + 300, { w: "800" });
-    const r = await worker.fetch(new Request(url), env);
+    const r = await handle(new Request(url), env);
     expect(r.status).toBe(200);
     expect(r.headers.get("Cache-Control")).toBe("private, no-store");
-    expect(fake.calls[0].width).toBe(800);
+    expect(env._images.calls[0].width).toBe(800);
   });
 
   it("row 13 — w=99999 returns 400", async () => {
     const url = await makeSignedURL("https://cdn.example.com", KEY,
       "private/A/q.jpg", Math.floor(Date.now()/1000) + 300, { w: "99999" });
-    const r = await worker.fetch(new Request(url), env);
+    const r = await handle(new Request(url), env);
     expect(r.status).toBe(400);
   });
 
   it("row 14 — fmt=svg returns 400", async () => {
     const url = await makeSignedURL("https://cdn.example.com", KEY,
       "private/A/q.jpg", Math.floor(Date.now()/1000) + 300, { fmt: "svg" });
-    const r = await worker.fetch(new Request(url), env);
+    const r = await handle(new Request(url), env);
     expect(r.status).toBe(400);
   });
 });
@@ -981,31 +1008,33 @@ This test asserts those two invariants hold even after a successful authenticate
 
 ```ts
 // worker/test/cache_safety.spec.ts
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { env } from "cloudflare:test";
-import worker from "../src/index";
-import { ImagesFake } from "./_imagesFake";
+import { describe, it, expect, beforeEach } from "vitest";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { handle } from "../src/index";
+import { mkTestEnv, type TestEnv } from "./_env";
 import { makeSignedURL } from "./_signer";
 
 const KEY = new TextEncoder().encode("0123456789abcdef0123456789abcdef");
+const TINY_JPEG = await readFile(fileURLToPath(new URL("./fixtures/tiny.jpg", import.meta.url)));
 
+let env: TestEnv;
 beforeEach(async () => {
-  (globalThis as any).__IMAGES_OVERRIDE__ = new ImagesFake();
-  await env.R2.put("private/X/img.jpg", new Uint8Array([0xff, 0xd8]));
+  env = mkTestEnv();
+  await env.R2.put("private/X/img.jpg", TINY_JPEG, { httpMetadata: { contentType: "image/jpeg" } });
 });
-afterEach(() => { delete (globalThis as any).__IMAGES_OVERRIDE__; });
 
 describe("case 16 — cache-key safety", () => {
   it("owner-then-anonymous: anon never receives owner bytes", async () => {
     // Owner request with valid sig.
     const ownerURL = await makeSignedURL("https://cdn.example.com", KEY,
       "private/X/img.jpg", Math.floor(Date.now()/1000) + 300, { w: "800" });
-    const ownerResp = await worker.fetch(new Request(ownerURL), env);
+    const ownerResp = await handle(new Request(ownerURL), env);
     expect(ownerResp.status).toBe(200);
     expect(ownerResp.headers.get("Cache-Control")).toBe("private, no-store");
 
     // Anonymous request to the same path with no sig.
-    const anonResp = await worker.fetch(
+    const anonResp = await handle(
       new Request("https://cdn.example.com/img/private/X/img.jpg?w=800"), env);
     expect(anonResp.status).toBe(401);
   });
@@ -1013,12 +1042,12 @@ describe("case 16 — cache-key safety", () => {
   it("owner-then-tampered: tampered sig never receives owner bytes", async () => {
     const ownerURL = await makeSignedURL("https://cdn.example.com", KEY,
       "private/X/img.jpg", Math.floor(Date.now()/1000) + 300, {});
-    const ownerResp = await worker.fetch(new Request(ownerURL), env);
+    const ownerResp = await handle(new Request(ownerURL), env);
     expect(ownerResp.status).toBe(200);
 
     const tampered = ownerURL.replace(/sig=([0-9a-f])/, (_, c) =>
       "sig=" + (c === "0" ? "1" : "0"));
-    const r = await worker.fetch(new Request(tampered), env);
+    const r = await handle(new Request(tampered), env);
     expect(r.status).toBe(401);
   });
 });
@@ -1054,12 +1083,12 @@ const KEY = new TextEncoder().encode("0123456789abcdef0123456789abcdef");
 describe("cross-language signature contract", () => {
   it("matches Plan 1 Task 8 fixed vector for /private/aaa/bbb.jpg @ 1700000000", async () => {
     const got = await computeSignature(KEY, "/private/aaa/bbb.jpg", 1700000000);
-    expect(got).toBe("<PASTE-FROM-PLAN-1-TASK-8>");
+    expect(got).toBe("c018a64c183bc6d6348dbf8e2780d287e3550b6945037fa4bedf05f5aa663654");
   });
 });
 ```
 
-- [ ] **Step 2: Run** — should pass once the placeholder is replaced with the actual hex from Plan 1 Task 8.
+- [ ] **Step 2: Run** — passes on first run. The hex above is the locked vector from Plan 1 Task 8 (`c018a64c…3654`); first compile to first green, no manual fill-in step.
 
 ```bash
 cd worker && npm test -- contract_pin
@@ -1105,6 +1134,8 @@ export default defineConfig({
 ```ts
 // worker/test_integration/round_trip.spec.ts
 import { describe, it, expect } from "vitest";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import imageSize from "image-size";
 
 const API   = process.env.ART_API_BASE   || "http://localhost:8080";
@@ -1121,14 +1152,18 @@ describe.skipIf(!TOKEN)("case 15 — signed-URL round-trip", () => {
     });
     const art = await created.json();
 
+    // Read the 2400-px JPEG fixture (committed under test_integration/fixtures/).
+    // `import.meta.url` is the standard ESM way to anchor relative paths;
+    // `import.meta.dir` (Bun) and `fetch("file://...")` (browser) are not
+    // available in Node, which is what `vitest.integration.config.ts` runs.
+    const fixturePath = fileURLToPath(new URL("./fixtures/2400px.jpg", import.meta.url));
+    const fixtureBytes = await readFile(fixturePath);
+
     const fd = new FormData();
     fd.set("manifest", JSON.stringify([
       { client_image_id: "K", position: 0, content_type: "image/jpeg" },
     ]));
-    // 2400-px wide JPEG fixture, ~30 KB; committed under test_integration/fixtures/
-    const file = await fetch("file://" + import.meta.dir + "/fixtures/2400px.jpg")
-      .then(r => r.blob());
-    fd.set("files", file, "2400.jpg");
+    fd.set("files", new Blob([fixtureBytes], { type: "image/jpeg" }), "2400.jpg");
     await fetch(`${API}/artworks/${art.id}/images`, {
       method: "POST", headers: { Cookie: `auth=${TOKEN}` }, body: fd,
     });
@@ -1157,21 +1192,23 @@ describe.skipIf(!TOKEN)("case 15 — signed-URL round-trip", () => {
 
 - [ ] **Step 3: Test fixtures**
 
-Generate `test_integration/fixtures/2400px.jpg` with any 2400×N JPEG (a solid-color fixture is fine). One-shot:
+Generate `test_integration/fixtures/2400px.jpg` with ImageMagick (a solid-color JPEG keeps the fixture small while preserving the 2400px width that drives the resize assertion):
 
 ```bash
 cd worker && mkdir -p test_integration/fixtures
-node -e "
-const f=require('fs');
-const w=2400,h=1600;
-// Pure-JS minimal JPEG generator is large; instead, use a fixture from a
-// prebuilt small JPEG and rely on the API to accept it. For initial wiring,
-// drop in any real JPEG of the right dimensions.
-"
-# In practice, use ImageMagick: `convert -size 2400x1600 xc:steelblue 2400px.jpg`
+convert -size 2400x1600 xc:steelblue test_integration/fixtures/2400px.jpg
+# Verify dimensions before committing (sanity check):
+#   identify test_integration/fixtures/2400px.jpg
+#   → test_integration/fixtures/2400px.jpg JPEG 2400x1600 ...
 ```
 
-Commit the binary fixture (a few KB). Document the convert command in `test_integration/README.md`.
+Commit the binary fixture (~30 KB at quality 85). The `convert` command is recorded in `test_integration/README.md` so anyone can regenerate it.
+
+If you don't have ImageMagick, a Pillow one-liner works:
+
+```bash
+python3 -c "from PIL import Image; Image.new('RGB', (2400, 1600), 'steelblue').save('test_integration/fixtures/2400px.jpg', 'JPEG', quality=85)"
+```
 
 - [ ] **Step 4: README documenting how to run Layer B locally**
 
@@ -1182,16 +1219,21 @@ Runs the full round-trip described in spec §8.6.2 case 15.
 
 **Prerequisites:**
 
-1. Plan 1's API running locally: `cd ../api && go run ./cmd/api` with `WORKER_SIGNING_KEY`, `JWT_SIGNING_KEY`, `DATABASE_URL`, `CDN_ORIGIN=http://localhost:8787` exported.
-2. This Worker running locally: `cd .. && npm run dev` (wrangler dev). Same `WORKER_SIGNING_KEY`. R2 bound to a dev bucket; `[images]` binding requires a Cloudflare account in `wrangler.toml`'s `[dev]` block — set `experimental_remote = true` for the IMAGES binding to use real Cloudflare image transforms in dev.
-3. An auth cookie / JWT for an owner user. Easiest: hit `GET /auth/google/start` in a browser, then copy the `auth` cookie value.
+1. Plan 1's API running locally with `APP_ENV=test`: `cd ../api && APP_ENV=test go run ./cmd/api` with `WORKER_SIGNING_KEY`, `JWT_SIGNING_KEY`, `DATABASE_URL`, `CDN_ORIGIN=http://localhost:8787` exported. `APP_ENV=test` swaps Storage to localfs (no R2 credentials needed) AND registers the `POST /dev/seed` endpoint.
+2. This Worker running locally: `cd .. && npm run dev` (wrangler dev). Same `WORKER_SIGNING_KEY`. R2 bound to a dev bucket; the `[images]` binding requires a Cloudflare account — wrangler 3.x supports an `experimental_remote = true` flag on the IMAGES binding (in `wrangler.toml` under `[dev]`) to proxy through real Cloudflare Images. Pin to `wrangler@^3.50.0` (per contracts §13.3) — earlier 3.x versions used a different flag name (`experimental_remote_bindings`) and the helper config we ship targets the newer name.
+3. Mint an owner JWT via the test-only seed endpoint (the manual "open Google in a browser" path is not deterministic and is reserved for end-user smoke testing):
+
+```bash
+SEED=$(curl -fsS -X POST http://localhost:8080/dev/seed)
+ART_OWNER_JWT=$(echo "$SEED" | jq -r .aliceCookie | sed 's/^auth=//')
+```
 
 **Run:**
 
 ```bash
 ART_API_BASE=http://localhost:8080 \
 ART_CDN_BASE=http://localhost:8787 \
-ART_OWNER_JWT=<paste-cookie-value> \
+ART_OWNER_JWT=$ART_OWNER_JWT \
 npm run test:integration
 ```
 ```
@@ -1252,8 +1294,9 @@ After all 12 tasks land, Plan 2 produces a Cloudflare Worker that:
 
 - Validates canonical paths (contracts §3) and rejects malformed input with 400
 - Verifies HMAC signatures byte-perfect against Plan 1 (via the locked vector pin in Task 10)
-- Reads R2 via binding, transforms via `env.IMAGES` with the allowlist (contracts §6), emits the right Cache-Control per visibility
+- Reads R2 via binding, transforms via `env.IMAGES` with the allowlist (contracts §6), emits the right Cache-Control per visibility (set in the success path only — 4xx responses keep their own bodies/headers)
+- Exposes a pure `handle(req, env)` function so tests inject a fake `IMAGES` via env-spread instead of relying on a `globalThis` side-channel that doesn't cross workerd's isolate boundary
 - Passes privacy-matrix rows 10–14 (§8.6.1) and the cache-safety regression (§8.6.2 case 16) in CI without Cloudflare credentials
-- Has a Layer-B round-trip test (case 15) ready to run against `wrangler dev` + the API
+- Has a Layer-B round-trip test (case 15) that mints its owner cookie via Plan 1's `POST /dev/seed` (no manual Google OAuth step)
 
 The Worker source is ~120 lines as the spec mandates. Anything that grows beyond that is a refactor signal.
