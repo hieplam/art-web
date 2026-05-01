@@ -16,7 +16,7 @@ describe.skipIf(!TOKEN)("case 15 — signed-URL round-trip", () => {
       headers: { Cookie: `auth=${TOKEN}`, "Content-Type": "application/json" },
       body: JSON.stringify({ title: "rt", visibility: "private" }),
     });
-    const art = await created.json();
+    const art = await created.json() as any;
 
     const fixturePath = fileURLToPath(new URL("./fixtures/2400px.jpg", import.meta.url));
     const fixtureBytes = await readFile(fixturePath);
@@ -33,7 +33,7 @@ describe.skipIf(!TOKEN)("case 15 — signed-URL round-trip", () => {
     // 2. Fetch detail, extract the signed URL, swap CDN base if needed.
     const detail = await fetch(`${API}/artworks/${art.id}`, {
       headers: { Cookie: `auth=${TOKEN}` },
-    }).then(r => r.json());
+    }).then(r => r.json() as any);
     const signed = detail.images[0].url
       .replace(/^https?:\/\/cdn\.example\.com/, CDN);
 

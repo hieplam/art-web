@@ -1,0 +1,12 @@
+# worker/Dockerfile.e2e
+# E2E-only image. Production Worker deploys via `wrangler deploy` and
+# never builds this image. Node version pinned per contracts §13.1.
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY tsconfig.json ./
+EXPOSE 8787
+CMD ["npx", "tsx", "scripts/e2e-server.ts"]
