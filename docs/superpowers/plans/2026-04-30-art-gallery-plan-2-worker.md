@@ -33,7 +33,8 @@
 | 9 | Cache-key safety test (case 16) | unit |
 | 10 | Test signer (TS port of Plan 1's signer) | unit |
 | 11 | Layer-B round-trip integration test (case 15) | integration |
-| 12 | `.github/workflows/worker.yml` | CI |
+| 12 | E2E entrypoint (`scripts/e2e-server.ts`) + `Dockerfile.e2e` | smoke |
+| 13 | `.github/workflows/worker.yml` | CI |
 
 ---
 
@@ -555,6 +556,13 @@ describe("public path", () => {
       new Request("https://cdn.example.com/img/public/../foo.jpg"), env);
     expect(r.status).toBe(400);
   });
+
+  it("rejects non-exact numeric transform params", async () => {
+    for (const qs of ["w=800junk", "q=85x"]) {
+      const r = await handle(new Request(`https://cdn.example.com/img/public/abc/img1.jpg?${qs}`), env);
+      expect(r.status).toBe(400);
+    }
+  });
 });
 ```
 
@@ -614,14 +622,16 @@ export async function handle(request: Request, env: Env): Promise<Response> {
   const wRaw = url.searchParams.get("w");
   let w: number | undefined;
   if (wRaw !== null) {
-    const parsed = parseInt(wRaw, 10);
+    const parsed = parseExactDecimal(wRaw);
+    if (parsed === null) return new Response("Bad request: w must be a decimal integer", { status: 400 });
     if (!isAllowedWidth(parsed)) return new Response("Bad request: w not in allowlist", { status: 400 });
     w = parsed;
   }
   const fmtParam = url.searchParams.get("fmt") ?? "auto";
   if (!ALLOWED_FORMATS.has(fmtParam)) return new Response("Bad request: fmt not in allowlist", { status: 400 });
   const qRaw = url.searchParams.get("q");
-  const q = qRaw === null ? 85 : parseInt(qRaw, 10);
+  const q = qRaw === null ? 85 : parseExactDecimal(qRaw);
+  if (q === null) return new Response("Bad request: q must be a decimal integer", { status: 400 });
   if (!ALLOWED_QUALITIES.has(q)) return new Response("Bad request: q not in allowlist", { status: 400 });
 
   const r2Key = canonicalPath.slice(1);
@@ -644,6 +654,12 @@ export async function handle(request: Request, env: Env): Promise<Response> {
 export default {
   fetch: handle,
 };
+
+function parseExactDecimal(raw: string): number | null {
+  if (!/^(0|[1-9][0-9]*)$/.test(raw)) return null;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) ? n : null;
+}
 
 function negotiateFormat(request: Request): string {
   const accept = request.headers.get("Accept") || "";
@@ -794,6 +810,15 @@ describe("private path", () => {
     expect(r.status).toBe(400);
   });
 
+  it("rejects non-exact exp values before signature verification", async () => {
+    const url = await makeSignedURL("https://cdn.example.com", KEY,
+      "private/abc/img1.jpg", Math.floor(Date.now()/1000) + 300, {});
+    const u = new URL(url);
+    u.searchParams.set("exp", `${u.searchParams.get("exp")}x`);
+    const r = await handle(new Request(u.toString()), env);
+    expect(r.status).toBe(401);
+  });
+
   it("case 14 — out-of-allowlist fmt returns 400", async () => {
     const url = await makeSignedURL("https://cdn.example.com", KEY,
       "private/abc/img1.jpg", Math.floor(Date.now()/1000) + 300, { fmt: "svg" });
@@ -823,8 +848,8 @@ with the real verification:
     const sig = url.searchParams.get("sig");
     const expStr = url.searchParams.get("exp");
     if (!sig || !expStr) return new Response("Unauthorized", { status: 401 });
-    const exp = parseInt(expStr, 10);
-    if (!Number.isFinite(exp) || Date.now() / 1000 > exp) {
+    const exp = parseExactDecimal(expStr);
+    if (exp === null || Date.now() / 1000 > exp) {
       return new Response("Unauthorized", { status: 401 });
     }
     const keyBytes = hexToBytes(env.WORKER_SIGNING_KEY);
@@ -1212,15 +1237,15 @@ python3 -c "from PIL import Image; Image.new('RGB', (2400, 1600), 'steelblue').s
 
 - [ ] **Step 4: README documenting how to run Layer B locally**
 
-```markdown
+````markdown
 # Layer-B integration tests
 
 Runs the full round-trip described in spec §8.6.2 case 15.
 
 **Prerequisites:**
 
-1. Plan 1's API running locally with `APP_ENV=test`: `cd ../api && APP_ENV=test go run ./cmd/api` with `WORKER_SIGNING_KEY`, `JWT_SIGNING_KEY`, `DATABASE_URL`, `CDN_ORIGIN=http://localhost:8787` exported. `APP_ENV=test` swaps Storage to localfs (no R2 credentials needed) AND registers the `POST /dev/seed` endpoint.
-2. This Worker running locally: `cd .. && npm run dev` (wrangler dev). Same `WORKER_SIGNING_KEY`. R2 bound to a dev bucket; the `[images]` binding requires a Cloudflare account — wrangler 3.x supports an `experimental_remote = true` flag on the IMAGES binding (in `wrangler.toml` under `[dev]`) to proxy through real Cloudflare Images. Pin to `wrangler@^3.50.0` (per contracts §13.3) — earlier 3.x versions used a different flag name (`experimental_remote_bindings`) and the helper config we ship targets the newer name.
+1. Plan 1's API running locally with `APP_ENV=test`: `cd ../api && APP_ENV=test go run ./cmd/api` with `WORKER_SIGNING_KEY`, `JWT_SIGNING_KEY`, `DATABASE_URL`, `CDN_ORIGIN=http://localhost:8787`, and S3/R2 credentials exported. `APP_ENV=test` registers the `POST /dev/seed` endpoint, but **storage must still be shared with the Worker** for this Layer-B round-trip: set `S3_ENDPOINT` to the Cloudflare R2 S3 endpoint for the same dev bucket bound to wrangler, plus `R2_ACCESS_KEY_ID`, `R2_ACCESS_KEY_SECRET`, and `R2_BUCKET`. Do not leave `S3_ENDPOINT` unset here; that selects localfs for API-only tests and the Worker will 404 because it reads from R2.
+2. This Worker running locally: `cd .. && npm run dev` (wrangler dev). Same `WORKER_SIGNING_KEY`. R2 bound to the **same dev bucket** the API writes via S3/R2 credentials; the `[images]` binding requires a Cloudflare account — wrangler 3.x supports an `experimental_remote = true` flag on the IMAGES binding (in `wrangler.toml` under `[dev]`) to proxy through real Cloudflare Images. Pin to `wrangler@^3.50.0` (per contracts §13.3) — earlier 3.x versions used a different flag name (`experimental_remote_bindings`) and the helper config we ship targets the newer name. If no Cloudflare R2 account is available, skip this Layer-B test locally and use Plan 3's MinIO-backed compose harness for storage-sharing coverage; compose does not prove real Cloudflare Images resizing.
 3. Mint an owner JWT via the test-only seed endpoint (the manual "open Google in a browser" path is not deterministic and is reserved for end-user smoke testing):
 
 ```bash
@@ -1236,7 +1261,7 @@ ART_CDN_BASE=http://localhost:8787 \
 ART_OWNER_JWT=$ART_OWNER_JWT \
 npm run test:integration
 ```
-```
+````
 
 - [ ] **Step 5: Commit**
 
@@ -1247,7 +1272,157 @@ git commit -m "[worker] test: layer-B round-trip with image-size width verificat
 
 ---
 
-## Task 12: `.github/workflows/worker.yml`
+## Task 12: E2E entrypoint + `Dockerfile.e2e` (consumed by `web/docker-compose.e2e.yml`)
+
+**Files:**
+- Create: `worker/scripts/e2e-server.ts`
+- Create: `worker/Dockerfile.e2e`
+- Modify: `worker/package.json` (add `@aws-sdk/client-s3` + `tsx` to devDependencies)
+- Modify: `worker/package-lock.json` (generated by `npm install --save-dev`; required because Dockerfile uses `npm ci`)
+
+**Why this lives in Plan 2:** the entrypoint imports the production `handle()` from `worker/src/index.ts` and shims a MinIO-backed S3 client into the R2 binding shape. Per contracts §1, files under `worker/` belong to Plan 2 — Plan 3 (which orchestrates the compose stack at `web/docker-compose.e2e.yml`) consumes this task's output via the `worker` service's `build:` directive.
+
+**Why a Node entrypoint instead of `wrangler dev`:** `wrangler dev` requires `wrangler login` against Cloudflare which can't run unattended in CI. Miniflare standalone runs the Worker but cannot emulate the `env.IMAGES` binding offline. The clean compromise: a small Node entrypoint that reuses the production `handle()` so canonical-path + HMAC + Cache-Control logic still flows through real production code; only the actual pixel resize is mocked. Layer-B (Task 11) is what proves the resize works against real `env.IMAGES`.
+
+- [ ] **Step 1: `scripts/e2e-server.ts`** — production `handle()` wrapper
+
+```ts
+// worker/scripts/e2e-server.ts
+import { createServer } from "node:http";
+import { Readable } from "node:stream";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { handle, type Env, type ImagesBinding } from "../src/index";
+
+const PORT = parseInt(process.env.PORT ?? "8787", 10);
+const SIGNING_KEY = process.env.WORKER_SIGNING_KEY ?? "";
+const BUCKET = process.env.R2_BUCKET ?? "art-dev";
+
+const s3 = new S3Client({
+  endpoint: process.env.S3_ENDPOINT ?? "http://minio:9000",
+  region: "auto",
+  forcePathStyle: true,
+  credentials: {
+    accessKeyId: process.env.S3_ACCESS_KEY_ID ?? "minioadmin",
+    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY ?? "minioadmin",
+  },
+});
+
+// Minimal R2 shim — handle() only calls .get(); other methods are typed but unused.
+const r2 = {
+  async get(key: string) {
+    try {
+      const out = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+      const bytes = await out.Body!.transformToByteArray();
+      return {
+        body: Readable.toWeb(Readable.from(Buffer.from(bytes))) as ReadableStream,
+      };
+    } catch {
+      return null;
+    }
+  },
+} as unknown as Env["R2"];
+
+// IMAGES stub — no real resize. Layer-B (Task 11) is what proves the real
+// binding works; this stub just ensures privacy + Cache-Control logic flow
+// through the production handler.
+const images: ImagesBinding = {
+  input(stream) {
+    return {
+      transform() { return this; },
+      async output(opts) {
+        return {
+          response: () => new Response(stream, {
+            status: 200,
+            headers: { "Content-Type": opts.format },
+          }),
+        };
+      },
+    } as never;
+  },
+};
+
+const env: Env = { R2: r2, IMAGES: images, WORKER_SIGNING_KEY: SIGNING_KEY };
+
+const server = createServer(async (nodeReq, nodeRes) => {
+  // Compose-internal /healthz so the docker healthcheck has a definitive signal.
+  if (nodeReq.url === "/healthz") {
+    nodeRes.writeHead(200, { "Content-Type": "text/plain" });
+    nodeRes.end("ok");
+    return;
+  }
+
+  const url = `http://localhost:${PORT}${nodeReq.url}`;
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(nodeReq.headers)) {
+    if (typeof v === "string") headers.set(k, v);
+    else if (Array.isArray(v)) headers.set(k, v.join(","));
+  }
+  try {
+    const resp = await handle(new Request(url, { method: nodeReq.method, headers }), env);
+    const respHeaders: Record<string, string> = {};
+    resp.headers.forEach((v, k) => { respHeaders[k] = v; });
+    nodeRes.writeHead(resp.status, respHeaders);
+    if (resp.body) {
+      const reader = resp.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        nodeRes.write(value);
+      }
+    }
+    nodeRes.end();
+  } catch (err) {
+    nodeRes.writeHead(500, { "Content-Type": "text/plain" });
+    nodeRes.end(`worker error: ${(err as Error).message}`);
+  }
+});
+
+server.listen(PORT, () => console.log(`worker e2e server on :${PORT}`));
+```
+
+- [ ] **Step 2: `worker/Dockerfile.e2e`**
+
+```dockerfile
+# worker/Dockerfile.e2e
+# E2E-only image. Production Worker deploys via `wrangler deploy` and
+# never builds this image. Node version pinned per contracts §13.1.
+FROM node:20-alpine
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY tsconfig.json ./
+EXPOSE 8787
+CMD ["npx", "tsx", "scripts/e2e-server.ts"]
+```
+
+- [ ] **Step 3: `package.json` devDependencies**
+
+Run from `worker/` so `package.json` and `package-lock.json` stay in sync for the Dockerfile's `npm ci` step:
+
+```bash
+npm install --save-dev @aws-sdk/client-s3@^3.600.0 tsx@^4.7.0
+```
+
+These are devDependencies on purpose — production `wrangler deploy` must not bundle them. The deployed Worker uses `env.R2` (not the S3 client) and never executes `scripts/e2e-server.ts`.
+
+- [ ] **Step 4: Smoke build**
+
+```bash
+cd worker && docker build -f Dockerfile.e2e -t art-web-worker-e2e:smoke .
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add worker/scripts/e2e-server.ts worker/Dockerfile.e2e worker/package.json worker/package-lock.json
+git commit -m "[worker] feat: E2E entrypoint + Dockerfile.e2e (MinIO-backed R2 shim)"
+```
+
+---
+
+## Task 13: `.github/workflows/worker.yml`
 
 **Files:**
 - Create: `.github/workflows/worker.yml`
@@ -1290,7 +1465,7 @@ git commit -m "[worker] ci: GitHub Actions workflow scoped to worker/**"
 
 ## Done
 
-After all 12 tasks land, Plan 2 produces a Cloudflare Worker that:
+After all 13 tasks land, Plan 2 produces a Cloudflare Worker that:
 
 - Validates canonical paths (contracts §3) and rejects malformed input with 400
 - Verifies HMAC signatures byte-perfect against Plan 1 (via the locked vector pin in Task 10)

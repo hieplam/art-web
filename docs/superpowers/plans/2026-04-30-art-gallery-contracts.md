@@ -16,11 +16,14 @@ art-web/
 │   ├── cmd/api/main.go
 │   ├── internal/{httpapi,auth,user,artwork,image,storage,db}/
 │   ├── migrations/
+│   ├── Dockerfile             # Plan 1 (used by web/docker-compose.e2e.yml)
 │   ├── go.mod
 │   └── go.sum
 ├── worker/                    # Plan 2 — Cloudflare Worker
 │   ├── src/{index.ts,sign.ts,allowlist.ts}
+│   ├── scripts/e2e-server.ts  # Plan 2 (E2E entrypoint; production deploys via wrangler)
 │   ├── test/
+│   ├── Dockerfile.e2e         # Plan 2 (used by web/docker-compose.e2e.yml)
 │   ├── package.json
 │   ├── wrangler.toml
 │   └── tsconfig.json
@@ -29,15 +32,28 @@ art-web/
 │   ├── components/
 │   ├── lib/
 │   ├── e2e/
+│   ├── docker-compose.e2e.yml # Plan 3 (cross-system convergence harness — see §2)
+│   ├── Dockerfile             # Plan 3
 │   ├── package.json
 │   ├── next.config.js
 │   ├── playwright.config.ts
 │   └── vitest.config.ts
+├── .github/workflows/         # Each plan owns one file (see §14)
+│   ├── api.yml                # Plan 1
+│   ├── worker.yml             # Plan 2
+│   ├── web.yml                # Plan 3
+│   └── e2e.yml                # Plan 3 (cross-system)
 ├── docs/superpowers/{specs,plans}/
+├── README.md
 └── .gitignore
 ```
 
-**Disjoint-subtree rule:** Plans 1/2/3 own `api/`, `worker/`, `web/` respectively and never touch each other's subtrees. The only shared file all three may modify is `.gitignore` and `README.md` at root, and only via additive entries.
+**Disjoint-subtree rule:** Plans 1/2/3 own `api/`, `worker/`, `web/` respectively and never touch each other's subtrees. Shared paths may be modified only via additive (non-conflicting) entries:
+
+- **`.gitignore` and `README.md`** at repo root — any plan may add lines.
+- **`.github/workflows/`** — each plan adds its own workflow file. Plan 1 owns `api.yml`, Plan 2 owns `worker.yml`, Plan 3 owns `web.yml` and the cross-system `e2e.yml`. No plan modifies another plan's workflow file.
+
+Container build files belong to the plan whose subtree they build, not to the plan that orchestrates them: `api/Dockerfile` is Plan 1; `worker/Dockerfile.e2e` and `worker/scripts/e2e-server.ts` are Plan 2; `web/Dockerfile` is Plan 3. The integration test manifest `web/docker-compose.e2e.yml` lives inside Plan 3's subtree because Plan 3 is the convergence point per §2; build contexts are relative paths into the sibling subtrees (`../api`, `../worker`, `.`).
 
 ## 2. Parallel Execution Model
 
@@ -293,14 +309,15 @@ type ApiError = {
 | `JWT_SIGNING_KEY` | API only | hex-encoded, min 32 bytes decoded |
 | `GOOGLE_OAUTH_CLIENT_ID` | API only | |
 | `GOOGLE_OAUTH_CLIENT_SECRET` | API only | |
-| `R2_ACCOUNT_ID` | API only (Worker uses binding) | |
-| `R2_ACCESS_KEY_ID` | API only | for direct R2 PUT |
-| `R2_ACCESS_KEY_SECRET` | API only | for direct R2 PUT |
+| `R2_ACCOUNT_ID` | API only, prod only (Worker uses binding) | used to construct the default R2 endpoint when `S3_ENDPOINT` is empty |
+| `R2_ACCESS_KEY_ID` | API only | S3-compatible access key. Set to R2 credentials in prod, `minioadmin` under E2E. |
+| `R2_ACCESS_KEY_SECRET` | API only | S3-compatible secret. Set to R2 credentials in prod, `minioadmin` under E2E. |
 | `R2_BUCKET` | API + Worker | identical bucket name |
+| `S3_ENDPOINT` | API (test + prod) + Worker (E2E entrypoint only) | S3-compatible endpoint URL. Empty/unset → API constructs the R2 endpoint from `R2_ACCOUNT_ID` (prod default). Set to `http://minio:9000` under docker-compose E2E so API and Worker share one storage backend. The production Worker reads from the R2 binding directly and ignores this var. |
 | `CDN_ORIGIN` | API only | base URL emitted in image responses; defaults `https://cdn.example.com` |
 | `COOKIE_DOMAIN` | API only | e.g. `.example.com` in prod; empty in dev |
 | `ALLOWED_ORIGIN` | API only | CORS Access-Control-Allow-Origin; the FE host (e.g. `https://example.com`) |
-| `APP_ENV` | API only | `dev` sets `Secure=false` on the auth cookie. `test` additionally (a) swaps `Storage` for `localfs.Store` so docker-compose runs without R2 credentials, and (b) registers a test-only `POST /dev/seed` route that mints fixture cookies + artworks for Plan 2 Layer-B and Plan 3 E2E. The route returns 404 outside test env (router skips registration AND handler re-checks). See Plan 1 Task 33. |
+| `APP_ENV` | API only | Three values control three orthogonal behaviors. `dev` sets `Secure=false` on the auth cookie and uses `localfs.Store`. `test` keeps `Secure=false` and registers a test-only `POST /dev/seed` route (mints fixture cookies + artworks for Plan 2 Layer-B and Plan 3 E2E; returns 404 outside test env via two-layer defense — router skips registration AND handler re-checks). Anything else is treated as production. **Storage is a separate axis** (see `S3_ENDPOINT`): under `test` the storage selector picks localfs only for API-only/unit-style tests when `S3_ENDPOINT` is empty. Plan 2 Layer-B must set S3/R2 credentials so the API writes to the same R2 bucket wrangler reads, and Plan 3 docker-compose sets `S3_ENDPOINT=http://minio:9000` so API and Worker share MinIO. See Plan 1 Tasks 31 and 33. |
 | `NEXT_PUBLIC_API_BASE` | Web only | e.g. `https://api.example.com` |
 | `NEXT_PUBLIC_CDN_BASE` | Web only | optional dev override; if unset, the loader uses the host of the URL the API returned |
 
@@ -329,11 +346,11 @@ Single source of truth for every runtime, image, and major library version used 
 
 | Component | Pin | Where used |
 |---|---|---|
-| Go toolchain | `1.24` (≥1.24 required for `t.Context()` in tests) | Plan 1 `go.mod`, Plan 1 `api.yml` setup-go, Plan 3 `api/Dockerfile` |
-| Node.js | `>=20` | Plans 2/3 `package.json` `engines.node`, all `setup-node@v4` actions |
-| PostgreSQL | `postgres:16-alpine` (server requires ≥13 for `gen_random_uuid()`) | Plan 1 testcontainer, Plan 3 `docker-compose.e2e.yml` |
-| MinIO | `minio/minio:RELEASE.2024-12-18T13-15-44Z` | Plan 1 testcontainer, Plan 3 `docker-compose.e2e.yml` |
-| Docker Compose schema | `"3.9"` | Plan 3 `docker-compose.e2e.yml` |
+| Go toolchain | `1.24` (≥1.24 required for `t.Context()` in tests) | Plan 1 `go.mod`, Plan 1 `api.yml` setup-go, Plan 1 `api/Dockerfile` |
+| Node.js | `>=20` | Plans 2/3 `package.json` `engines.node`, all `setup-node@v4` actions, Plan 2 `worker/Dockerfile.e2e`, Plan 3 `web/Dockerfile` |
+| PostgreSQL | `postgres:16-alpine` (server requires ≥13 for `gen_random_uuid()`) | Plan 1 testcontainer, Plan 3 `web/docker-compose.e2e.yml` |
+| MinIO | `minio/minio:RELEASE.2024-12-18T13-15-44Z` | Plan 1 testcontainer, Plan 3 `web/docker-compose.e2e.yml` |
+| Docker Compose schema | `"3.9"` | Plan 3 `web/docker-compose.e2e.yml` |
 | Cloudflare Workers compatibility date | `2026-04-01` | Plan 2 `wrangler.toml` |
 
 ### 13.2 Go modules (Plan 1)
@@ -387,7 +404,7 @@ Each plan contributes its own GitHub Actions workflow file under `.github/workfl
 - `api.yml` — runs on `api/**` changes; spawns Postgres + MinIO testcontainers; `go test ./...` (Plan 1)
 - `worker.yml` — runs on `worker/**` changes; `vitest` against `@cloudflare/vitest-pool-workers` (Plan 2)
 - `web.yml` — runs on `web/**` changes; Vitest unit + RTL component tests (Plan 3)
-- `e2e.yml` — runs on any-change to `api/**`, `worker/**`, `web/**`; brings up docker-compose stack and runs Playwright (Plan 3 owns this file)
+- `e2e.yml` — runs on any-change to `api/**`, `worker/**`, `web/**`, or `web/docker-compose.e2e.yml`; brings up the `web/docker-compose.e2e.yml` stack and runs Playwright (Plan 3 owns this file)
 
 Each plan's workflow file is added in that plan's tasks and modifies only its own file.
 

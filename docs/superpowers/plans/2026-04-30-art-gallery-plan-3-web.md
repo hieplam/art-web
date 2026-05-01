@@ -8,7 +8,7 @@
 
 **Tech Stack:** Next.js 14, React 18, TypeScript, Tailwind CSS (minimal), Vitest + React Testing Library (unit/component), Playwright (E2E), `image-size` for HTML response parsing in tests.
 
-**Subtree owned by this plan:** `web/` (read [contracts §1](./2026-04-30-art-gallery-contracts.md#1-monorepo-layout)). This plan also owns `docker-compose.e2e.yml` at repo root and `.github/workflows/e2e.yml` for cross-system integration.
+**Subtree owned by this plan:** `web/` (read [contracts §1](./2026-04-30-art-gallery-contracts.md#1-monorepo-layout)). The convergence harness `web/docker-compose.e2e.yml` and the cross-system workflow `.github/workflows/e2e.yml` are also Plan 3's per contracts §1 — both are integration glue Plan 3 owns as the convergence point (contracts §2). Container build files for `api/` and `worker/` belong to Plans 1 and 2 respectively; this plan only references them via build contexts.
 
 **Read first:**
 1. [Design spec](../specs/2026-04-30-art-gallery-design.md) — sections 7, 8.5, 8.6.1 (rows 6-9), 8.6.5, 12
@@ -42,7 +42,7 @@
 | 18 | `playwright.config.ts` + globalSetup | — |
 | 19 | E2E privacy SSR HTML tests (cases 6-9) | E2E |
 | 20 | E2E UX tests (cases 22-25) | E2E |
-| 21 | `docker-compose.e2e.yml` for full-stack | — |
+| 21 | `web/docker-compose.e2e.yml` for full-stack | — |
 | 22 | `.github/workflows/web.yml` + `e2e.yml` | CI |
 
 ---
@@ -57,6 +57,7 @@
 - Create: `web/app/layout.tsx`
 - Create: `web/app/page.tsx`
 - Create: `web/app/globals.css`
+- Create: `web/public/.keep`
 
 - [ ] **Step 1: package.json**
 
@@ -171,6 +172,8 @@ export default function Home() { return <main>placeholder</main>; }
 * { box-sizing: border-box; }
 body { margin: 0; font-family: system-ui, sans-serif; }
 ```
+
+Create an empty `web/public/.keep` so the production Dockerfile's `COPY --from=build /app/public ./public` has a stable source directory even before real static assets exist.
 
 - [ ] **Step 5: .gitignore**
 
@@ -328,6 +331,7 @@ export type ApiArgs = {
   body?: BodyInit;
   cookie?: string;        // forwarded as the request `Cookie` header
   headers?: Record<string, string>;
+  cache?: RequestCache;
 };
 
 export async function api<T = unknown>(args: ApiArgs): Promise<T> {
@@ -340,7 +344,7 @@ export async function api<T = unknown>(args: ApiArgs): Promise<T> {
     method: args.method ?? "GET",
     body: args.body,
     headers,
-    cache: "no-store",   // every fetch from the server-side renderer must opt out
+    cache: args.cache ?? "no-store",
     credentials: "include",
   });
   const text = await resp.text();
@@ -369,6 +373,14 @@ export function forwardCookie(): string | undefined {
 export function hasAuthCookie(): boolean {
   return cookies().get("auth") !== undefined;
 }
+
+export function publicApiBase(): string {
+  return process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
+}
+
+export function apiBase(): string {
+  return process.env.API_BASE_INTERNAL || publicApiBase();
+}
 ```
 
 - [ ] **Step 3: Run + commit**
@@ -391,7 +403,7 @@ git commit -m "[web] feat(api): cookie-forwarding fetch wrapper with no-store de
 
 ```ts
 // web/lib/cf-loader.test.ts
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import cfLoader from "./cf-loader";
 
 describe("cf-loader", () => {
@@ -422,6 +434,13 @@ describe("cf-loader", () => {
     const u = new URL(cfLoader({ src: "https://cdn.example.com/img/public/x.jpg", width: 800 }));
     expect(u.searchParams.get("q")).toBe("85");
   });
+
+  it("rewrites container CDN origins for the browser when configured", () => {
+    vi.stubEnv("NEXT_PUBLIC_CDN_BASE", "http://localhost:8787");
+    const u = new URL(cfLoader({ src: "http://worker:8787/img/public/x.jpg", width: 800 }));
+    expect(u.origin).toBe("http://localhost:8787");
+    vi.unstubAllEnvs();
+  });
 });
 ```
 
@@ -439,6 +458,12 @@ function pickWidth(requested: number): number {
 
 export default function cfLoader(args: { src: string; width: number; quality?: number }): string {
   const u = new URL(args.src);
+  const publicOrigin = process.env.NEXT_PUBLIC_CDN_BASE;
+  if (publicOrigin) {
+    const origin = new URL(publicOrigin);
+    u.protocol = origin.protocol;
+    u.host = origin.host;
+  }
   u.searchParams.set("w", String(pickWidth(args.width)));
   u.searchParams.set("fmt", "auto");
   const q = args.quality && ALLOWED_QUALITIES.has(args.quality) ? args.quality : 85;
@@ -796,15 +821,15 @@ git commit -m "[web] feat(component): InfiniteFeed with deduping IntersectionObs
 ```tsx
 // web/components/Nav.tsx
 import Link from "next/link";
-import { api, forwardCookie, hasAuthCookie } from "@/lib/api";
+import { api, apiBase, forwardCookie, hasAuthCookie, publicApiBase } from "@/lib/api";
 import type { User } from "@/lib/types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
-
 export async function Nav() {
+  const serverBase = apiBase();
+  const browserBase = publicApiBase();
   let me: User | null = null;
   if (hasAuthCookie()) {
-    try { me = await api<User>({ base: API_BASE, path: "/me", cookie: forwardCookie() }); }
+    try { me = await api<User>({ base: serverBase, path: "/me", cookie: forwardCookie() }); }
     catch { /* 401 = not signed in */ }
   }
   return (
@@ -818,7 +843,7 @@ export async function Nav() {
             <Link href={`/u/${me.slug}`}>{me.display_name}</Link>
           </>
         ) : (
-          <a href={`${API_BASE}/auth/google/start`}>Sign in</a>
+          <a href={`${browserBase}/auth/google/start`}>Sign in</a>
         )}
       </div>
     </nav>
@@ -862,25 +887,18 @@ git commit -m "[web] feat: root layout with auth-aware nav (server-rendered)"
 
 ```tsx
 // web/app/page.tsx
-import { api } from "@/lib/api";
-import { Masonry } from "@/components/Masonry";
-import { ArtCard } from "@/components/ArtCard";
+import { api, apiBase, publicApiBase } from "@/lib/api";
 import { HomeClient } from "@/components/HomeClient";
 import type { Feed } from "@/lib/types";
-
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
 
 // Public-only: cache freely (contracts §10).
 export const revalidate = 60;
 
 export default async function Home() {
-  const initial = await api<Feed>({ base: API_BASE, path: "/artworks?limit=24" });
+  const initial = await api<Feed>({ base: apiBase(), path: "/artworks?limit=24", cache: "force-cache" });
   return (
     <main>
-      <Masonry>
-        {initial.items.map((it) => <ArtCard key={it.id} item={it} />)}
-      </Masonry>
-      <HomeClient initialCursor={initial.next_cursor} apiBase={API_BASE} />
+      <HomeClient initialItems={initial.items} initialCursor={initial.next_cursor} apiBase={publicApiBase()} />
     </main>
   );
 }
@@ -890,26 +908,32 @@ export default async function Home() {
 // web/components/HomeClient.tsx
 "use client";
 import { InfiniteFeed } from "./InfiniteFeed";
+import { Masonry } from "./Masonry";
 import { ArtCard } from "./ArtCard";
 import type { ArtworkSummary, Feed } from "@/lib/types";
 
-export function HomeClient({ initialCursor, apiBase }: { initialCursor: string | null; apiBase: string }) {
-  if (!initialCursor) return null;
+export function HomeClient(props: {
+  initialItems: ArtworkSummary[];
+  initialCursor: string | null;
+  apiBase: string;
+}) {
   return (
-    <InfiniteFeed<ArtworkSummary>
-      initialItems={[]}
-      initialCursor={initialCursor}
-      fetchMore={async (c) => {
-        const r = await fetch(`${apiBase}/artworks?cursor=${encodeURIComponent(c)}&limit=24`);
-        return r.json() as Promise<Feed>;
-      }}
-      renderItem={(it) => <ArtCard key={it.id} item={it} />}
-    />
+    <Masonry>
+      <InfiniteFeed<ArtworkSummary>
+        initialItems={props.initialItems}
+        initialCursor={props.initialCursor}
+        fetchMore={async (c) => {
+          const r = await fetch(`${props.apiBase}/artworks?cursor=${encodeURIComponent(c)}&limit=24`);
+          return r.json() as Promise<Feed>;
+        }}
+        renderItem={(it) => <ArtCard key={it.id} item={it} />}
+      />
+    </Masonry>
   );
 }
 ```
 
-The first `Masonry` is server-rendered; the client `InfiniteFeed` appends additional cards. Visually the additional cards inherit the masonry layout because they're flowed into the same `<div class="masonry">` container — adjust by hoisting the `Masonry` wrapper inside `HomeClient` if needed.
+`HomeClient` owns the single `Masonry` wrapper and gives `InfiniteFeed` the initial server-fetched items. That guarantees initial and appended cards share the same masonry container instead of rendering appended cards after the layout closes.
 
 - [ ] **Step 2: Commit**
 
@@ -930,7 +954,7 @@ git commit -m "[web] feat: home feed with SSR-first paint + client infinite scro
 ```tsx
 // web/app/u/[slug]/page.tsx
 import { notFound } from "next/navigation";
-import { api, ApiClientError, forwardCookie } from "@/lib/api";
+import { api, apiBase, ApiClientError, forwardCookie } from "@/lib/api";
 import { Masonry } from "@/components/Masonry";
 import { ArtCard } from "@/components/ArtCard";
 import type { UserProfile } from "@/lib/types";
@@ -939,13 +963,11 @@ import type { UserProfile } from "@/lib/types";
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
-
 export default async function Profile({ params }: { params: { slug: string } }) {
   let data: UserProfile;
   try {
     data = await api<UserProfile>({
-      base: API_BASE,
+      base: apiBase(),
       path: `/users/${encodeURIComponent(params.slug)}`,
       cookie: forwardCookie(),
     });
@@ -991,19 +1013,17 @@ git commit -m "[web] feat: profile page with force-dynamic + cookie-forwarded fe
 import { notFound } from "next/navigation";
 import Image from "next/image";
 import Link from "next/link";
-import { api, ApiClientError, forwardCookie } from "@/lib/api";
+import { api, apiBase, ApiClientError, forwardCookie } from "@/lib/api";
 import type { ArtworkDetail } from "@/lib/types";
 import { blurhashToDataURL } from "@/lib/blurhash";
 
 export const dynamic = "force-dynamic";
 export const fetchCache = "force-no-store";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
-
 export default async function Art({ params }: { params: { id: string } }) {
   let data: ArtworkDetail;
   try {
-    data = await api<ArtworkDetail>({ base: API_BASE, path: `/artworks/${params.id}`, cookie: forwardCookie() });
+    data = await api<ArtworkDetail>({ base: apiBase(), path: `/artworks/${params.id}`, cookie: forwardCookie() });
   } catch (e) {
     if (e instanceof ApiClientError && e.status === 404) notFound();
     throw e;
@@ -1067,7 +1087,7 @@ git commit -m "[web] feat: artwork detail with 404 page that scrubs all metadata
 
 ```tsx
 // web/app/tag/[name]/page.tsx
-import { api } from "@/lib/api";
+import { api, apiBase } from "@/lib/api";
 import { Masonry } from "@/components/Masonry";
 import { ArtCard } from "@/components/ArtCard";
 import type { Feed } from "@/lib/types";
@@ -1075,12 +1095,11 @@ import type { Feed } from "@/lib/types";
 // Public-only by spec §8.6.1 case 5 — cacheable.
 export const revalidate = 60;
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
-
 export default async function Tag({ params }: { params: { name: string } }) {
   const feed = await api<Feed>({
-    base: API_BASE,
+    base: apiBase(),
     path: `/tags/${encodeURIComponent(params.name)}?limit=24`,
+    cache: "force-cache",
   });
   return (
     <main className="p-4">
@@ -1113,26 +1132,26 @@ The page is server-rendered specifically so it can auth-gate before the form eve
 ```tsx
 // web/app/upload/page.tsx
 import { redirect } from "next/navigation";
-import { api, ApiClientError, forwardCookie, hasAuthCookie } from "@/lib/api";
+import { api, apiBase, ApiClientError, forwardCookie, hasAuthCookie, publicApiBase } from "@/lib/api";
 import { ArtworkUploader } from "@/components/ArtworkUploader";
 import type { User } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
-
 export default async function UploadPage() {
+  const serverBase = apiBase();
+  const browserBase = publicApiBase();
   // Cheap check first — no API round-trip needed if we don't even have a cookie.
-  if (!hasAuthCookie()) redirect(`${API_BASE}/auth/google/start`);
+  if (!hasAuthCookie()) redirect(`${browserBase}/auth/google/start`);
 
   // Cookie may be present but stale (expired JWT, invalidated session) —
   // verify with /me. 401 → redirect to OAuth start; any other failure
   // bubbles up to Next's error boundary so ops sees it.
   try {
-    await api<User>({ base: API_BASE, path: "/me", cookie: forwardCookie() });
+    await api<User>({ base: serverBase, path: "/me", cookie: forwardCookie() });
   } catch (e) {
     if (e instanceof ApiClientError && e.status === 401) {
-      redirect(`${API_BASE}/auth/google/start`);
+      redirect(`${browserBase}/auth/google/start`);
     }
     throw e;
   }
@@ -1140,7 +1159,7 @@ export default async function UploadPage() {
   return (
     <main className="max-w-2xl mx-auto p-4">
       <h1 className="text-2xl mb-3">New artwork</h1>
-      <ArtworkUploader apiBase={API_BASE} />
+      <ArtworkUploader apiBase={browserBase} />
     </main>
   );
 }
@@ -1421,7 +1440,7 @@ export default async function globalSetup() {
 //
 // The /dev/seed endpoint is registered by Plan 1 Task 33, gated by
 // APP_ENV=test. Outside test env it returns 404 (the route is not
-// registered AND the handler re-checks). The API in docker-compose.e2e.yml
+// registered AND the handler re-checks). The API in web/docker-compose.e2e.yml
 // runs with APP_ENV=test, so this just works inside CI.
 
 const API = process.env.API_BASE || "http://localhost:8080";
@@ -1440,6 +1459,7 @@ export async function seedMatrix(opts: { many?: number } = {}): Promise<{
   }
   return r.json();
 }
+```
 
 - [ ] **Step 4: Commit**
 
@@ -1626,23 +1646,25 @@ git commit -m "[web] test: UX cases 22-25 (no-dupes, no-CLS, lazy, flip+incognit
 
 ---
 
-## Task 21: `docker-compose.e2e.yml` for full-stack
+## Task 21: `web/docker-compose.e2e.yml` for full-stack
 
 **Files:**
-- Create: `docker-compose.e2e.yml` (at repo root)
-- Create: `api/Dockerfile`
-- Create: `worker/Dockerfile.e2e`
-- Create: `worker/scripts/e2e-server.ts`
+- Create: `web/docker-compose.e2e.yml` (Plan 3 owns the convergence harness — see contracts §1)
 - Create: `web/Dockerfile`
 
-**Why the Worker is harder than the others.** `wrangler dev` requires `wrangler login` against Cloudflare, which can't run unattended in CI. Miniflare standalone runs the Worker but cannot emulate the `env.IMAGES` binding offline. The clean compromise: ship a small Node entrypoint (`worker/scripts/e2e-server.ts`) that imports the same `handle(req, env)` function the production Worker exports, wraps a MinIO-backed S3 client to look like R2, and stubs IMAGES with a pass-through. This exercises the *real* canonicalization + HMAC + Cache-Control logic; only the actual pixel resize is mocked. Layer-B (Plan 2 Task 11) is what proves the resize works.
+**What this task covers (and what it doesn't).** This compose file orchestrates four services into a full E2E stack. Container build files for `api/` and `worker/` belong to Plans 1 and 2 respectively per contracts §1: `api/Dockerfile` is built in Plan 1 Task 31; `worker/Dockerfile.e2e` and `worker/scripts/e2e-server.ts` are built in Plan 2 Task 12. This task only references them via `build:` contexts — it does not create them.
 
-`Cache-Control` headers are set per-branch by the production handler (Plan 2 Task 5), so privacy + cache invariants in the SSR HTML and UX tests still pin the same logic the production Worker runs.
+**Why a Node entrypoint instead of `wrangler dev` for the Worker:** see Plan 2 Task 12 for the rationale and entrypoint code. Privacy + HMAC + Cache-Control flow through real production code (the `handle()` function exported by `worker/src/index.ts`); only the actual pixel resize is mocked. Layer-B (Plan 2 Task 11) is what proves the resize works against real `env.IMAGES`.
+
+**Storage backend.** API and Worker share one MinIO bucket: API writes via the S3 driver pointing at `S3_ENDPOINT=http://minio:9000` (Plan 1 Task 31's storage selector goes through that branch when `APP_ENV=test`); Worker reads via the S3 client wrapped in an R2-shaped binding (Plan 2 Task 12). Same bytes, same bucket — bytes the API just uploaded are visible to Worker reads, which is what makes cross-system E2E (case 25 incognito flip, case 7 home-feed cards) actually verify reality.
 
 - [ ] **Step 1: Compose file with healthchecks on every service**
 
+Build contexts are relative to this file's location (`web/`), so `../api` reaches Plan 1's subtree and `../worker` reaches Plan 2's. The web service uses `.` as its context.
+
 ```yaml
-# docker-compose.e2e.yml — at repo root, NOT inside web/
+# web/docker-compose.e2e.yml — Plan 3-owned convergence harness (contracts §1).
+# Build contexts cross into sibling subtrees: ../api, ../worker.
 version: "3.9"
 services:
   postgres:
@@ -1659,9 +1681,8 @@ services:
       retries: 30
 
   minio:
-    # Tag pinned per contracts §13 — must match the version used by
-    # Plan 1's testcontainer-driven r2_test.go, otherwise dev compose
-    # and unit tests can drift apart on AWS S3 SDK behavior nuances.
+    # Tag pinned per contracts §13.1 — must match Plan 1's testcontainer
+    # so dev compose and unit tests share the same MinIO behavior.
     image: minio/minio:RELEASE.2024-12-18T13-15-44Z
     command: server /data --address :9000
     environment:
@@ -1676,21 +1697,29 @@ services:
 
   api:
     build:
-      context: ./api
+      context: ../api
       dockerfile: Dockerfile
     environment:
       ADDR: ":8080"
-      # APP_ENV=test triggers two behaviors in Plan 1 main.go:
-      #   1. loadConfig swaps Storage for localfs (no R2 credentials needed)
-      #   2. router registers POST /dev/seed for cross-system test fixtures
+      # APP_ENV=test triggers two behaviors in Plan 1's main.go:
+      #   1. Storage selector (Task 31) routes to the S3 driver pointing at
+      #      S3_ENDPOINT — i.e. MinIO in this compose.
+      #   2. Router registers POST /dev/seed for cross-system fixtures (Task 33).
+      # Sharing the MinIO bucket with the worker service is what makes
+      # bytes the API uploads visible to Worker reads.
       APP_ENV: test
       DATABASE_URL: postgres://art:art@postgres:5432/artweb?sslmode=disable
       JWT_SIGNING_KEY: "3031323334353637383961626364656630313233343536373839616263646566"
       WORKER_SIGNING_KEY: "3031323334353637383961626364656630313233343536373839616263646566"
-      CDN_ORIGIN: "http://worker:8787"   # API generates URLs the worker container resolves
+      CDN_ORIGIN: "http://localhost:8787"   # browser-visible origin; Worker verifies only path/query
       FRONTEND_URL: "http://localhost:3000/"
+      S3_ENDPOINT: "http://minio:9000"
+      R2_ACCESS_KEY_ID: "minioadmin"
+      R2_ACCESS_KEY_SECRET: "minioadmin"
+      R2_BUCKET: "art-dev"
     depends_on:
       postgres: { condition: service_healthy }
+      minio:    { condition: service_healthy }
     ports: ["8080:8080"]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
@@ -1700,7 +1729,7 @@ services:
 
   worker:
     build:
-      context: ./worker
+      context: ../worker
       dockerfile: Dockerfile.e2e
     environment:
       PORT: "8787"
@@ -1720,10 +1749,10 @@ services:
 
   web:
     build:
-      context: ./web
+      context: .
       dockerfile: Dockerfile
     environment:
-      NEXT_PUBLIC_API_BASE: "http://api:8080"
+      NEXT_PUBLIC_API_BASE: "http://localhost:8080"
       NEXT_PUBLIC_CDN_BASE: "http://localhost:8787"   # browser-side; resolves to host port
       API_BASE_INTERNAL: "http://api:8080"            # server-side fetch uses internal hostname
     depends_on:
@@ -1737,156 +1766,11 @@ services:
       retries: 30
 ```
 
-- [ ] **Step 2: Worker E2E entrypoint (`worker/scripts/e2e-server.ts`)**
-
-Imports the production `handle()`, wraps MinIO as an R2-shaped object, stubs `IMAGES` with pass-through. ~60 lines.
-
-```ts
-// worker/scripts/e2e-server.ts
-import { createServer } from "node:http";
-import { Readable } from "node:stream";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
-import { handle, type Env, type ImagesBinding } from "../src/index";
-
-const PORT = parseInt(process.env.PORT ?? "8787", 10);
-const SIGNING_KEY = process.env.WORKER_SIGNING_KEY ?? "";
-const BUCKET = process.env.R2_BUCKET ?? "art-dev";
-
-const s3 = new S3Client({
-  endpoint: process.env.S3_ENDPOINT ?? "http://minio:9000",
-  region: "auto",
-  forcePathStyle: true,
-  credentials: {
-    accessKeyId: process.env.S3_ACCESS_KEY_ID ?? "minioadmin",
-    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY ?? "minioadmin",
-  },
-});
-
-// Minimal R2 shim — handle() only calls .get(); other methods are typed but unused.
-const r2 = {
-  async get(key: string) {
-    try {
-      const out = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
-      const bytes = await out.Body!.transformToByteArray();
-      return {
-        body: Readable.toWeb(Readable.from(Buffer.from(bytes))) as ReadableStream,
-      };
-    } catch {
-      return null;
-    }
-  },
-} as unknown as Env["R2"];
-
-// IMAGES stub — no real resize. Plan 2's Layer-B integration test (Task 11)
-// is what proves the real binding works; this stub just ensures privacy +
-// Cache-Control logic flows correctly through the production handler.
-const images: ImagesBinding = {
-  input(stream) {
-    return {
-      transform() { return this; },
-      async output(opts) {
-        return {
-          response: () => new Response(stream, {
-            status: 200,
-            headers: { "Content-Type": opts.format },
-          }),
-        };
-      },
-    } as never;
-  },
-};
-
-const env: Env = { R2: r2, IMAGES: images, WORKER_SIGNING_KEY: SIGNING_KEY };
-
-const server = createServer(async (nodeReq, nodeRes) => {
-  // Compose-internal /healthz so the docker healthcheck has a definitive signal.
-  if (nodeReq.url === "/healthz") {
-    nodeRes.writeHead(200, { "Content-Type": "text/plain" });
-    nodeRes.end("ok");
-    return;
-  }
-
-  const url = `http://localhost:${PORT}${nodeReq.url}`;
-  const headers = new Headers();
-  for (const [k, v] of Object.entries(nodeReq.headers)) {
-    if (typeof v === "string") headers.set(k, v);
-    else if (Array.isArray(v)) headers.set(k, v.join(","));
-  }
-  try {
-    const resp = await handle(new Request(url, { method: nodeReq.method, headers }), env);
-    const respHeaders: Record<string, string> = {};
-    resp.headers.forEach((v, k) => { respHeaders[k] = v; });
-    nodeRes.writeHead(resp.status, respHeaders);
-    if (resp.body) {
-      const reader = resp.body.getReader();
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        nodeRes.write(value);
-      }
-    }
-    nodeRes.end();
-  } catch (err) {
-    nodeRes.writeHead(500, { "Content-Type": "text/plain" });
-    nodeRes.end(`worker error: ${(err as Error).message}`);
-  }
-});
-
-server.listen(PORT, () => console.log(`worker e2e server on :${PORT}`));
-```
-
-`@aws-sdk/client-s3` is added to `worker/package.json` *only* under devDependencies — production wrangler deploys never run this script:
-
-```json
-"devDependencies": {
-  ...,
-  "@aws-sdk/client-s3": "^3.600.0",
-  "tsx": "^4.7.0"
-}
-```
-
-- [ ] **Step 3: Dockerfiles**
-
-```dockerfile
-# api/Dockerfile
-# Go version pinned per contracts §13 (must be ≥1.24 — t.Context() is a
-# 1.24+ feature used throughout the test suite).
-#
-# Runtime is alpine, not distroless. Distroless ships no shell, which
-# means docker-compose's CMD-SHELL healthcheck (`wget -qO- /healthz`)
-# cannot run inside the container. Alpine adds ~5 MB but lets the
-# healthcheck work without an extra Go-built healthcheck binary.
-FROM golang:1.24-alpine AS build
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 go build -o /bin/api ./cmd/api
-
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates wget
-COPY --from=build /bin/api /api
-EXPOSE 8080
-ENTRYPOINT ["/api"]
-```
-
-```dockerfile
-# worker/Dockerfile.e2e
-# E2E-only image. Production worker deploys via `wrangler deploy` and
-# never builds this image.
-FROM node:20-alpine
-WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
-COPY src/ ./src/
-COPY scripts/ ./scripts/
-COPY tsconfig.json ./
-EXPOSE 8787
-CMD ["npx", "tsx", "scripts/e2e-server.ts"]
-```
+- [ ] **Step 2: `web/Dockerfile`**
 
 ```dockerfile
 # web/Dockerfile
+# Node version pinned per contracts §13.1.
 FROM node:20-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -1904,15 +1788,19 @@ EXPOSE 3000
 CMD ["npm", "run", "start"]
 ```
 
-- [ ] **Step 4: API healthcheck endpoint**
+- [ ] **Step 3: Validate compose resolves before commit**
 
-The compose healthcheck queries `/healthz`. Add the route to Plan 1's router (or wire it as a tiny Plan 1 follow-up): `GET /healthz` returns `200 OK` with body `ok`. Keep it pre-middleware so it works even before DB connects.
-
-- [ ] **Step 5: Commit**
+`docker compose config` parses the file and resolves the cross-subtree build contexts; if `../api/Dockerfile` or `../worker/Dockerfile.e2e` are missing (Plans 1 or 2 not yet merged) this surfaces a clear error rather than waiting for `up --wait` to time out.
 
 ```bash
-git add docker-compose.e2e.yml api/Dockerfile worker/Dockerfile.e2e worker/scripts/e2e-server.ts web/Dockerfile
-git commit -m "[web] chore: docker-compose for full-stack E2E with miniflare-free worker container"
+cd web && docker compose -f docker-compose.e2e.yml config >/dev/null
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add web/docker-compose.e2e.yml web/Dockerfile
+git commit -m "[web] chore: web-owned docker-compose harness for full-stack E2E"
 ```
 
 ---
@@ -1956,9 +1844,11 @@ name: e2e
 
 on:
   push:
-    paths: [ 'api/**', 'worker/**', 'web/**', 'docker-compose.e2e.yml', '.github/workflows/e2e.yml' ]
+    # web/** already covers web/docker-compose.e2e.yml; listed explicitly
+    # for grep-ability when contributors search for the trigger path.
+    paths: [ 'api/**', 'worker/**', 'web/**', 'web/docker-compose.e2e.yml', '.github/workflows/e2e.yml' ]
   pull_request:
-    paths: [ 'api/**', 'worker/**', 'web/**', 'docker-compose.e2e.yml', '.github/workflows/e2e.yml' ]
+    paths: [ 'api/**', 'worker/**', 'web/**', 'web/docker-compose.e2e.yml', '.github/workflows/e2e.yml' ]
 
 jobs:
   e2e:
@@ -1968,7 +1858,7 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
       - name: Build + start full stack
-        run: docker compose -f docker-compose.e2e.yml up -d --build --wait
+        run: docker compose -f web/docker-compose.e2e.yml up -d --build --wait
       - name: Install Playwright deps
         working-directory: web
         run: npm ci && npx playwright install --with-deps chromium
@@ -1981,7 +1871,7 @@ jobs:
         run: npm run test:e2e
       - name: Tear down
         if: always()
-        run: docker compose -f docker-compose.e2e.yml down -v
+        run: docker compose -f web/docker-compose.e2e.yml down -v
       - name: Upload Playwright report
         if: failure()
         uses: actions/upload-artifact@v4

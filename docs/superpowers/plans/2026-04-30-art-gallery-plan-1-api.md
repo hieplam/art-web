@@ -168,7 +168,7 @@ CREATE INDEX artworks_by_user_idx ON artworks (user_id, created_at DESC);
 CREATE TABLE artwork_images (
   id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   artwork_id      uuid NOT NULL REFERENCES artworks(id) ON DELETE CASCADE,
-  client_image_id uuid NOT NULL,
+  client_image_id text NOT NULL CHECK (client_image_id <> ''),
   storage_key     text NOT NULL,
   source_sha256   text NOT NULL,                               -- hex of SHA-256 of the original bytes
   width           int NOT NULL,
@@ -3356,6 +3356,9 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
 
 	"github.com/<org>/art-web/api/internal/artwork"
 	"github.com/<org>/art-web/api/internal/auth"
@@ -3373,7 +3376,7 @@ func NewHandler(s *Service, ar *artwork.Repo, u *auth.URLBuilder) *Handler {
 
 func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	uid, _ := auth.UserIDFrom(r.Context())
-	artID := chiURLParam(r, "id")
+	artID := chi.URLParam(r, "id")
 
 	art, err := h.art.Get(r.Context(), artID)
 	if err != nil || art.UserID != uid {
@@ -3390,7 +3393,7 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"manifest_required"}`, 400)
 		return
 	}
-	entries, err := ParseManifest(stringsReader(manifestRaw))
+	entries, err := ParseManifest(strings.NewReader(manifestRaw))
 	if err != nil {
 		http.Error(w, `{"error":"`+err.Error()+`"}`, 400)
 		return
@@ -3438,8 +3441,6 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(results)
 }
 ```
-
-`chiURLParam` is `chi.URLParam`; rename when wiring routes in Task 25.
 
 - [ ] **Step 3: Concurrent + partial-failure tests** (cases 19 + 20)
 
@@ -3955,10 +3956,12 @@ import (
 	"github.com/<org>/art-web/api/internal/artwork"
 	"github.com/<org>/art-web/api/internal/auth"
 	"github.com/<org>/art-web/api/internal/image"
+	"github.com/<org>/art-web/api/internal/storage"
 	"github.com/<org>/art-web/api/internal/user"
 )
 
 type Deps struct {
+	AppEnv        string
 	JWT           *auth.JWT
 	URL           *auth.URLBuilder
 	Providers     map[string]auth.Provider
@@ -3966,6 +3969,7 @@ type Deps struct {
 	Artworks      *artwork.Repo
 	Tags          *artwork.TagsRepo
 	Images        *image.Repo
+	Store         storage.Storage
 	Upload        *image.Handler
 	Vis           *artwork.VisibilityService
 	Frontend      string         // post-login redirect
@@ -4865,11 +4869,12 @@ git commit -m "[api] test(artwork): case 21 published_at stability across flips"
 
 ---
 
-## Task 31: `cmd/api/main.go` wiring + config
+## Task 31: `cmd/api/main.go` wiring + config + container
 
 **Files:**
 - Modify: `api/cmd/api/main.go`
 - Create: `api/cmd/api/config.go`
+- Create: `api/Dockerfile` (consumed by `web/docker-compose.e2e.yml` — see contracts §1)
 
 - [ ] **Step 1: Replace placeholder main**
 
@@ -4914,17 +4919,36 @@ func main() {
 	defer pool.Close()
 
 	var store storage.Storage
-	// `test` and `dev` both run against localfs so the e2e docker-compose
-	// stack and developer machines do not need real R2 credentials. Plan 3's
-	// docker-compose sets APP_ENV=test for the api service (Plan 3 Task 21).
-	if cfg.AppEnv == "dev" || cfg.AppEnv == "test" {
+	// Storage backend selection:
+	//   - `dev`            → localfs ("./var/storage"). No MinIO/R2 needed.
+	//   - `test` w/o S3    → localfs for API-only/unit-style tests. Do not use
+	//                        this for Plan 2 Layer-B: wrangler reads from R2, so
+	//                        Layer-B must point the API at the same R2 bucket via
+	//                        S3_ENDPOINT + credentials.
+	//   - `test` w/ S3     → S3 driver pointing at `S3_ENDPOINT`. This is the
+	//                        docker-compose E2E path (Plan 3 Task 21 sets
+	//                        S3_ENDPOINT=http://minio:9000 plus minioadmin
+	//                        creds). API and Worker share one MinIO bucket
+	//                        so bytes uploaded by the API are visible to
+	//                        Worker reads (`worker/scripts/e2e-server.ts`).
+	//   - anything else    → S3 driver. Endpoint comes from `S3_ENDPOINT` if
+	//                        set, otherwise constructed from `R2_ACCOUNT_ID`
+	//                        (the production R2 path).
+	switch {
+	case cfg.AppEnv == "dev":
 		store = storage.NewLocalFS("./var/storage")
-	} else {
+	case cfg.AppEnv == "test" && cfg.S3Endpoint == "":
+		store = storage.NewLocalFS("./var/storage")
+	default:
+		endpoint := cfg.S3Endpoint
+		if endpoint == "" {
+			endpoint = "https://" + cfg.R2AccountID + ".r2.cloudflarestorage.com"
+		}
 		s3cli := s3.NewFromConfig(aws.Config{
 			Region:      "auto",
 			Credentials: credentials.NewStaticCredentialsProvider(cfg.R2KeyID, cfg.R2KeySecret, ""),
 		}, func(o *s3.Options) {
-			o.BaseEndpoint = aws.String("https://" + cfg.R2AccountID + ".r2.cloudflarestorage.com")
+			o.BaseEndpoint = aws.String(endpoint)
 			o.UsePathStyle = true
 		})
 		store = storage.NewR2(s3cli, cfg.R2Bucket)
@@ -4953,7 +4977,7 @@ func main() {
 		Providers: map[string]auth.Provider{
 			"google": auth.NewGoogleProvider(cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.GoogleRedirectURL),
 		},
-		Users: users, Artworks: arts, Tags: tags, Images: images,
+		Users: users, Artworks: arts, Tags: tags, Images: images, Store: store,
 		Upload: upload, Vis: vis,
 		Frontend:      cfg.FrontendURL,
 		AllowedOrigin: cfg.AllowedOrigin,
@@ -4988,6 +5012,7 @@ type config struct {
 	WorkerSigningKey, JWTSigningKey, CookieDomain, AllowedOrigin  string
 	GoogleClientID, GoogleClientSecret, GoogleRedirectURL         string
 	R2AccountID, R2KeyID, R2KeySecret, R2Bucket                   string
+	S3Endpoint                                                    string
 }
 
 func loadConfig() config {
@@ -5008,6 +5033,7 @@ func loadConfig() config {
 		R2KeyID:            getEnv("R2_ACCESS_KEY_ID", ""),
 		R2KeySecret:        getEnv("R2_ACCESS_KEY_SECRET", ""),
 		R2Bucket:           getEnv("R2_BUCKET", "art-dev"),
+		S3Endpoint:         getEnv("S3_ENDPOINT", ""),
 	}
 }
 
@@ -5050,11 +5076,32 @@ func mustDecodeHexKey(name, value string) []byte {
 cd api && go build ./...
 ```
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: `api/Dockerfile`** (consumed by `web/docker-compose.e2e.yml`, owned by Plan 1 per contracts §1)
+
+The runtime is alpine, not distroless, so `wget` is available for the compose `CMD-SHELL` healthcheck against `/healthz` (already wired in Task 27 Step 3) without a separate Go-built healthcheck binary.
+
+```dockerfile
+# api/Dockerfile
+# Go version pinned per contracts §13.1 (≥1.24 required for `t.Context()`).
+FROM golang:1.24-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /bin/api ./cmd/api
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates wget
+COPY --from=build /bin/api /api
+EXPOSE 8080
+ENTRYPOINT ["/api"]
+```
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add api/cmd/api/
-git commit -m "[api] feat(cmd): wire main with full config + provider registry"
+git add api/cmd/api/ api/Dockerfile
+git commit -m "[api] feat(cmd): wire main with full config + Dockerfile for E2E compose"
 ```
 
 ---
@@ -5158,7 +5205,8 @@ func TestDevSeed_TestEnv_ReturnsFixture(t *testing.T) {
 	var out struct {
 		AliceCookie, BobCookie string
 		AliceSlug, BobSlug     string
-		PID, QID               string `json:"pId,qId"`
+		PID                    string `json:"pId"`
+		QID                    string `json:"qId"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&out); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -5195,15 +5243,22 @@ func TestDevSeed_Many_BulkSeedsPublic(t *testing.T) {
 package httpapi
 
 import (
+	"bytes"
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/<org>/art-web/api/internal/artwork"
 	"github.com/<org>/art-web/api/internal/auth"
+	"github.com/<org>/art-web/api/internal/image"
+	"github.com/<org>/art-web/api/internal/storage"
 	"github.com/<org>/art-web/api/internal/user"
 )
 
@@ -5215,6 +5270,8 @@ type DevSeed struct {
 	Users    *user.Repo
 	Artworks *artwork.Repo
 	Tags     *artwork.TagsRepo
+	Images   *image.Repo
+	Store    storage.Storage
 	JWT      *auth.JWT
 	Cookie   auth.CookieOpts
 }
@@ -5238,43 +5295,77 @@ func (h *DevSeed) handle(w http.ResponseWriter, r *http.Request) {
 	// Stable but unique per call: append 4 random bytes so reseeding within
 	// a single Postgres instance does not collide on `users.slug`.
 	suffix := randHex(4)
-	alice, err := h.Users.UpsertOAuth(ctx, "test", "alice-"+suffix, "alice@test", "Alice", "alice-"+suffix)
-	if err != nil { writeErr(w, err); return }
-	bob, err := h.Users.UpsertOAuth(ctx, "test", "bob-"+suffix, "bob@test", "Bob", "bob-"+suffix)
-	if err != nil { writeErr(w, err); return }
+	aliceSlug := "alice-" + suffix
+	bobSlug := "bob-" + suffix
+	aliceID, err := h.Users.UpsertOAuth(ctx, "test", "alice-"+suffix, "alice@test", "Alice", aliceSlug)
+	if err != nil { writeSeedErr(w, err); return }
+	bobID, err := h.Users.UpsertOAuth(ctx, "test", "bob-"+suffix, "bob@test", "Bob", bobSlug)
+	if err != nil { writeSeedErr(w, err); return }
 
-	p, err := h.Artworks.Create(ctx, alice.ID, "Public P", "public")
-	if err != nil { writeErr(w, err); return }
-	q, err := h.Artworks.Create(ctx, alice.ID, "Private Q", "private")
-	if err != nil { writeErr(w, err); return }
+	pID, err := h.Artworks.Create(ctx, aliceID, "Public P", "Seeded public artwork P", "public")
+	if err != nil { writeSeedErr(w, err); return }
+	qID, err := h.Artworks.Create(ctx, aliceID, "Private Q", "Seeded private artwork Q", "private")
+	if err != nil { writeSeedErr(w, err); return }
 
 	// Tag both with "t" so the tag-page test can find P (and prove Q is hidden).
-	if err := h.Tags.UpsertAndAttach(ctx, p.ID, []string{"t"}); err != nil { writeErr(w, err); return }
-	if err := h.Tags.UpsertAndAttach(ctx, q.ID, []string{"t"}); err != nil { writeErr(w, err); return }
+	if err := h.Tags.SetTags(ctx, pID, []string{"t"}); err != nil { writeSeedErr(w, err); return }
+	if err := h.Tags.SetTags(ctx, qID, []string{"t"}); err != nil { writeSeedErr(w, err); return }
+
+	// Feed/profile pages skip artworks with no images, so each fixture artwork
+	// gets one real storage object plus one `artwork_images` row.
+	if err := h.attachSeedImage(ctx, pID, "public", "seed-p", 0); err != nil { writeSeedErr(w, err); return }
+	if err := h.attachSeedImage(ctx, qID, "private", "seed-q", 0); err != nil { writeSeedErr(w, err); return }
 
 	// Optional: ?many=N seeds N additional public artworks for case 22.
 	if many, _ := strconv.Atoi(r.URL.Query().Get("many")); many > 0 {
 		for i := 0; i < many; i++ {
-			if _, err := h.Artworks.Create(ctx, alice.ID, fmt.Sprintf("Bulk %d", i), "public"); err != nil {
-				writeErr(w, err); return
+			id, err := h.Artworks.Create(ctx, aliceID, fmt.Sprintf("Bulk %d", i), "Seeded bulk artwork", "public")
+			if err != nil {
+				writeSeedErr(w, err); return
+			}
+			if err := h.attachSeedImage(ctx, id, "public", fmt.Sprintf("seed-bulk-%d", i), 0); err != nil {
+				writeSeedErr(w, err); return
 			}
 		}
 	}
 
-	aliceJWT, _ := h.JWT.Issue(alice.ID)
-	bobJWT, _ := h.JWT.Issue(bob.ID)
+	aliceJWT, err := h.JWT.Issue(aliceID, time.Hour)
+	if err != nil { writeSeedErr(w, err); return }
+	bobJWT, err := h.JWT.Issue(bobID, time.Hour)
+	if err != nil { writeSeedErr(w, err); return }
 
 	// Build a Cookie header value the test can pass back as `Cookie:` directly.
 	out := seedResponse{
 		AliceCookie: "auth=" + aliceJWT,
 		BobCookie:   "auth=" + bobJWT,
-		AliceSlug:   alice.Slug,
-		BobSlug:     bob.Slug,
-		PID:         p.ID,
-		QID:         q.ID,
+		AliceSlug:   aliceSlug,
+		BobSlug:     bobSlug,
+		PID:         pID,
+		QID:         qID,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+var seedPNG = mustDecodeBase64("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=")
+
+func (h *DevSeed) attachSeedImage(ctx context.Context, artworkID, visibility, clientID string, position int) error {
+	key := fmt.Sprintf("%s/%s/%s.png", visibility, artworkID, clientID)
+	if err := h.Store.Put(ctx, key, bytes.NewReader(seedPNG), "image/png"); err != nil {
+		return err
+	}
+	sum := sha256.Sum256(seedPNG)
+	_, err := h.Images.Insert(ctx, image.InsertInput{
+		ArtworkID: artworkID, ClientImageID: clientID, ContentType: "image/png",
+		StorageKey: key, SourceSHA256: hex.EncodeToString(sum[:]),
+		Position: position, Width: 1, Height: 1, ByteSize: len(seedPNG),
+		Blurhash: "L00000fQfQfQfQfQfQfQfQfQfQfQ",
+	})
+	return err
+}
+
+func writeSeedErr(w http.ResponseWriter, err error) {
+	http.Error(w, `{"error":"seed_failed","message":`+strconv.Quote(err.Error())+`}`, 500)
 }
 
 func randHex(n int) string {
@@ -5282,9 +5373,17 @@ func randHex(n int) string {
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
+
+func mustDecodeBase64(s string) []byte {
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
 ```
 
-The seeded artworks have **no images** — the privacy SSR HTML tests (Plan 3 case 6-9) don't require images for negative-content assertions, and case 25's incognito flip works on the artwork ID alone. Image uploads would require building multipart bodies in the seeder, which is more complex than needed. If a future test requires images, extend `DevSeed` rather than embedding image upload in the matrix seed.
+The seeded artworks include one image row and one storage object each. This keeps the API's "skip imageless artworks" behavior intact while still giving Plan 3's cards and private signed URL tests real image URLs to render.
 
 - [ ] **Step 3: Wire registration in `router.go`**
 
@@ -5296,6 +5395,8 @@ if deps.AppEnv == "test" {
         Users:    deps.Users,
         Artworks: deps.Artworks,
         Tags:     deps.Tags,
+        Images:   deps.Images,
+        Store:    deps.Store,
         JWT:      deps.JWT,
         Cookie:   deps.CookieOpts,
     }
@@ -5303,15 +5404,16 @@ if deps.AppEnv == "test" {
 }
 ```
 
-Add `AppEnv string` to the `Deps` struct.
+Add `AppEnv string` and `Store storage.Storage` to the `Deps` struct.
 
 - [ ] **Step 4: Wire `cfg.AppEnv` from `main.go`**
 
-In `cmd/api/main.go` Step 1 (Task 31), the `httpapi.Deps` literal gains:
+In `cmd/api/main.go` Step 1 (Task 31), the `httpapi.Deps` literal includes the storage handle and gains `AppEnv`:
 
 ```go
 r := httpapi.New(&httpapi.Deps{
     AppEnv: cfg.AppEnv,  // ← add this line
+    Store:  store,
     JWT: jwts, URL: urls,
     // ...rest unchanged
 })
@@ -5337,7 +5439,7 @@ After all 33 tasks land, Plan 1 produces a Go API that:
 - Accepts multi-image uploads with idempotent retries (cases 17–20)
 - Holds `published_at` stable across flips (case 21)
 - Builds a signed image URL the Worker (Plan 2) verifies (case 15 companion)
-- Runs against `localfs` in dev, `localfs` under `APP_ENV=test` for E2E, or `r2` in prod via the same `Storage` interface
+- Selects storage backend through one `Storage` interface: `localfs` for `dev` and for `APP_ENV=test` without `S3_ENDPOINT` (local Layer-B, no MinIO needed); the S3 driver pointing at MinIO for `APP_ENV=test` with `S3_ENDPOINT=http://minio:9000` (docker-compose E2E, shared with the Worker); the same S3 driver pointing at R2 in prod (endpoint constructed from `R2_ACCOUNT_ID` when `S3_ENDPOINT` is empty)
 - Exposes a strictly-gated `/dev/seed` endpoint that Plan 2 Layer-B and Plan 3 E2E rely on for deterministic fixtures
 
 The 26-test correctness budget is partially satisfied (cases 1-5 + 15-companion + 17-21 incl. 17b + the building blocks for 6-9). The remaining cases (10-14, 15 cross-system, 16, 22-25) are addressed by Plans 2 and 3.
