@@ -92,7 +92,7 @@ func (h *DevSeed) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if many, _ := strconv.Atoi(r.URL.Query().Get("many")); many > 0 {
-		const maxMany = 100
+		const maxMany = 200
 		if many > maxMany {
 			many = maxMany
 		}

@@ -13,6 +13,7 @@ import (
 type DecodeResult struct {
 	Width, Height int
 	Blurhash      string
+	Format        string // actual format detected by image.Decode ("jpeg", "png", etc.)
 }
 
 func DecodeAndBlurhash(r io.Reader, _ string) (*DecodeResult, error) {
@@ -20,7 +21,7 @@ func DecodeAndBlurhash(r io.Reader, _ string) (*DecodeResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	img, _, err := stdimage.Decode(bytes.NewReader(buf))
+	img, format, err := stdimage.Decode(bytes.NewReader(buf))
 	if err != nil {
 		return nil, err
 	}
@@ -29,5 +30,5 @@ func DecodeAndBlurhash(r io.Reader, _ string) (*DecodeResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DecodeResult{Width: bb.Dx(), Height: bb.Dy(), Blurhash: hash}, nil
+	return &DecodeResult{Width: bb.Dx(), Height: bb.Dy(), Blurhash: hash, Format: format}, nil
 }

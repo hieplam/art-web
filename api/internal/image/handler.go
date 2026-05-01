@@ -73,6 +73,9 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, ErrTooLarge):
 			http.Error(w, `{"error":"too_large"}`, 422)
 			return
+		case errors.Is(err, ErrContentTypeMismatch):
+			http.Error(w, `{"error":"content_type_mismatch","message":"body does not match declared content_type"}`, 422)
+			return
 		case err != nil:
 			http.Error(w, `{"error":"upload_failed"}`, 500)
 			return

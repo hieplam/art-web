@@ -15,6 +15,12 @@ import (
 	"local/art-web/api/internal/storage"
 )
 
+// mimeForFormat maps image.Decode format names to MIME types.
+var mimeForFormat = map[string]string{
+	"jpeg": "image/jpeg",
+	"png":  "image/png",
+}
+
 type Service struct {
 	store    storage.Storage
 	images   *Repo
@@ -37,7 +43,10 @@ type UploadResult struct {
 	Existed bool
 }
 
-var ErrTooLarge = errors.New("file exceeds 25 MB")
+var (
+	ErrTooLarge          = errors.New("file exceeds 25 MB")
+	ErrContentTypeMismatch = errors.New("body content type does not match declared manifest content_type")
+)
 
 func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in UploadOne) (*UploadResult, error) {
 	limited := io.LimitReader(in.Body, MaxBytes+1)
@@ -52,6 +61,9 @@ func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in Upload
 	if err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
+	if actual, ok := mimeForFormat[dec.Format]; ok && actual != in.Manifest.ContentType {
+		return nil, ErrContentTypeMismatch
+	}
 
 	sum := sha256.Sum256(buf)
 	sha := hex.EncodeToString(sum[:])
@@ -60,8 +72,8 @@ func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in Upload
 	ext, _ := ExtFor(in.Manifest.ContentType)
 	key := fmt.Sprintf("%s/%s/%s.%s", art.Visibility, art.ID, imgID, ext)
 
-	// On retry (same client_image_id + same SHA256), Insert returns Existed=true
-	// but `key` was already written above and will never be referenced — orphan.
+	// On idempotent retry (same client_image_id + same SHA256), Insert returns
+	// Existed=true but `key` is a duplicate object never referenced by the DB.
 	// TODO post-v1: track and sweep in R2 GC (spec §11).
 	if err := s.store.Put(ctx, key, bytes.NewReader(buf), in.Manifest.ContentType); err != nil {
 		return nil, err
@@ -75,6 +87,7 @@ func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in Upload
 		ByteSize: len(buf), Blurhash: dec.Blurhash,
 	})
 	if err != nil {
+		_ = s.store.Delete(ctx, key) // best-effort: prevent orphan on insert failure
 		return nil, err
 	}
 
