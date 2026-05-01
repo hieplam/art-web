@@ -9,6 +9,9 @@
 - 2026-05-01 — Schema amendments from plan-1 code review:
   - `artworks.cover_image_id uuid` (with FK to `artwork_images.id`) → `artworks.cover_position int NOT NULL DEFAULT 0`. Original FK only enforced existence, not same-artwork; a buggy or malicious update could point an artwork's cover at an image owned by *another* artwork. The new representation makes the bug structurally impossible: cover is the row where `(artwork_id, position) = (artwork_id, cover_position)`.
   - Added `artwork_images.source_sha256 text NOT NULL`. Idempotency keyed only on `client_image_id` could silently accept a buggy retry that reused the key with different bytes — the server would return the original row and the client would be told "OK, already uploaded" for the wrong file. Storing a SHA-256 fingerprint lets the upload pipeline distinguish "true retry" from "key reuse with different bytes" (the latter returns 409).
+- 2026-05-01 (later) — Pagination + privacy-flip amendments from plan-1 second review:
+  - Cursor wire format pinned to nanosecond precision (RFC3339Nano + UUID, see contracts §8.7). The earlier draft truncated `published_at` to integer epoch seconds, which silently dropped items whose timestamps shared a second because the lexicographic tuple fall-through was on a random UUID. No item is duplicated *or* skipped now.
+  - §6.6 privacy flip extended to cover the `private → public` partial-failure direction. Earlier text only described the safe `public → private` direction; without rollback, a partial private→public flip would leave already-moved bytes accessible at their unsigned `/public/` path despite the artwork still being marked private in DB. Implementation now rolls back already-moved objects on any error before returning.
 
 ## 1. Overview
 
@@ -328,9 +331,15 @@ We do **not** generate thumbnails on upload. The Cloudflare image transform crea
 4. `UPDATE artworks SET visibility = 'public', published_at = COALESCE(published_at, now())`. The `COALESCE` enforces option A: set on first publish only.
 5. Commit.
 
-If a `public → private` move succeeds but the DB commit fails, the object is "stranded" in `/private/` while the DB still says public — but the Worker will block access because the URL says `/public/...`, which now 404s. Result: image hidden, which is the safe failure mode for privacy.
+**Failure-mode analysis (both directions).** Storage moves are non-transactional with the DB, so any flip can fail mid-flight. The implementation MUST roll back already-moved objects on any error before returning, otherwise:
 
-`public → private` is the dangerous direction. `private → public` does the reverse.
+- *`public → private` partial:* one image at `/private/`, one still at `/public/`, DB still says public. Old `/public/` URLs continue to work for the still-moved image; the moved image returns 404 because no signed URL was issued for `/private/` yet. Visible damage is bounded — the artwork stays public (some images broken) and no private content leaks. Acceptable on its own, but tests assert no leaks anyway.
+- *`private → public` partial without rollback:* one image at `/public/`, one still at `/private/`, DB still says private. **The image at `/public/` is now served unsigned to anyone who knows its path** — the Worker authorizes by path prefix, not by DB state. This is a privacy regression: the artwork is supposed to be private, but bytes are reachable as if public.
+- *DB commit fails after all moves succeed:* every image has been moved to the target prefix; rollback restores them so the DB state and storage state stay in sync.
+
+The rollback path is best-effort. If reversing a move itself fails (network, R2 outage), a misplaced object stays at the destination prefix — handled by the v2 R2 GC sweeper (§11) and surfaced via `RollbackLog` in the meantime.
+
+`public → private` was historically called the "dangerous" direction in earlier drafts; with the rollback in place both directions are safe under partial failure. The remaining unsafe scenario is "rollback itself fails after a `private → public` partial move," which the GC sweeper closes within its scan window.
 
 ## 7. Frontend (Next.js)
 

@@ -989,14 +989,16 @@ func TestSign_FixedVector(t *testing.T) {
 	// Locks the byte-perfect HMAC output for a known input. The same hex
 	// MUST appear in worker/test/contract_pin.spec.ts (Plan 2 Task 10).
 	// If this value ever changes, the Worker verifier WILL break.
+	//
+	// Inputs (do NOT change without coordinating with Plan 2):
+	//   key = []byte("0123456789abcdef0123456789abcdef")  // 32 bytes
+	//   canonicalPath = "/private/aaa/bbb.jpg"
+	//   exp = 1700000000
+	//   string-to-sign = "v1|/private/aaa/bbb.jpg|1700000000"
+	const want = "c018a64c183bc6d6348dbf8e2780d287e3550b6945037fa4bedf05f5aa663654"
 	got, err := auth.SignCanonical(testKey, "/private/aaa/bbb.jpg", 1700000000)
 	if err != nil {
 		t.Fatal(err)
-	}
-	const want = "FILL_ME_FIRST_RUN" // see Step 3 below
-	if want == "FILL_ME_FIRST_RUN" {
-		t.Logf("first run — paste this into want: %s", got)
-		t.Fatal("FixedVector not yet locked; see test log above")
 	}
 	if got != want {
 		t.Fatalf("signature drifted:\n  got:  %s\n  want: %s", got, want)
@@ -1007,7 +1009,7 @@ func TestSign_FixedVector(t *testing.T) {
 }
 ```
 
-`TestSign_FixedVector` deliberately fails on the very first run. Step 3 explains how to lock the value.
+The hex constant is precomputed (Python: `hmac.new(b"0123456789abcdef0123456789abcdef", b"v1|/private/aaa/bbb.jpg|1700000000", hashlib.sha256).hexdigest()`) so first-run is green and there is no manual fill-in step that can be skipped. **The same constant MUST be hard-coded in `worker/test/contract_pin.spec.ts` (Plan 2 Task 10).** Drift is caught the moment either side recompiles.
 
 - [ ] **Step 2: Implementation**
 
@@ -1067,13 +1069,15 @@ func ValidateCanonicalPath(p string) error {
 }
 ```
 
-- [ ] **Step 3: Lock the cross-language vector**
+- [ ] **Step 3: Verify cross-language pin**
 
 ```bash
 cd api && go test ./internal/auth/... -run TestSign_FixedVector -v
 ```
 
-Expected on first run: FAIL with `first run — paste this into want: <64-char-hex>`. Copy the hex into the `want` constant in `sign_test.go`, replacing `FILL_ME_FIRST_RUN`. Re-run; it should now pass. Record the same hex in `worker/test/contract_pin.spec.ts` (Plan 2 Task 10) — the two values MUST match byte-for-byte forever after.
+Expected: PASS. The `want` constant is already locked at `c018a64c…3654`. If this fails, your `SignCanonical` deviates from contracts §3 (likely a missing `v1|` prefix, a stray newline, or wrong byte concatenation) — fix the implementation, do not edit `want`.
+
+Confirm the same hex literal is present in `worker/test/contract_pin.spec.ts` (Plan 2 Task 10). Both tests pin the same string; they cannot drift.
 
 - [ ] **Step 4: Run + commit**
 
@@ -1505,6 +1509,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/<org>/art-web/api/internal/auth"
 )
@@ -1630,6 +1635,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
+
 	"github.com/<org>/art-web/api/internal/auth"
 )
 
@@ -1653,10 +1660,9 @@ func (f *fakeUserRepo) UpsertOAuth(_ context.Context, prov, sub, email, name, av
 }
 
 func TestStart_RedirectsToProviderWithState(t *testing.T) {
-	h := auth.StartHandler(map[string]auth.Provider{"google": fakeProvider{}}, "/")
+	h := auth.StartHandler(map[string]auth.Provider{"google": fakeProvider{}}, "/", auth.CookieOpts{Secure: true})
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/auth/google/start", nil)
-	addChiURLParam(req, "provider", "google")
+	req := withChiURLParam(httptest.NewRequest("GET", "/auth/google/start", nil), "provider", "google")
 	h.ServeHTTP(rec, req)
 	if rec.Code != 302 {
 		t.Fatalf("code %d", rec.Code)
@@ -1677,7 +1683,7 @@ func TestCallback_SetsAuthCookie(t *testing.T) {
 	h := auth.CallbackHandler(map[string]auth.Provider{"google": fakeProvider{}}, repo, jwts, "https://app.example.com/", opts)
 	req := httptest.NewRequest("GET", "/auth/google/callback?code=C&state=S", nil)
 	req.AddCookie(&http.Cookie{Name: "oauth_state", Value: "S"})
-	addChiURLParam(req, "provider", "google")
+	req = withChiURLParam(req, "provider", "google")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 302 {
@@ -1702,9 +1708,15 @@ func TestLogout_ClearsAuthCookie(t *testing.T) {
 	}
 }
 
-// helpers — addChiURLParam is provided by httpapi/testutil in Task 25;
-// for this isolated package test we inline a minimal version.
-func addChiURLParam(r *http.Request, k, v string) { /* see Task 25 */ }
+// withChiURLParam attaches a chi RouteContext to the request so handlers
+// that call chi.URLParam(r, k) see v. Returns a new *http.Request because
+// http.Request.Context is read-only (must use WithContext to swap).
+func withChiURLParam(r *http.Request, k, v string) *http.Request {
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add(k, v)
+	return r.WithContext(context.WithValue(r.Context(), chi.RouteCtxKey, rctx))
+}
+
 func getCookie(r *http.Response, name string) *http.Cookie {
 	for _, c := range r.Cookies() {
 		if c.Name == name {
@@ -1742,7 +1754,10 @@ type CookieOpts struct {
 	Secure bool
 }
 
-func StartHandler(providers map[string]Provider, _ string) http.Handler {
+// StartHandler now takes CookieOpts so the state cookie is Secure in
+// production (matching the auth cookie). The handler signature also keeps
+// CookieOpts.Domain ignored — state is per-flight and host-scoped.
+func StartHandler(providers map[string]Provider, _ string, cookieOpts CookieOpts) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p, ok := providers[chi.URLParam(r, "provider")]
 		if !ok {
@@ -1752,7 +1767,8 @@ func StartHandler(providers map[string]Provider, _ string) http.Handler {
 		state := randState()
 		http.SetCookie(w, &http.Cookie{
 			Name: "oauth_state", Value: state,
-			HttpOnly: true, SameSite: http.SameSiteLaxMode, Path: "/", MaxAge: 600,
+			HttpOnly: true, Secure: cookieOpts.Secure,
+			SameSite: http.SameSiteLaxMode, Path: "/", MaxAge: 600,
 		})
 		http.Redirect(w, r, p.AuthURL(state), http.StatusFound)
 	})
@@ -1776,6 +1792,14 @@ func CallbackHandler(
 			http.Error(w, `{"error":"bad_state"}`, 400)
 			return
 		}
+		// Clear the state cookie immediately on a valid match so a leaked
+		// state value can't be replayed. Same flags as the set so the
+		// browser actually overwrites the original.
+		http.SetCookie(w, &http.Cookie{
+			Name: "oauth_state", Value: "",
+			HttpOnly: true, Secure: cookieOpts.Secure,
+			SameSite: http.SameSiteLaxMode, Path: "/", MaxAge: -1,
+		})
 		prof, err := p.Exchange(r.Context(), r.URL.Query().Get("code"))
 		if err != nil {
 			http.Error(w, `{"error":"exchange_failed"}`, 502)
@@ -1846,6 +1870,7 @@ package user_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/<org>/art-web/api/internal/db"
@@ -1876,18 +1901,35 @@ func TestUpsertOAuth_FirstTimeAssignsSlug(t *testing.T) {
 
 func TestUpsertOAuth_ConflictingSlugGetsSuffixed(t *testing.T) {
 	r := newRepo(t)
-	_, _ = r.UpsertOAuth(t.Context(), "google", "S1", "a@b", "alice", "")
-	uid2, _ := r.UpsertOAuth(t.Context(), "google", "S2", "x@b", "alice", "")
-	u2, _ := r.Get(t.Context(), uid2)
+	if _, err := r.UpsertOAuth(t.Context(), "google", "S1", "a@b", "alice", ""); err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+	uid2, err := r.UpsertOAuth(t.Context(), "google", "S2", "x@b", "alice", "")
+	if err != nil {
+		t.Fatalf("second upsert (different subject, same display name): %v", err)
+	}
+	u2, err := r.Get(t.Context(), uid2)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
 	if u2.Slug == "alice" {
 		t.Fatal("slug collision not resolved")
+	}
+	if !strings.HasPrefix(u2.Slug, "alice-") {
+		t.Fatalf("expected suffixed slug, got %q", u2.Slug)
 	}
 }
 
 func TestUpsertOAuth_Idempotent_ReturnsSameID(t *testing.T) {
 	r := newRepo(t)
-	a, _ := r.UpsertOAuth(t.Context(), "google", "S1", "a@b", "alice", "")
-	b, _ := r.UpsertOAuth(t.Context(), "google", "S1", "a@b", "alice", "")
+	a, err := r.UpsertOAuth(t.Context(), "google", "S1", "a@b", "alice", "")
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	b, err := r.UpsertOAuth(t.Context(), "google", "S1", "a@b", "alice", "")
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
 	if a != b {
 		t.Fatalf("upsert produced two ids: %s vs %s", a, b)
 	}
@@ -1908,6 +1950,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -1934,49 +1977,76 @@ func slugify(s string) string {
 	return s
 }
 
+// UpsertOAuth runs the read-then-insert dance OUTSIDE a transaction.
+// Earlier draft kept a single tx open across the slug-retry loop, but
+// PostgreSQL aborts a transaction on any error, so the second iteration
+// would see SQLSTATE 25P02 ("current transaction is aborted") instead of
+// 23505 and the retry was effectively dead. Doing the SELECT and the
+// INSERT as separate statements keeps the retry loop able to observe
+// fresh unique-violation errors. The two-statement window is racy
+// (concurrent callbacks for the same provider+subject can both try to
+// INSERT) — handled by classifying the constraint that fires.
+//
+// Constraint classification uses pgconn.PgError.ConstraintName, NOT a
+// substring match on err.Error(): a (provider, subject) collision must
+// re-SELECT the existing row instead of triggering slug suffix retries.
 func (r *Repo) UpsertOAuth(ctx context.Context, provider, subject, email, displayName, avatar string) (string, error) {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
+	if id, ok, err := r.lookupExistingOAuth(ctx, provider, subject); err != nil {
 		return "", err
-	}
-	defer tx.Rollback(ctx)
-
-	var existingID string
-	err = tx.QueryRow(ctx,
-		`SELECT id FROM users WHERE oauth_provider=$1 AND oauth_subject=$2`,
-		provider, subject).Scan(&existingID)
-	if err == nil {
-		_, _ = tx.Exec(ctx,
+	} else if ok {
+		_, err := r.pool.Exec(ctx,
 			`UPDATE users SET email=$1, display_name=$2, avatar_url=NULLIF($3,'') WHERE id=$4`,
-			email, displayName, avatar, existingID)
-		if err := tx.Commit(ctx); err != nil {
+			email, displayName, avatar, id)
+		if err != nil {
 			return "", err
 		}
-		return existingID, nil
-	}
-	if !errors.Is(err, pgx.ErrNoRows) {
-		return "", err
+		return id, nil
 	}
 
 	base := slugify(displayName)
 	slug := base
 	for i := 0; i < 50; i++ {
 		var id string
-		err = tx.QueryRow(ctx, `
+		err := r.pool.QueryRow(ctx, `
 			INSERT INTO users (oauth_provider, oauth_subject, email, display_name, slug, avatar_url)
 			VALUES ($1,$2,$3,$4,$5, NULLIF($6,''))
 			RETURNING id`,
 			provider, subject, email, displayName, slug, avatar).Scan(&id)
 		if err == nil {
-			return id, tx.Commit(ctx)
+			return id, nil
 		}
-		if isUniqueViolationOn(err, "users_slug_key") {
+		switch uniqueConstraint(err) {
+		case "users_slug_key":
 			slug = fmt.Sprintf("%s-%d", base, i+2)
 			continue
+		case "users_oauth_provider_oauth_subject_key":
+			// Concurrent OAuth callback for the same (provider, subject)
+			// won the race. Re-read the existing row and return it.
+			if id, ok, lerr := r.lookupExistingOAuth(ctx, provider, subject); lerr != nil {
+				return "", lerr
+			} else if ok {
+				return id, nil
+			}
+			return "", errors.New("oauth conflict but row not found on re-read")
+		default:
+			return "", err
 		}
-		return "", err
 	}
 	return "", errors.New("slug exhausted")
+}
+
+func (r *Repo) lookupExistingOAuth(ctx context.Context, provider, subject string) (string, bool, error) {
+	var id string
+	err := r.pool.QueryRow(ctx,
+		`SELECT id FROM users WHERE oauth_provider=$1 AND oauth_subject=$2`,
+		provider, subject).Scan(&id)
+	if err == nil {
+		return id, true, nil
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	return "", false, err
 }
 
 func (r *Repo) Get(ctx context.Context, id string) (*User, error) {
@@ -1995,10 +2065,20 @@ func (r *Repo) GetBySlug(ctx context.Context, slug string) (*User, error) {
 	return &u, err
 }
 
-func isUniqueViolationOn(err error, _ string) bool {
-	// pgx-specific: the SQLState for unique_violation is "23505".
-	// Inspecting constraint name requires errors.As + *pgconn.PgError.
-	return err != nil && strings.Contains(err.Error(), "23505")
+// uniqueConstraint returns the violated constraint name for SQLSTATE
+// 23505 (unique_violation) errors, or "" for any other error. Using the
+// constraint name (not a substring search of err.Error()) is what keeps
+// (oauth_provider, oauth_subject) collisions from being misclassified
+// as slug collisions.
+func uniqueConstraint(err error) string {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return ""
+	}
+	if pgErr.SQLState() != "23505" {
+		return ""
+	}
+	return pgErr.ConstraintName
 }
 ```
 
@@ -2093,6 +2173,40 @@ func TestDelete_CascadesImagesAndTags(t *testing.T) {
 		t.Fatal("expected not-found after delete")
 	}
 }
+
+// Regression for C6: patching title alone must NOT clobber description.
+// Earlier draft used a single SQL UPDATE that wrote both columns from
+// the same call; an absent description in the request body collapsed
+// to NULL and silently wiped the column.
+func TestPatchTitle_PreservesDescription(t *testing.T) {
+	repo, _, uid := newCtx(t)
+	id, _ := repo.Create(t.Context(), uid, "title-1", "important description", "private")
+	if err := repo.PatchTitle(t.Context(), id, "title-2"); err != nil {
+		t.Fatalf("patch title: %v", err)
+	}
+	got, _ := repo.Get(t.Context(), id)
+	if got.Title != "title-2" {
+		t.Fatalf("title not updated: %q", got.Title)
+	}
+	if got.Description == nil || *got.Description != "important description" {
+		t.Fatalf("description was clobbered: %v", got.Description)
+	}
+}
+
+func TestPatchDescription_PreservesTitle(t *testing.T) {
+	repo, _, uid := newCtx(t)
+	id, _ := repo.Create(t.Context(), uid, "stable-title", "old", "private")
+	if err := repo.PatchDescription(t.Context(), id, "new description"); err != nil {
+		t.Fatalf("patch desc: %v", err)
+	}
+	got, _ := repo.Get(t.Context(), id)
+	if got.Title != "stable-title" {
+		t.Fatalf("title was clobbered: %q", got.Title)
+	}
+	if got.Description == nil || *got.Description != "new description" {
+		t.Fatalf("description not updated: %v", got.Description)
+	}
+}
 ```
 
 - [ ] **Step 2: Implementation**
@@ -2132,43 +2246,34 @@ func (r *Repo) Create(ctx context.Context, userID, title, description, visibilit
 func (r *Repo) Get(ctx context.Context, id string) (*Artwork, error) {
 	var a Artwork
 	var desc *string
-	var pub, cre time.Time
+	var pub *time.Time // pgx scans NULL → nil pointer natively
+	var cre time.Time
 	err := r.pool.QueryRow(ctx, `
 		SELECT id, user_id, title, description, visibility, published_at, created_at, cover_position
 		FROM artworks WHERE id = $1`, id).
-		Scan(&a.ID, &a.UserID, &a.Title, &desc, &a.Visibility, &pubOrNil{&pub, &a.PublishedAt}, &cre, &a.CoverPosition)
+		Scan(&a.ID, &a.UserID, &a.Title, &desc, &a.Visibility, &pub, &cre, &a.CoverPosition)
 	if err != nil {
 		return nil, err
 	}
 	a.Description = desc
+	a.PublishedAt = pub
 	a.CreatedAt = &cre
 	return &a, nil
 }
 
-// pubOrNil scans a possibly-NULL timestamp into *time.Time pointer.
-type pubOrNil struct {
-	tmp **time.Time
-	dst **time.Time
+// PatchTitle updates only the title. Each field is patched by its own
+// method so a partial PATCH body (e.g. {"title":"x"}) can't accidentally
+// clobber an unrelated column the caller never mentioned.
+func (r *Repo) PatchTitle(ctx context.Context, id, title string) error {
+	_, err := r.pool.Exec(ctx, `UPDATE artworks SET title=$2 WHERE id=$1`, id, title)
+	return err
 }
 
-func (p pubOrNil) Scan(src any) error {
-	if src == nil {
-		*p.dst = nil
-		return nil
-	}
-	t, ok := src.(time.Time)
-	if !ok {
-		return nil
-	}
-	*p.tmp = &t
-	*p.dst = *p.tmp
-	return nil
-}
-
-func (r *Repo) PatchTitleDescription(ctx context.Context, id, title string, description *string) error {
+// PatchDescription updates only the description. Empty string is stored
+// as SQL NULL so the JSON shape stays nullable, matching contracts §8.4.
+func (r *Repo) PatchDescription(ctx context.Context, id, description string) error {
 	_, err := r.pool.Exec(ctx,
-		`UPDATE artworks SET title=$2, description=NULLIF($3,'') WHERE id=$1`,
-		id, title, ptrOrEmpty(description))
+		`UPDATE artworks SET description=NULLIF($2,'') WHERE id=$1`, id, description)
 	return err
 }
 
@@ -2189,13 +2294,6 @@ func (r *Repo) SetCoverPosition(ctx context.Context, id string, position int) er
 func (r *Repo) Delete(ctx context.Context, id string) error {
 	_, err := r.pool.Exec(ctx, `DELETE FROM artworks WHERE id=$1`, id)
 	return err
-}
-
-func ptrOrEmpty(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
 }
 ```
 
@@ -2223,6 +2321,7 @@ package artwork_test
 
 import (
 	"testing"
+	"time"
 
 	"github.com/<org>/art-web/api/internal/artwork"
 )
@@ -2266,23 +2365,77 @@ func TestPublicFeed_PaginatesViaCursor(t *testing.T) {
 		t.Fatal("page2 leaked duplicates from page1")
 	}
 }
+
+// Regression for the cursor-precision bug: when many artworks publish
+// inside the same second, an int64 epoch cursor would skip items
+// roughly half the time depending on how UUID v4s sorted. Force every
+// row to share a published_at down to the microsecond, then verify that
+// paginating through the whole set returns exactly N distinct ids.
+func TestPublicFeed_SameSecondPublish_NoSkipsOrDupes(t *testing.T) {
+	repo, _, uid := newCtx(t)
+	const N = 7
+	pinned := time.Now().UTC().Truncate(time.Second).Add(123456 * time.Microsecond)
+	for i := 0; i < N; i++ {
+		id, _ := repo.Create(t.Context(), uid, "x", "", "public")
+		// Pin published_at to the same instant for every row.
+		if _, err := repo.Pool().Exec(t.Context(),
+			`UPDATE artworks SET published_at=$2 WHERE id=$1`, id, pinned); err != nil {
+			t.Fatalf("pin: %v", err)
+		}
+	}
+	seen := map[string]bool{}
+	cursor := artwork.FeedCursor{}
+	for {
+		page, err := repo.PublicFeed(t.Context(), cursor, 2)
+		if err != nil {
+			t.Fatalf("feed: %v", err)
+		}
+		for _, a := range page.Items {
+			if seen[a.ID] {
+				t.Fatalf("duplicate id across pages: %s", a.ID)
+			}
+			seen[a.ID] = true
+		}
+		if page.NextCursor == nil {
+			break
+		}
+		cursor = *page.NextCursor
+	}
+	if len(seen) != N {
+		t.Fatalf("expected %d distinct ids, saw %d", N, len(seen))
+	}
+}
 ```
+
+(`Pool()` is the 1-line accessor added in Task 19; this test depends on it but the test is committed in Task 16 — the import will resolve once Task 19 lands. If you implement Task 16 strictly before Task 19, gate the test with `t.Skip("enable after Task 19")` and unskip in Task 19's commit.)
 
 - [ ] **Step 2: Implementation appended to `repo.go`**
 
 ```go
 // api/internal/artwork/repo.go (append)
 
+// FeedCursor carries the full-precision timestamp of the last row on the
+// previous page. Stamp.IsZero() means "first page". The earlier int64
+// epoch encoding lost sub-second precision and silently skipped items
+// whose published_at shared a second with the cursor's row — see
+// contracts §8.7.
 type FeedCursor struct {
-	PublishedAtUnix int64
-	ID              string
+	Stamp time.Time
+	ID    string
 }
+
+func (c FeedCursor) IsZero() bool { return c.Stamp.IsZero() && c.ID == "" }
 
 type FeedPage struct {
 	Items      []Artwork
 	NextCursor *FeedCursor
 }
 
+// PublicFeed compares directly against published_at (timestamptz, μs
+// precision) instead of extract(epoch ...)::bigint. The tuple
+// (published_at, id::uuid) < (cursor.stamp, cursor.id) gives a strict
+// ordering that matches the ORDER BY exactly; nothing is silently
+// skipped or duplicated when many artworks publish in the same second.
 func (r *Repo) PublicFeed(ctx context.Context, c FeedCursor, limit int) (*FeedPage, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 24
@@ -2291,14 +2444,32 @@ func (r *Repo) PublicFeed(ctx context.Context, c FeedCursor, limit int) (*FeedPa
 		SELECT id, user_id, title, description, visibility, published_at, created_at, cover_position
 		FROM artworks
 		WHERE visibility='public' AND published_at IS NOT NULL
-		  AND ($1 = 0 OR (extract(epoch FROM published_at)::bigint, id::text) < ($1, $2))
+		  AND ($1::boolean OR (published_at, id) < ($2::timestamptz, $3::uuid))
 		ORDER BY published_at DESC, id DESC
-		LIMIT $3`, c.PublishedAtUnix, c.ID, limit+1)
+		LIMIT $4`,
+		c.IsZero(), nullableStamp(c), nullableID(c), limit+1)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanFeedRows(rows, limit, false /*useCreatedAt*/)
+}
+
+// nullableStamp/nullableID return nil when the cursor is the zero value
+// so pgx binds SQL NULL. Postgres evaluates the cursor predicate lazily:
+// if $1 is true the (stamp, id) comparison is short-circuited and NULLs
+// never get compared.
+func nullableStamp(c FeedCursor) any {
+	if c.IsZero() {
+		return nil
+	}
+	return c.Stamp
+}
+func nullableID(c FeedCursor) any {
+	if c.IsZero() {
+		return nil
+	}
+	return c.ID
 }
 ```
 
@@ -2353,10 +2524,10 @@ func (r *Repo) ListByUser(ctx context.Context, userID string, viewerIsOwner bool
 			true:  ``,
 			false: ` AND visibility='public' AND published_at IS NOT NULL`,
 		}[viewerIsOwner] + `
-		  AND ($2 = 0 OR (extract(epoch FROM created_at)::bigint, id::text) < ($2, $3))
+		  AND ($2::boolean OR (created_at, id) < ($3::timestamptz, $4::uuid))
 		ORDER BY created_at DESC, id DESC
-		LIMIT $4`
-	rows, err := r.pool.Query(ctx, q, userID, c.PublishedAtUnix, c.ID, limit+1)
+		LIMIT $5`
+	rows, err := r.pool.Query(ctx, q, userID, c.IsZero(), nullableStamp(c), nullableID(c), limit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -2366,8 +2537,9 @@ func (r *Repo) ListByUser(ctx context.Context, userID string, viewerIsOwner bool
 
 // scanFeedRows is shared by PublicFeed, ListByUser, and ListByTag.
 // `published_at` is nullable (drafts have NULL), so we scan into a
-// pointer to time.Time. The cursor stamp is derived from created_at
-// (per-user view) or published_at (public feed / tag view).
+// pointer to time.Time. The cursor stamp is the row's published_at
+// (public feed / tag view) or created_at (per-user view) — matching
+// each query's ORDER BY column.
 func scanFeedRows(rows pgx.Rows, limit int, useCreatedAt bool) (*FeedPage, error) {
 	out := &FeedPage{}
 	for rows.Next() {
@@ -2383,14 +2555,24 @@ func scanFeedRows(rows pgx.Rows, limit int, useCreatedAt bool) (*FeedPage, error
 		a.Description = desc
 		out.Items = append(out.Items, a)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	if len(out.Items) > limit {
 		last := out.Items[limit-1]
 		out.Items = out.Items[:limit]
-		stamp := last.CreatedAt.Unix()
-		if !useCreatedAt && last.PublishedAt != nil {
-			stamp = last.PublishedAt.Unix()
+		var stamp time.Time
+		if useCreatedAt {
+			stamp = *last.CreatedAt
+		} else if last.PublishedAt != nil {
+			stamp = *last.PublishedAt
+		} else {
+			// Should never happen: PublicFeed/ListByTag both filter
+			// `published_at IS NOT NULL`. Fall back to created_at to
+			// avoid handing out a cursor that compares against NULL.
+			stamp = *last.CreatedAt
 		}
-		out.NextCursor = &FeedCursor{PublishedAtUnix: stamp, ID: last.ID}
+		out.NextCursor = &FeedCursor{Stamp: stamp, ID: last.ID}
 	}
 	return out, nil
 }
@@ -2437,9 +2619,9 @@ func (r *Repo) ListByTag(ctx context.Context, tag string, c FeedCursor, limit in
 		JOIN tags t ON t.id = at.tag_id
 		WHERE t.name = lower($1)
 		  AND a.visibility='public' AND a.published_at IS NOT NULL
-		  AND ($2 = 0 OR (extract(epoch FROM a.published_at)::bigint, a.id::text) < ($2, $3))
+		  AND ($2::boolean OR (a.published_at, a.id) < ($3::timestamptz, $4::uuid))
 		ORDER BY a.published_at DESC, a.id DESC
-		LIMIT $4`, tag, c.PublishedAtUnix, c.ID, limit+1)
+		LIMIT $5`, tag, c.IsZero(), nullableStamp(c), nullableID(c), limit+1)
 	if err != nil {
 		return nil, err
 	}
@@ -2911,11 +3093,28 @@ package image
 import (
 	"context"
 	"errors"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// uniqueConstraint returns the violated constraint name for SQLSTATE
+// 23505, "" otherwise. Matching on err.Error() substrings would be
+// brittle: PostgreSQL's auto-generated constraint name format is not
+// part of the contract, and any future migration that renames the
+// constraints (or any error wrapper that strips the message) would
+// silently misclassify the failure.
+func uniqueConstraint(err error) string {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return ""
+	}
+	if pgErr.SQLState() != "23505" {
+		return ""
+	}
+	return pgErr.ConstraintName
+}
 
 var (
 	ErrPositionTaken       = errors.New("position already taken by a different client_image_id")
@@ -2969,11 +3168,11 @@ func (r *Repo) Insert(ctx context.Context, in InsertInput) (*InsertResult, error
 		return &InsertResult{ID: id, Existed: false}, nil
 	}
 
-	// 3. Detect which unique constraint fired.
-	if !strings.Contains(err.Error(), "23505") {
-		return nil, err
-	}
-	if strings.Contains(err.Error(), "client_image_id") {
+	// 3. Detect which unique constraint fired by name. The migration
+	// in Task 2 lets Postgres auto-generate names; the standard
+	// formula is `<table>_<col1>_<col2>_..._key`.
+	switch uniqueConstraint(err) {
+	case "artwork_images_artwork_id_client_image_id_key":
 		// Concurrent retry won the race — re-check fingerprint before
 		// returning the winner's row.
 		err = r.pool.QueryRow(ctx,
@@ -2986,11 +3185,11 @@ func (r *Repo) Insert(ctx context.Context, in InsertInput) (*InsertResult, error
 			return nil, ErrFingerprintMismatch
 		}
 		return &InsertResult{ID: existingID, Existed: true}, nil
-	}
-	if strings.Contains(err.Error(), "position") {
+	case "artwork_images_artwork_id_position_key":
 		return nil, ErrPositionTaken
+	default:
+		return nil, err
 	}
-	return nil, err
 }
 
 func (r *Repo) ListByArtwork(ctx context.Context, artworkID string) ([]InsertedImage, error) {
@@ -3458,7 +3657,9 @@ package artwork_test
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/<org>/art-web/api/internal/artwork"
@@ -3474,8 +3675,8 @@ func TestFlip_PrivateToPublic_MovesObjectsAndUpdatesKeys(t *testing.T) {
 	// Pre-seed storage + DB to simulate a finished upload.
 	_ = store.Put(t.Context(), "private/"+aid+"/img1.jpg", strings.NewReader("bytes"), "image/jpeg")
 	_, _ = repo.Pool().Exec(t.Context(),
-		`INSERT INTO artwork_images (artwork_id, client_image_id, storage_key, width, height, byte_size, content_type, position)
-		 VALUES ($1,'K','private/'||$1||'/img1.jpg', 1,1,1,'image/jpeg',0)`, aid)
+		`INSERT INTO artwork_images (artwork_id, client_image_id, storage_key, source_sha256, width, height, byte_size, content_type, position)
+		 VALUES ($1,'K','private/'||$1||'/img1.jpg','sha', 1,1,1,'image/jpeg',0)`, aid)
 
 	if err := svc.Flip(t.Context(), aid, "public"); err != nil {
 		t.Fatalf("flip: %v", err)
@@ -3485,6 +3686,65 @@ func TestFlip_PrivateToPublic_MovesObjectsAndUpdatesKeys(t *testing.T) {
 	}
 	if ok, _ := store.Exists(t.Context(), "private/"+aid+"/img1.jpg"); ok {
 		t.Fatal("private copy not deleted")
+	}
+}
+
+// flakyMoveStore wraps a Storage and forces an error on the Nth Move call.
+// Used to simulate a partial-failure flip without touching real R2.
+type flakyMoveStore struct {
+	storage.Storage
+	failOn int32
+	calls  atomic.Int32
+}
+
+func (f *flakyMoveStore) Move(ctx context.Context, src, dst string) error {
+	n := f.calls.Add(1)
+	if n == f.failOn {
+		return errors.New("simulated move failure")
+	}
+	return f.Storage.Move(ctx, src, dst)
+}
+
+// Regression for C5: a private→public flip that succeeds on image 1 but
+// fails on image 2 must NOT leave image 1 accessible at its /public/
+// path. The implementation rolls back already-moved objects before
+// returning the error.
+func TestFlip_PartialFailure_RollsBackMoves(t *testing.T) {
+	repo, _, uid := newCtx(t)
+	base := storage.NewLocalFS(t.TempDir())
+	store := &flakyMoveStore{Storage: base, failOn: 2}
+	svc := artwork.NewVisibilityService(repo, store)
+
+	aid, _ := repo.Create(t.Context(), uid, "x", "", "private")
+	for i, k := range []string{"img1", "img2"} {
+		_ = base.Put(t.Context(), "private/"+aid+"/"+k+".jpg",
+			strings.NewReader("bytes"+k), "image/jpeg")
+		if _, err := repo.Pool().Exec(t.Context(),
+			`INSERT INTO artwork_images (artwork_id, client_image_id, storage_key, source_sha256, width, height, byte_size, content_type, position)
+			 VALUES ($1,$2,'private/'||$1||'/'||$3||'.jpg','sha', 1,1,1,'image/jpeg',$4)`,
+			aid, "K"+k, k, i); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	if err := svc.Flip(t.Context(), aid, "public"); err == nil {
+		t.Fatal("expected flip to fail when second move errors")
+	}
+
+	// Critical assertion: nothing under /public/ for this artwork.
+	for _, k := range []string{"img1", "img2"} {
+		if ok, _ := store.Exists(t.Context(), "public/"+aid+"/"+k+".jpg"); ok {
+			t.Fatalf("PRIVACY LEAK: %s.jpg ended up in /public/ after rollback failure", k)
+		}
+		if ok, _ := store.Exists(t.Context(), "private/"+aid+"/"+k+".jpg"); !ok {
+			t.Fatalf("rollback dropped image: %s.jpg missing from /private/", k)
+		}
+	}
+
+	// And DB visibility is unchanged — should still be private.
+	got, _ := repo.Get(t.Context(), aid)
+	if got.Visibility != "private" {
+		t.Fatalf("visibility changed despite failure: %q", got.Visibility)
 	}
 }
 ```
@@ -3497,6 +3757,8 @@ package artwork
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/<org>/art-web/api/internal/storage"
@@ -3511,6 +3773,25 @@ func NewVisibilityService(r *Repo, s storage.Storage) *VisibilityService {
 	return &VisibilityService{repo: r, store: s}
 }
 
+// flipMove records one image's source + destination storage key for a
+// single flip operation. Lifted to package scope so Flip and
+// rollbackMoves share the same named type — anonymous-struct slices
+// would not be assignable across the two.
+type flipMove struct{ id, src, dst string }
+
+// Flip moves an artwork's images between the public/ and private/ R2
+// prefixes and updates DB visibility + storage_key + published_at in one
+// step. Critical invariant: on ANY mid-flight failure, no image must end
+// up at its destination prefix while the DB still says the artwork is
+// at the source prefix. Otherwise a private→public partial failure
+// would leak images via their `/public/` path even though the artwork
+// is marked private.
+//
+// Strategy: move forward; on the first move error (or any later DB
+// error), roll back every already-moved object back to its source key.
+// The rollback is best-effort but logs/errors are surfaced so an
+// operator can sweep stragglers if the rollback itself fails. Storage
+// orphan accounting is documented in spec §11.
 func (v *VisibilityService) Flip(ctx context.Context, artworkID, target string) error {
 	if target != "public" && target != "private" {
 		return errBadTarget
@@ -3523,36 +3804,54 @@ func (v *VisibilityService) Flip(ctx context.Context, artworkID, target string) 
 		return nil
 	}
 
-	// 1. Move objects.
+	// 1. Read images.
 	rows, err := v.repo.Pool().Query(ctx, `SELECT id, storage_key FROM artwork_images WHERE artwork_id=$1`, artworkID)
 	if err != nil {
 		return err
 	}
-	type kv struct{ id, src, dst string }
-	var moves []kv
+	var moves []flipMove
 	for rows.Next() {
 		var id, src string
-		_ = rows.Scan(&id, &src)
-		dst := target + strings.TrimPrefix(src, a.Visibility) // swap prefix
-		moves = append(moves, kv{id, src, dst})
-	}
-	rows.Close()
-
-	for _, m := range moves {
-		if err := v.store.Move(ctx, m.src, m.dst); err != nil {
+		if err := rows.Scan(&id, &src); err != nil {
+			rows.Close()
 			return err
 		}
+		if !strings.HasPrefix(src, a.Visibility+"/") {
+			rows.Close()
+			return fmt.Errorf("storage_key %q does not match artwork visibility %q", src, a.Visibility)
+		}
+		dst := target + strings.TrimPrefix(src, a.Visibility) // swap exactly the prefix
+		moves = append(moves, flipMove{id, src, dst})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
 	}
 
-	// 2. DB update inside a transaction.
+	// 2. Move objects forward, tracking which succeeded so we can roll
+	// them back on a later failure.
+	completed := moves[:0:0] // separate backing array; do not alias `moves`
+	for _, m := range moves {
+		if err := v.store.Move(ctx, m.src, m.dst); err != nil {
+			rollbackMoves(ctx, v.store, completed)
+			return fmt.Errorf("move %s→%s: %w", m.src, m.dst, err)
+		}
+		completed = append(completed, m)
+	}
+
+	// 3. DB update inside a transaction. If anything below fails we
+	// must also undo the storage moves; otherwise the bytes are at the
+	// target prefix while the DB still says the source.
 	tx, err := v.repo.Pool().Begin(ctx)
 	if err != nil {
+		rollbackMoves(ctx, v.store, completed)
 		return err
 	}
 	defer tx.Rollback(ctx)
 	for _, m := range moves {
 		if _, err := tx.Exec(ctx,
 			`UPDATE artwork_images SET storage_key=$2 WHERE id=$1`, m.id, m.dst); err != nil {
+			rollbackMoves(ctx, v.store, completed)
 			return err
 		}
 	}
@@ -3561,16 +3860,41 @@ func (v *VisibilityService) Flip(ctx context.Context, artworkID, target string) 
 		  visibility=$2,
 		  published_at = CASE WHEN $2='public' THEN COALESCE(published_at, now()) ELSE published_at END
 		WHERE id=$1`, artworkID, target); err != nil {
+		rollbackMoves(ctx, v.store, completed)
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		rollbackMoves(ctx, v.store, completed)
+		return err
+	}
+	return nil
 }
 
-var errBadTarget = stringError("target must be 'public' or 'private'")
+// rollbackMoves walks completed moves in reverse and best-effort
+// undoes them. Errors are not returned: the caller is already
+// returning a primary error; a failed rollback leaks a misplaced
+// object that the v2 R2 GC sweeper (spec §11) is responsible for.
+// We log via a package-level hook so production wires it to the
+// real logger; tests can override it.
+func rollbackMoves(ctx context.Context, store storage.Storage, completed []flipMove) {
+	for i := len(completed) - 1; i >= 0; i-- {
+		m := completed[i]
+		if err := store.Move(ctx, m.dst, m.src); err != nil {
+			// Best-effort. If this returns an error we cannot
+			// recover automatically; the misplaced object stays
+			// at m.dst. Surface via the rollback log hook so it
+			// shows up in operations.
+			RollbackLog(fmt.Errorf("rollback move %s→%s: %w", m.dst, m.src, err))
+		}
+	}
+}
 
-type stringError string
+// RollbackLog is a package-level hook so callers (main.go) can wire
+// it to slog. Defaults to a no-op which is safe but unobservable;
+// production MUST override before calling Flip.
+var RollbackLog = func(err error) {}
 
-func (s stringError) Error() string { return string(s) }
+var errBadTarget = errors.New("target must be 'public' or 'private'")
 ```
 
 - [ ] **Step 3: Run + commit**
@@ -3650,10 +3974,10 @@ func New(d *Deps) chi.Router {
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
 	r.Use(CORSFor(d.AllowedOrigin))
 	r.Use(auth.Middleware(d.JWT))
-	r.Use(NoStoreForViewerSpecific())
+	r.Use(CacheControlByPath())
 
 	r.Route("/auth", func(r chi.Router) {
-		r.Get("/{provider}/start", auth.StartHandler(d.Providers, d.Frontend).ServeHTTP)
+		r.Get("/{provider}/start", auth.StartHandler(d.Providers, d.Frontend, d.CookieOpts).ServeHTTP)
 		r.Get("/{provider}/callback", auth.CallbackHandler(d.Providers, d.Users, d.JWT, d.Frontend, d.CookieOpts).ServeHTTP)
 		r.Post("/logout", auth.LogoutHandler(d.CookieOpts).ServeHTTP)
 	})
@@ -3759,6 +4083,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -3776,28 +4101,36 @@ func parseLimit(r *http.Request) int {
 	return n
 }
 
-func parseCursor(r *http.Request) artwork.FeedCursor {
+// parseCursor decodes the contracts §8.7 cursor: base64url("<RFC3339Nano>|<uuid>").
+// Returns (zero cursor, nil) when no cursor was supplied; (zero, err) if the
+// caller sent something malformed. Handlers should treat the latter as 400
+// instead of silently dropping back to first-page — that hid client bugs in
+// the previous draft.
+func parseCursor(r *http.Request) (artwork.FeedCursor, error) {
 	raw := r.URL.Query().Get("cursor")
 	if raw == "" {
-		return artwork.FeedCursor{}
+		return artwork.FeedCursor{}, nil
 	}
 	dec, err := base64.RawURLEncoding.DecodeString(raw)
 	if err != nil {
-		return artwork.FeedCursor{}
+		return artwork.FeedCursor{}, fmt.Errorf("bad_cursor: %w", err)
 	}
-	parts := strings.SplitN(string(dec), ":", 2)
-	if len(parts) != 2 {
-		return artwork.FeedCursor{}
+	parts := strings.SplitN(string(dec), "|", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return artwork.FeedCursor{}, errors.New("bad_cursor: missing field")
 	}
-	n, _ := strconv.ParseInt(parts[0], 10, 64)
-	return artwork.FeedCursor{PublishedAtUnix: n, ID: parts[1]}
+	stamp, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return artwork.FeedCursor{}, fmt.Errorf("bad_cursor: timestamp %w", err)
+	}
+	return artwork.FeedCursor{Stamp: stamp.UTC(), ID: parts[1]}, nil
 }
 
 func encodeCursor(c *artwork.FeedCursor) *string {
 	if c == nil {
 		return nil
 	}
-	raw := fmt.Sprintf("%d:%s", c.PublishedAtUnix, c.ID)
+	raw := c.Stamp.UTC().Format(time.RFC3339Nano) + "|" + c.ID
 	enc := base64.RawURLEncoding.EncodeToString([]byte(raw))
 	return &enc
 }
@@ -3820,7 +4153,12 @@ func meHandler(d *Deps) http.Handler {
 
 func listFeedHandler(d *Deps) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		page, err := d.Artworks.PublicFeed(r.Context(), parseCursor(r), parseLimit(r))
+		cursor, err := parseCursor(r)
+		if err != nil {
+			renderJSON(w, 400, map[string]string{"error": "bad_cursor", "message": err.Error()})
+			return
+		}
+		page, err := d.Artworks.PublicFeed(r.Context(), cursor, parseLimit(r))
 		if err != nil {
 			renderJSON(w, 500, map[string]string{"error": "list_failed"})
 			return
@@ -3916,18 +4254,40 @@ func patchArtworkHandler(d *Deps) http.Handler {
 			renderJSON(w, 404, map[string]string{"error": "not_found"})
 			return
 		}
+		// Each field is *T so the JSON decoder can distinguish "omitted"
+		// (nil) from "set to empty/zero" (non-nil pointer to zero value).
+		// Each branch below runs ONLY when the field was present, which
+		// is what stops a PATCH {"title":"x"} from clobbering description
+		// or cover_position.
 		var body struct {
-			Title       *string  `json:"title,omitempty"`
-			Description *string  `json:"description,omitempty"`
-			Visibility  *string  `json:"visibility,omitempty"`
-			Tags        []string `json:"tags,omitempty"`
+			Title         *string  `json:"title,omitempty"`
+			Description   *string  `json:"description,omitempty"`
+			Visibility    *string  `json:"visibility,omitempty"`
+			CoverPosition *int     `json:"cover_position,omitempty"` // spec §6.5
+			Tags          []string `json:"tags,omitempty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			renderJSON(w, 400, map[string]string{"error": "bad_json"})
 			return
 		}
 		if body.Title != nil {
-			if err := d.Artworks.PatchTitleDescription(r.Context(), id, *body.Title, body.Description); err != nil {
+			if err := d.Artworks.PatchTitle(r.Context(), id, *body.Title); err != nil {
+				renderJSON(w, 500, map[string]string{"error": "patch_failed"})
+				return
+			}
+		}
+		if body.Description != nil {
+			if err := d.Artworks.PatchDescription(r.Context(), id, *body.Description); err != nil {
+				renderJSON(w, 500, map[string]string{"error": "patch_failed"})
+				return
+			}
+		}
+		if body.CoverPosition != nil {
+			if *body.CoverPosition < 0 {
+				renderJSON(w, 400, map[string]string{"error": "bad_cover_position"})
+				return
+			}
+			if err := d.Artworks.SetCoverPosition(r.Context(), id, *body.CoverPosition); err != nil {
 				renderJSON(w, 500, map[string]string{"error": "patch_failed"})
 				return
 			}
@@ -4051,7 +4411,12 @@ func userProfileHandler(d *Deps) http.Handler {
 			return
 		}
 		isOwner := viewer == profileUser.ID
-		page, err := d.Artworks.ListByUser(r.Context(), profileUser.ID, isOwner, parseCursor(r), parseLimit(r))
+		cursor, err := parseCursor(r)
+		if err != nil {
+			renderJSON(w, 400, map[string]string{"error": "bad_cursor", "message": err.Error()})
+			return
+		}
+		page, err := d.Artworks.ListByUser(r.Context(), profileUser.ID, isOwner, cursor, parseLimit(r))
 		if err != nil {
 			renderJSON(w, 500, map[string]string{"error": "list_failed"})
 			return
@@ -4109,7 +4474,12 @@ import (
 func tagsHandler(d *Deps) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		name := strings.ToLower(chi.URLParam(r, "name"))
-		page, err := d.Artworks.ListByTag(r.Context(), name, parseCursor(r), parseLimit(r))
+		cursor, err := parseCursor(r)
+		if err != nil {
+			renderJSON(w, 400, map[string]string{"error": "bad_cursor", "message": err.Error()})
+			return
+		}
+		page, err := d.Artworks.ListByTag(r.Context(), name, cursor, parseLimit(r))
 		if err != nil {
 			renderJSON(w, 500, map[string]string{"error": "list_failed"})
 			return
@@ -4150,13 +4520,47 @@ func TestCORS_AllowsCredentialsForAllowedOrigin(t *testing.T) {
 	}
 }
 
-func TestNoStoreOnViewerSpecificEndpoints(t *testing.T) {
+// Per contracts §10, /artworks (the public feed) MUST get public,
+// max-age=60 — earlier draft tagged it private/no-store, which was a
+// contract violation. /artworks/<id> stays private/no-store because
+// the response can embed signed private URLs.
+func TestCacheControl_PublicFeedIsShortPublic(t *testing.T) {
 	rec := httptest.NewRecorder()
-	mw := httpapi.NoStoreForViewerSpecific()
+	mw := httpapi.CacheControlByPath()
+	h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/artworks", nil))
+	if got := rec.Header().Get("Cache-Control"); got != "public, max-age=60" {
+		t.Fatalf("/artworks Cache-Control=%q want public, max-age=60", got)
+	}
+}
+
+func TestCacheControl_ArtworkDetailIsPrivateNoStore(t *testing.T) {
+	rec := httptest.NewRecorder()
+	mw := httpapi.CacheControlByPath()
+	h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/artworks/abc-123", nil))
+	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Fatalf("/artworks/<id> Cache-Control=%q want private, no-store", got)
+	}
+}
+
+func TestCacheControl_MeIsPrivateNoStore(t *testing.T) {
+	rec := httptest.NewRecorder()
+	mw := httpapi.CacheControlByPath()
 	h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/me", nil))
-	if cc := rec.Header().Get("Cache-Control"); !strings.Contains(cc, "no-store") {
-		t.Fatalf("cc=%q", cc)
+	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Fatalf("/me Cache-Control=%q want private, no-store", got)
+	}
+}
+
+func TestCacheControl_TagListingIsShortPublic(t *testing.T) {
+	rec := httptest.NewRecorder()
+	mw := httpapi.CacheControlByPath()
+	h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/tags/landscape", nil))
+	if got := rec.Header().Get("Cache-Control"); got != "public, max-age=60" {
+		t.Fatalf("/tags/<name> Cache-Control=%q want public, max-age=60", got)
 	}
 }
 ```
@@ -4190,23 +4594,60 @@ func CORSFor(allowedOrigin string) func(http.Handler) http.Handler {
 	}
 }
 
-// NoStoreForViewerSpecific marks endpoints whose response may include
-// signed URLs or owner-only data per contracts §10.
-func NoStoreForViewerSpecific() func(http.Handler) http.Handler {
-	private := map[string]bool{
-		"/me": true, "/users/": true, "/artworks/": true, // path-prefix match below
-	}
+// CacheControlByPath sets the Cache-Control header per contracts §10:
+//
+//   - exact `/artworks` (the public feed)        → public, max-age=60
+//   - exact `/tags/<name>`                       → public, max-age=60
+//   - `/me`, `/users/<slug>`, `/artworks/<id>`   → private, no-store
+//
+// Note that an earlier draft used a single "no-store everywhere under
+// /artworks/" middleware, which incorrectly tagged the public feed
+// (`GET /artworks`) as `private, no-store` and made it impossible for
+// the edge to cache. Splitting the rule so the COLLECTION root is
+// public and the ITEM endpoints are viewer-specific matches the
+// contract exactly.
+func CacheControlByPath() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			for p := range private {
-				if strings.HasPrefix(r.URL.Path, p) || r.URL.Path == strings.TrimRight(p, "/") {
-					w.Header().Set("Cache-Control", "private, no-store")
-					break
-				}
+			switch h := classifyCachePath(r.URL.Path); h {
+			case cachePublicShort:
+				w.Header().Set("Cache-Control", "public, max-age=60")
+			case cachePrivateNoStore:
+				w.Header().Set("Cache-Control", "private, no-store")
 			}
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+type cacheHint int
+
+const (
+	cacheNone cacheHint = iota
+	cachePublicShort
+	cachePrivateNoStore
+)
+
+// classifyCachePath returns the cache hint for a path. Exact-match
+// rules come first so `/artworks` (collection) is not swallowed by the
+// `/artworks/` (item) prefix rule.
+func classifyCachePath(p string) cacheHint {
+	switch p {
+	case "/artworks":
+		return cachePublicShort
+	case "/me":
+		return cachePrivateNoStore
+	}
+	switch {
+	case strings.HasPrefix(p, "/tags/"):
+		return cachePublicShort
+	case strings.HasPrefix(p, "/users/"):
+		return cachePrivateNoStore
+	case strings.HasPrefix(p, "/artworks/"):
+		// /artworks/<id> and /artworks/<id>/images
+		return cachePrivateNoStore
+	}
+	return cacheNone
 }
 ```
 
@@ -4483,6 +4924,10 @@ func main() {
 	imgSvc := image.NewService(store, images, arts)
 	upload := image.NewHandler(imgSvc, arts, urls)
 	vis := artwork.NewVisibilityService(arts, store)
+
+	// Surface storage-move rollback failures so operators can clean up
+	// stragglers manually until the v2 GC sweeper lands (spec §11).
+	artwork.RollbackLog = func(err error) { log.Error("flip rollback", "err", err) }
 
 	r := httpapi.New(&httpapi.Deps{
 		JWT: jwts, URL: urls,

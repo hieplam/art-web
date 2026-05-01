@@ -234,7 +234,19 @@ type UserProfile = {
 
 ### 8.7 `Cursor`
 
-Opaque base64-url-encoded string. Internally `<published_at_unix_seconds>:<id>`. Never exposed in spec; clients pass it back unchanged.
+Opaque to clients — they pass it back byte-for-byte. Internally:
+
+```
+base64url( "<rfc3339nano-timestamp>|<id>" )
+```
+
+- The timestamp portion is the row's `published_at` (for `/artworks`, `/tags/:name`) or `created_at` (for `/users/:slug`), encoded with `time.RFC3339Nano` (`2026-04-30T14:32:11.123456789Z`). **Nanosecond precision is required.** Truncating to integer seconds — as an earlier draft did — silently skips items whose timestamps share a second, because the lexicographic tuple comparison falls back to `id` (a random UUID) and there is no guarantee the cursor's id sorts above the unseen siblings.
+- The `id` portion is the row's UUID v4 in lowercase canonical hyphenated form.
+- The `|` separator is U+007C (single ASCII byte). Embedding it in the timestamp or id is impossible by construction (RFC3339Nano never contains `|`; UUID hex never contains `|`).
+- `base64url` is *unpadded* base64-url (`base64.RawURLEncoding` in Go, `btoa(...).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_")` in JS).
+- Encoding alphabet is exactly `[A-Za-z0-9_-]`; clients MUST URL-encode the cursor when concatenating it into a query string nonetheless (`encodeURIComponent` in JS) because nothing prevents a future scheme from adding bytes that need percent-encoding.
+
+Cursor parsing on the API side rejects malformed cursors (missing `|`, non-decodable base64, unparseable timestamp) with HTTP 400 and `{"error":"bad_cursor"}`. The previous behavior — silently treating a malformed cursor as "no cursor / first page" — masked client bugs and could double-bill items into the user's scroll feed.
 
 ### 8.8 `ApiError`
 
