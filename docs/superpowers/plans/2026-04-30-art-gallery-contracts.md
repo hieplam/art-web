@@ -378,9 +378,9 @@ All `v` paths are major-version pinned via the import path; minor/patch resolves
 | `react`, `react-dom` | `18.3.0` | web |
 | `typescript` | `^5.4.0` | web + worker |
 | `vitest` | `^2.1.0` | web + worker |
-| `@cloudflare/vitest-pool-workers` | `^0.5.0` | worker |
+| `@cloudflare/vitest-pool-workers` | `^0.9.0` | worker |
 | `@cloudflare/workers-types` | `^4.20240117.0` | worker |
-| `wrangler` | `^3.50.0` (dep) — prereq tooling `3.x` | worker |
+| `wrangler` | `^4.44.0` (dep) — prereq tooling `4.x` | worker |
 | `@playwright/test` | `^1.43.0` | web |
 | `@testing-library/react` | `^15.0.0` | web |
 | `@testing-library/jest-dom` | `^6.4.0` | web |
