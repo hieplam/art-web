@@ -765,7 +765,10 @@ import (
 
 func TestR2_PutGetMove(t *testing.T) {
 	ctx := context.Background()
-	c, err := tcminio.Run(ctx, "minio/minio:latest")
+	// MinIO image tag pinned per contracts §13. Replacing this with
+	// `:latest` makes the test result depend on whatever MinIO image
+	// happens to be on Docker Hub the day the test runs.
+	c, err := tcminio.Run(ctx, "minio/minio:RELEASE.2024-12-18T13-15-44Z")
 	if err != nil {
 		t.Fatalf("minio: %v", err)
 	}

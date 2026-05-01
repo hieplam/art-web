@@ -65,6 +65,9 @@
   "name": "art-web-frontend",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",
@@ -1648,7 +1651,10 @@ services:
       retries: 30
 
   minio:
-    image: minio/minio:latest
+    # Tag pinned per contracts §13 — must match the version used by
+    # Plan 1's testcontainer-driven r2_test.go, otherwise dev compose
+    # and unit tests can drift apart on AWS S3 SDK behavior nuances.
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
     command: server /data --address :9000
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -1696,7 +1702,10 @@ Each subtree needs a Dockerfile. Add `api/Dockerfile`, `worker/Dockerfile`, `web
 
 ```dockerfile
 # api/Dockerfile
-FROM golang:1.22-alpine AS build
+# Go version pinned to match contracts §13 (must be ≥1.24 per Plan 1 §0
+# tech stack — t.Context() is a 1.24+ feature used throughout the test
+# suite). Bumping this without updating contracts §13 is a contract drift.
+FROM golang:1.24-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

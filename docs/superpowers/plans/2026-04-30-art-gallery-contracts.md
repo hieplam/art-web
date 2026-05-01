@@ -321,7 +321,65 @@ The 26 critical-correctness test cases from spec §8.6 are distributed:
 
 Case 25 (flip-private + incognito) is the final integration test that asserts all three subsystems agree. It runs only against a docker-compose'd full stack.
 
-## 13. CI Job Topology
+## 13. Pinned Versions
+
+Single source of truth for every runtime, image, and major library version used across all three subtrees and the docker-compose dev stack. Inline values in plan tasks (Dockerfiles, `package.json`, `go.mod` snippets, testcontainer calls, GitHub Actions workflows) MUST agree with this table; drift is a contracts violation per §15.
+
+### 13.1 Runtimes & images
+
+| Component | Pin | Where used |
+|---|---|---|
+| Go toolchain | `1.24` (≥1.24 required for `t.Context()` in tests) | Plan 1 `go.mod`, Plan 1 `api.yml` setup-go, Plan 3 `api/Dockerfile` |
+| Node.js | `>=20` | Plans 2/3 `package.json` `engines.node`, all `setup-node@v4` actions |
+| PostgreSQL | `postgres:16-alpine` (server requires ≥13 for `gen_random_uuid()`) | Plan 1 testcontainer, Plan 3 `docker-compose.e2e.yml` |
+| MinIO | `minio/minio:RELEASE.2024-12-18T13-15-44Z` | Plan 1 testcontainer, Plan 3 `docker-compose.e2e.yml` |
+| Docker Compose schema | `"3.9"` | Plan 3 `docker-compose.e2e.yml` |
+| Cloudflare Workers compatibility date | `2026-04-01` | Plan 2 `wrangler.toml` |
+
+### 13.2 Go modules (Plan 1)
+
+All `v` paths are major-version pinned via the import path; minor/patch resolves at `go mod tidy` time but the dev container should commit `go.sum` so subsequent builds are reproducible.
+
+| Module | Major | Notes |
+|---|---|---|
+| `github.com/go-chi/chi/v5` | v5 | router |
+| `github.com/jackc/pgx/v5` (+ `pgxpool`, `pgconn`) | v5 | database driver + error introspection |
+| `github.com/golang-migrate/migrate/v4` | v4 | with `database/pgx/v5` driver + `source/iofs` |
+| `github.com/golang-jwt/jwt/v5` | v5 | HS256 cookie auth |
+| `golang.org/x/oauth2` | latest | Google OAuth |
+| `github.com/aws/aws-sdk-go-v2` (+ `service/s3`, `credentials`) | v2 | R2 client |
+| `github.com/buckket/go-blurhash` | latest | upload-time blurhash |
+| `github.com/google/uuid` | latest | server-generated image IDs |
+| `github.com/testcontainers/testcontainers-go/modules/postgres` | latest | repo tests |
+| `github.com/testcontainers/testcontainers-go/modules/minio` | latest | r2 tests |
+
+### 13.3 npm packages
+
+| Package | Pin | Subtree |
+|---|---|---|
+| `next` | `14.2.0` | web |
+| `react`, `react-dom` | `18.3.0` | web |
+| `typescript` | `^5.4.0` | web + worker |
+| `vitest` | `^1.6.0` | web + worker |
+| `@cloudflare/vitest-pool-workers` | `^0.5.0` | worker |
+| `@cloudflare/workers-types` | `^4.20240117.0` | worker |
+| `wrangler` | `^3.50.0` (dep) — prereq tooling `3.x` | worker |
+| `@playwright/test` | `^1.43.0` | web |
+| `@testing-library/react` | `^15.0.0` | web |
+| `@testing-library/jest-dom` | `^6.4.0` | web |
+| `tailwindcss` | `^3.4.0` | web |
+| `jsdom` | `^24.0.0` | web |
+| `image-size` | `^1.1.1` | worker + web |
+| `pngjs` | `^7.0.0` | web (blurhash placeholder) |
+| `@vitejs/plugin-react` | `^4.0.0` | web |
+
+### 13.4 Bumping a pin
+
+Per §15: any version bump touches this table AND every plan task that pins the same value. CI cannot land a PR that bumps a value here without simultaneously bumping every inline reference; a grep of the new value across `docs/superpowers/` and the implementation tree must show no stragglers.
+
+If a transitive dependency forces an inline bump (e.g., a CVE in `image-size`), bump §13.3 first, then the package.json. Reviewers reading the PR should be able to see the table change before the inline change.
+
+## 14. CI Job Topology
 
 Each plan contributes its own GitHub Actions workflow file under `.github/workflows/`:
 
@@ -332,7 +390,7 @@ Each plan contributes its own GitHub Actions workflow file under `.github/workfl
 
 Each plan's workflow file is added in that plan's tasks and modifies only its own file.
 
-## 14. Change Protocol
+## 15. Change Protocol
 
 If implementation reveals a contract here is wrong:
 
