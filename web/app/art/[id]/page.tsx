@@ -12,7 +12,7 @@ export const fetchCache = "force-no-store";
 export default async function Art({ params }: { params: { id: string } }) {
   let data: ArtworkDetail;
   try {
-    data = await api<ArtworkDetail>({ base: apiBase(), path: `/artworks/${params.id}`, cookie: forwardCookie() });
+    data = await api<ArtworkDetail>({ base: apiBase(), path: `/artworks/${encodeURIComponent(params.id)}`, cookie: forwardCookie() });
   } catch (e) {
     if (e instanceof ApiClientError && e.status === 404) notFound();
     throw e;

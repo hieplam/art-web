@@ -15,7 +15,7 @@ export default async function Tag({ params }: { params: { name: string } }) {
   });
   return (
     <main className="p-4">
-      <h1 className="text-2xl mb-3">#{params.name}</h1>
+      <h1 className="text-2xl mb-3">#{decodeURIComponent(params.name)}</h1>
       <Masonry>{feed.items.map((it) => <ArtCard key={it.id} item={it} />)}</Masonry>
     </main>
   );

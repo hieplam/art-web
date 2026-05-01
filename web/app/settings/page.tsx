@@ -1,23 +1,24 @@
 // web/app/settings/page.tsx
-"use client";
-import { useEffect, useState } from "react";
+import { redirect } from "next/navigation";
+import { api, apiBase, ApiClientError, forwardCookie, hasAuthCookie, publicApiBase } from "@/lib/api";
+import { SettingsClient } from "@/components/SettingsClient";
+import type { User } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
 
-const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8080";
-
-export default function Settings() {
-  const [me, setMe] = useState<any>(null);
-  useEffect(() => { fetch(`${API}/me`, { credentials: "include" }).then(r => r.json()).then(setMe); }, []);
-  if (!me) return <main className="p-4">Loading…</main>;
-  return (
-    <main className="max-w-md mx-auto p-4 space-y-3">
-      <h1 className="text-2xl">Settings</h1>
-      <div>Display name: <strong>{me.display_name}</strong></div>
-      <div>Slug: <strong>{me.slug}</strong></div>
-      <form method="POST" action={`${API}/auth/logout`}>
-        <button type="submit" className="bg-gray-200 px-4 py-2">Sign out</button>
-      </form>
-    </main>
-  );
+export default async function Settings() {
+  const serverBase = apiBase();
+  const browserBase = publicApiBase();
+  if (!hasAuthCookie()) redirect(`${browserBase}/auth/google/start`);
+  let me: User;
+  try {
+    me = await api<User>({ base: serverBase, path: "/me", cookie: forwardCookie() });
+  } catch (e) {
+    if (e instanceof ApiClientError && e.status === 401) {
+      redirect(`${browserBase}/auth/google/start`);
+    }
+    throw e;
+  }
+  return <SettingsClient me={me} apiBase={browserBase} />;
 }
