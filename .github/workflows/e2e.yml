@@ -12,20 +12,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
+      - uses: oven-sh/setup-bun@v2
+        with: { bun-version: latest }
       - name: Build + start full stack
         run: docker compose -f web/docker-compose.e2e.yml up -d --build --wait
       - name: Install Playwright deps
         working-directory: web
-        run: npm ci && npx playwright install --with-deps chromium
+        run: bun install --frozen-lockfile && bunx playwright install --with-deps chromium
       - name: Run Playwright
         working-directory: web
         env:
           API_BASE: http://localhost:8080
           CDN_BASE: http://localhost:8787
           WEB_BASE: http://localhost:3000
-        run: npm run test:e2e
+        run: bun run test:e2e
       - name: Tear down
         if: always()
         run: docker compose -f web/docker-compose.e2e.yml down -v
