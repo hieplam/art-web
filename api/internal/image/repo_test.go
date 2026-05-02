@@ -17,7 +17,8 @@ func setup(t *testing.T) (*image.Repo, string) {
 		t.Fatalf("db.New: %v", err)
 	}
 	dbtest.TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
-		_, err := pool.Exec(ctx, sql); return err
+		_, err := pool.Exec(ctx, sql)
+		return err
 	})
 	users := user.NewRepo(pool)
 	uid, _ := users.UpsertOAuth(t.Context(), "google", "S", "a@b", "alice", "")

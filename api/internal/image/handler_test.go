@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -46,9 +47,9 @@ func (f *failingStore) Put(ctx context.Context, k string, b io.Reader, ct string
 
 type spyStore struct {
 	storage.Storage
-	mu          sync.Mutex
-	putCount    int
-	deleteKeys  []string
+	mu         sync.Mutex
+	putCount   int
+	deleteKeys []string
 }
 
 func (s *spyStore) Put(ctx context.Context, k string, b io.Reader, ct string) error {
@@ -71,7 +72,8 @@ func newHandler(t *testing.T, store storage.Storage) (*chi.Mux, string, string) 
 		t.Fatalf("db.New: %v", err)
 	}
 	dbtest.TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
-		_, err := pool.Exec(ctx, sql); return err
+		_, err := pool.Exec(ctx, sql)
+		return err
 	})
 	users := user.NewRepo(pool)
 	uid, _ := users.UpsertOAuth(t.Context(), "google", "S", "a@b", "alice", "")
@@ -90,15 +92,23 @@ func newHandler(t *testing.T, store storage.Storage) (*chi.Mux, string, string) 
 	return r, aid, tok
 }
 
-func uploadJPEG(t *testing.T, mux http.Handler, artID, token, clientID string, position int) int {
+func uploadBytes(
+	t *testing.T,
+	mux http.Handler,
+	artID, token, clientID string,
+	position int,
+	declaredType, filename string,
+	raw []byte,
+) *httptest.ResponseRecorder {
 	t.Helper()
-	raw, _ := os.ReadFile("testdata/sample.jpg")
-
 	body := &bytes.Buffer{}
 	mw := multipart.NewWriter(body)
-	manifest := fmt.Sprintf(`[{"client_image_id":"%s","position":%d,"content_type":"image/jpeg"}]`, clientID, position)
+	manifest := fmt.Sprintf(
+		`[{"client_image_id":"%s","position":%d,"content_type":"%s"}]`,
+		clientID, position, declaredType,
+	)
 	_ = mw.WriteField("manifest", manifest)
-	w, _ := mw.CreateFormFile("files", "f.jpg")
+	w, _ := mw.CreateFormFile("files", filename)
 	_, _ = w.Write(raw)
 	mw.Close()
 
@@ -107,7 +117,135 @@ func uploadJPEG(t *testing.T, mux http.Handler, artID, token, clientID string, p
 	req.AddCookie(&http.Cookie{Name: "auth", Value: token})
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
-	return rec.Code
+	return rec
+}
+
+func uploadJPEG(t *testing.T, mux http.Handler, artID, token, clientID string, position int) int {
+	t.Helper()
+	return uploadJPEGResponse(t, mux, artID, token, clientID, position).Code
+}
+
+func uploadJPEGResponse(t *testing.T, mux http.Handler, artID, token, clientID string, position int) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, _ := os.ReadFile("testdata/sample.jpg")
+	return uploadBytes(t, mux, artID, token, clientID, position, "image/jpeg", "f.jpg", raw)
+}
+
+func requireJSONContentType(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if got := rec.Result().Header.Get("Content-Type"); !strings.HasPrefix(got, "application/json") {
+		t.Fatalf("Content-Type=%q, want application/json", got)
+	}
+}
+
+func decodeUploadResult(t *testing.T, rec *httptest.ResponseRecorder) []struct {
+	ID      string `json:"id"`
+	Existed bool   `json:"existed"`
+} {
+	t.Helper()
+	var out []struct {
+		ID      string `json:"id"`
+		Existed bool   `json:"existed"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatalf("decode upload result: %v", err)
+	}
+	if len(out) != 1 {
+		t.Fatalf("expected one upload result, got %d", len(out))
+	}
+	return out
+}
+
+func TestUploadFirstCreate201Retry200(t *testing.T) {
+	store := storage.NewLocalFS(t.TempDir())
+	mux, aid, token := newHandler(t, store)
+
+	rec := uploadJPEGResponse(t, mux, aid, token, "K1", 0)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("first upload status=%d want 201", rec.Code)
+	}
+	requireJSONContentType(t, rec)
+
+	retry := uploadJPEGResponse(t, mux, aid, token, "K1", 0)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retry upload status=%d want 200", retry.Code)
+	}
+	requireJSONContentType(t, retry)
+}
+
+func TestUploadNonMultipart_Returns415JSON(t *testing.T) {
+	store := storage.NewLocalFS(t.TempDir())
+	mux, aid, token := newHandler(t, store)
+
+	req := httptest.NewRequest("POST", "/artworks/"+aid+"/images", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "auth", Value: token})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status=%d want 415", rec.Code)
+	}
+	requireJSONContentType(t, rec)
+}
+
+func TestUploadInvalidImage_Returns422JSON(t *testing.T) {
+	store := storage.NewLocalFS(t.TempDir())
+	mux, aid, token := newHandler(t, store)
+
+	rec := uploadBytes(t, mux, aid, token, "K1", 0, "image/jpeg", "bad.jpg", []byte("not an image"))
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status=%d want 422", rec.Code)
+	}
+	requireJSONContentType(t, rec)
+}
+
+func TestUploadFingerprintMismatch_SkipsDecodeAndStorageWrite(t *testing.T) {
+	spy := &spyStore{Storage: storage.NewLocalFS(t.TempDir())}
+	mux, aid, token := newHandler(t, spy)
+
+	first := uploadJPEGResponse(t, mux, aid, token, "K1", 0)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first upload: %d", first.Code)
+	}
+	putAfterFirst := spy.putCount
+
+	rec := uploadBytes(t, mux, aid, token, "K1", 0, "image/jpeg", "bad.jpg", []byte("not an image"))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status=%d want 409", rec.Code)
+	}
+	requireJSONContentType(t, rec)
+	if spy.putCount != putAfterFirst {
+		t.Fatalf("fingerprint mismatch must not call store.Put: putCount was %d after first, %d after retry",
+			putAfterFirst, spy.putCount)
+	}
+}
+
+func TestUploadStorageKeyUsesReturnedImageIDAndRetryStable(t *testing.T) {
+	store := storage.NewLocalFS(t.TempDir())
+	mux, aid, token := newHandler(t, store)
+
+	first := uploadJPEGResponse(t, mux, aid, token, "K1", 0)
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first upload: %d", first.Code)
+	}
+	firstOut := decodeUploadResult(t, first)
+	key := "private/" + aid + "/" + firstOut[0].ID + ".jpg"
+	ok, err := store.Exists(t.Context(), key)
+	if err != nil {
+		t.Fatalf("Exists(%q): %v", key, err)
+	}
+	if !ok {
+		t.Fatalf("storage key %q was not written", key)
+	}
+
+	retry := uploadJPEGResponse(t, mux, aid, token, "K1", 0)
+	if retry.Code != http.StatusOK {
+		t.Fatalf("retry upload: %d", retry.Code)
+	}
+	retryOut := decodeUploadResult(t, retry)
+	if retryOut[0].ID != firstOut[0].ID || !retryOut[0].Existed {
+		t.Fatalf("retry returned %+v, want same id %q with existed=true", retryOut[0], firstOut[0].ID)
+	}
 }
 
 func TestUploadCase19_ConcurrentSamePosition(t *testing.T) {
@@ -193,7 +331,7 @@ func TestUploadCase20_PartialFailureResume(t *testing.T) {
 	req2.AddCookie(&http.Cookie{Name: "auth", Value: token})
 	rec2 := httptest.NewRecorder()
 	mux.ServeHTTP(rec2, req2)
-	if rec2.Code != 200 {
+	if rec2.Code != 200 && rec2.Code != 201 {
 		t.Fatalf("retry status %d", rec2.Code)
 	}
 
@@ -233,6 +371,7 @@ func TestUploadContentTypeMismatch_Returns422(t *testing.T) {
 	if rec.Code != 422 {
 		t.Fatalf("expected 422 for content-type mismatch, got %d", rec.Code)
 	}
+	requireJSONContentType(t, rec)
 }
 
 func TestUploadIdempotentRetry_SkipsStorageWrite(t *testing.T) {
@@ -245,7 +384,7 @@ func TestUploadIdempotentRetry_SkipsStorageWrite(t *testing.T) {
 	putAfterFirst := spy.putCount
 
 	// Retry with identical client_image_id and bytes — pre-check must short-circuit before Put.
-	if code := uploadJPEG(t, mux, aid, token, "K1", 0); code != 200 && code != 201 {
+	if code := uploadJPEG(t, mux, aid, token, "K1", 0); code != 200 {
 		t.Fatalf("retry upload: %d", code)
 	}
 	if spy.putCount != putAfterFirst {

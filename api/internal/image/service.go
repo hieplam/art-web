@@ -44,7 +44,7 @@ type UploadResult struct {
 }
 
 var (
-	ErrTooLarge          = errors.New("file exceeds 25 MB")
+	ErrTooLarge            = errors.New("file exceeds 25 MB")
 	ErrContentTypeMismatch = errors.New("body content type does not match declared manifest content_type")
 )
 
@@ -57,18 +57,11 @@ func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in Upload
 	if len(buf) > MaxBytes {
 		return nil, ErrTooLarge
 	}
-	dec, err := DecodeAndBlurhash(bytes.NewReader(buf), in.Manifest.ContentType)
-	if err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
-	}
-	if actual, ok := mimeForFormat[dec.Format]; ok && actual != in.Manifest.ContentType {
-		return nil, ErrContentTypeMismatch
-	}
 
 	sum := sha256.Sum256(buf)
 	sha := hex.EncodeToString(sum[:])
 
-	// Pre-check before any storage write (spec §6.5): skip the write entirely on retry.
+	// Spec §6.5 requires the fingerprint check before decode, blurhash, or storage writes.
 	existing, err := s.images.FindByClientImageID(ctx, art.ID, in.Manifest.ClientImageID)
 	if err != nil {
 		return nil, err
@@ -80,6 +73,14 @@ func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in Upload
 		return &UploadResult{Image: *existing, Existed: true}, nil
 	}
 
+	dec, err := DecodeAndBlurhash(bytes.NewReader(buf), in.Manifest.ContentType)
+	if err != nil {
+		return nil, fmt.Errorf("decode: %w", err)
+	}
+	if actual, ok := mimeForFormat[dec.Format]; ok && actual != in.Manifest.ContentType {
+		return nil, ErrContentTypeMismatch
+	}
+
 	imgID := uuid.NewString()
 	ext, _ := ExtFor(in.Manifest.ContentType)
 	key := fmt.Sprintf("%s/%s/%s.%s", art.Visibility, art.ID, imgID, ext)
@@ -89,7 +90,7 @@ func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in Upload
 	}
 
 	res, err := s.images.Insert(ctx, InsertInput{
-		ArtworkID: art.ID, ClientImageID: in.Manifest.ClientImageID,
+		ID: imgID, ArtworkID: art.ID, ClientImageID: in.Manifest.ClientImageID,
 		Position: in.Manifest.Position, ContentType: in.Manifest.ContentType,
 		StorageKey: key, SourceSHA256: sha,
 		Width: dec.Width, Height: dec.Height,
@@ -99,13 +100,24 @@ func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in Upload
 		_ = s.store.Delete(ctx, key) // best-effort: prevent orphan on concurrent-race insert failure
 		return nil, err
 	}
+	if res.Existed {
+		_ = s.store.Delete(ctx, key)
+		existing, err := s.images.FindByClientImageID(ctx, art.ID, in.Manifest.ClientImageID)
+		if err != nil {
+			return nil, err
+		}
+		if existing == nil {
+			return nil, errors.New("idempotent insert returned existing row but row was not found")
+		}
+		return &UploadResult{Image: *existing, Existed: true}, nil
+	}
 
 	return &UploadResult{
 		Image: InsertedImage{
 			ID: res.ID, ArtworkID: art.ID, ClientImageID: in.Manifest.ClientImageID,
 			StorageKey: key, ContentType: in.Manifest.ContentType, Blurhash: dec.Blurhash,
 			SourceSHA256: sha,
-			Position: in.Manifest.Position, Width: dec.Width, Height: dec.Height, ByteSize: len(buf),
+			Position:     in.Manifest.Position, Width: dec.Width, Height: dec.Height, ByteSize: len(buf),
 		},
 		Existed: res.Existed,
 	}, nil

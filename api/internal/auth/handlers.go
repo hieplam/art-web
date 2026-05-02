@@ -46,7 +46,7 @@ func setRawCookie(w http.ResponseWriter, name, value, domain, path, sameSite str
 }
 
 func jsonError(w http.ResponseWriter, body string, code int) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
 	_, _ = w.Write([]byte(body))
 }

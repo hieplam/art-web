@@ -85,7 +85,7 @@ func main() {
 		AllowedOrigin: cfg.AllowedOrigin,
 		CookieOpts: auth.CookieOpts{
 			Domain: cfg.CookieDomain,
-			Secure: cfg.AppEnv != "dev",
+			Secure: secureCookieForEnv(cfg.AppEnv),
 		},
 	})
 
@@ -94,4 +94,8 @@ func main() {
 		log.Error("server", "err", err)
 		os.Exit(1)
 	}
+}
+
+func secureCookieForEnv(appEnv string) bool {
+	return appEnv != "dev" && appEnv != "test"
 }

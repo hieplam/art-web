@@ -26,8 +26,8 @@ var (
 )
 
 type InsertInput struct {
-	ArtworkID, ClientImageID, ContentType, StorageKey, Blurhash, SourceSHA256 string
-	Position, Width, Height, ByteSize                                          int
+	ID, ArtworkID, ClientImageID, ContentType, StorageKey, Blurhash, SourceSHA256 string
+	Position, Width, Height, ByteSize                                             int
 }
 
 type InsertResult struct {
@@ -58,14 +58,25 @@ func (r *Repo) Insert(ctx context.Context, in InsertInput) (*InsertResult, error
 	}
 
 	var id string
-	err = r.pool.QueryRow(ctx, `
-		INSERT INTO artwork_images
-		  (artwork_id, client_image_id, storage_key, source_sha256,
-		   width, height, byte_size, content_type, position, blurhash)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, NULLIF($10,''))
-		RETURNING id`,
-		in.ArtworkID, in.ClientImageID, in.StorageKey, in.SourceSHA256,
-		in.Width, in.Height, in.ByteSize, in.ContentType, in.Position, in.Blurhash).Scan(&id)
+	if in.ID != "" {
+		err = r.pool.QueryRow(ctx, `
+			INSERT INTO artwork_images
+			  (id, artwork_id, client_image_id, storage_key, source_sha256,
+			   width, height, byte_size, content_type, position, blurhash)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, NULLIF($11,''))
+			RETURNING id`,
+			in.ID, in.ArtworkID, in.ClientImageID, in.StorageKey, in.SourceSHA256,
+			in.Width, in.Height, in.ByteSize, in.ContentType, in.Position, in.Blurhash).Scan(&id)
+	} else {
+		err = r.pool.QueryRow(ctx, `
+			INSERT INTO artwork_images
+			  (artwork_id, client_image_id, storage_key, source_sha256,
+			   width, height, byte_size, content_type, position, blurhash)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, NULLIF($10,''))
+			RETURNING id`,
+			in.ArtworkID, in.ClientImageID, in.StorageKey, in.SourceSHA256,
+			in.Width, in.Height, in.ByteSize, in.ContentType, in.Position, in.Blurhash).Scan(&id)
+	}
 	if err == nil {
 		return &InsertResult{ID: id, Existed: false}, nil
 	}
@@ -134,5 +145,5 @@ func (r *Repo) ListByArtwork(ctx context.Context, artworkID string) ([]InsertedI
 
 type InsertedImage struct {
 	ID, ArtworkID, ClientImageID, StorageKey, ContentType, Blurhash, SourceSHA256 string
-	Position, Width, Height, ByteSize                                              int
+	Position, Width, Height, ByteSize                                             int
 }

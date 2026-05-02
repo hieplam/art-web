@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/google/uuid"
+
 	"local/art-web/api/internal/artwork"
 	"local/art-web/api/internal/auth"
 	"local/art-web/api/internal/image"
@@ -128,7 +130,7 @@ func (h *DevSeed) handle(w http.ResponseWriter, r *http.Request) {
 		PID:         pID,
 		QID:         qID,
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(out)
 }
 
@@ -136,13 +138,14 @@ func (h *DevSeed) handle(w http.ResponseWriter, r *http.Request) {
 var devSeedPNG = devMustDecodeBase64("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=")
 
 func (h *DevSeed) attachSeedImage(ctx context.Context, artworkID, visibility, clientID string, position int) error {
-	key := fmt.Sprintf("%s/%s/%s.png", visibility, artworkID, clientID)
+	imageID := uuid.NewString()
+	key := fmt.Sprintf("%s/%s/%s.png", visibility, artworkID, imageID)
 	if err := h.Store.Put(ctx, key, bytes.NewReader(devSeedPNG), "image/png"); err != nil {
 		return err
 	}
 	sum := sha256.Sum256(devSeedPNG)
 	_, err := h.Images.Insert(ctx, image.InsertInput{
-		ArtworkID: artworkID, ClientImageID: clientID, ContentType: "image/png",
+		ID: imageID, ArtworkID: artworkID, ClientImageID: clientID, ContentType: "image/png",
 		StorageKey: key, SourceSHA256: hex.EncodeToString(sum[:]),
 		Position: position, Width: 1, Height: 1, ByteSize: len(devSeedPNG),
 		Blurhash: "L00000fQfQfQfQfQfQfQfQfQfQfQ",
@@ -151,7 +154,7 @@ func (h *DevSeed) attachSeedImage(ctx context.Context, artworkID, visibility, cl
 }
 
 func writeSeedErr(w http.ResponseWriter, err error) {
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(500)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": "seed_failed", "message": err.Error()})
 }

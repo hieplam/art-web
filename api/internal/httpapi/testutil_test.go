@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"local/art-web/api/internal/artwork"
 	"local/art-web/api/internal/auth"
 	"local/art-web/api/internal/db"
@@ -158,12 +160,14 @@ func setupMatrixEnv(t *testing.T) *MatrixEnv {
 
 // attachTestImage writes a 1×1 seed PNG into the store and inserts the image row.
 func attachTestImage(ctx context.Context, store storage.Storage, images *image.Repo, artworkID, visibility string) error {
-	key := visibility + "/" + artworkID + "/seed.png"
+	imageID := uuid.NewString()
+	key := visibility + "/" + artworkID + "/" + imageID + ".png"
 	if err := store.Put(ctx, key, bytes.NewReader(testSeedPNG), "image/png"); err != nil {
 		return err
 	}
 	sum := sha256.Sum256(testSeedPNG)
 	_, err := images.Insert(ctx, image.InsertInput{
+		ID:            imageID,
 		ArtworkID:     artworkID,
 		ClientImageID: "seed",
 		ContentType:   "image/png",

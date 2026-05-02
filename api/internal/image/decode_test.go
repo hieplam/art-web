@@ -24,8 +24,8 @@ func TestDecodeAndBlurhash_JPEG(t *testing.T) {
 
 func TestDecodeAndBlurhash_ReturnsFormat(t *testing.T) {
 	cases := []struct {
-		file   string
-		want   string
+		file string
+		want string
 	}{
 		{"testdata/sample.jpg", "jpeg"},
 		{"testdata/sample.png", "png"},

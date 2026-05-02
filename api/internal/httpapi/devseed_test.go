@@ -43,6 +43,38 @@ func TestDevSeed_TestEnv_ReturnsFixture(t *testing.T) {
 	if out.PID == "" || out.QID == "" || out.PID == out.QID {
 		t.Fatalf("PID/QID must be distinct non-empty UUIDs; got P=%q Q=%q", out.PID, out.QID)
 	}
+
+	pool, err := db.New(t.Context(), dbtest.StartPostgres(t))
+	if err != nil {
+		t.Fatalf("db.New: %v", err)
+	}
+	t.Cleanup(func() { pool.Close() })
+	rows, err := pool.Query(t.Context(), `
+		SELECT id, storage_key
+		FROM artwork_images
+		WHERE artwork_id IN ($1, $2)
+		ORDER BY artwork_id`, out.PID, out.QID)
+	if err != nil {
+		t.Fatalf("query seed images: %v", err)
+	}
+	defer rows.Close()
+	var n int
+	for rows.Next() {
+		var id, key string
+		if err := rows.Scan(&id, &key); err != nil {
+			t.Fatalf("scan seed image: %v", err)
+		}
+		if !strings.Contains(key, "/"+id+".") {
+			t.Fatalf("seed storage_key %q does not include image id %q", key, id)
+		}
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("seed image rows: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("expected 2 seed image rows, got %d", n)
+	}
 }
 
 func TestDevSeed_Many_BulkSeedsPublic(t *testing.T) {
