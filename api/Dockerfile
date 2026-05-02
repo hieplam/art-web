@@ -1,4 +1,4 @@
-FROM golang:1.24-alpine AS build
+FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -6,7 +6,9 @@ COPY . .
 RUN CGO_ENABLED=0 go build -o /bin/api ./cmd/api
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates wget \
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN sed -i 's|https://|http://|g' /etc/apk/repositories \
+    && apk add --no-cache wget \
     && addgroup -S app && adduser -S app -G app
 COPY --from=build /bin/api /api
 USER app
