@@ -1,0 +1,20 @@
+name = "art-web-worker"
+main = "src/index.ts"
+compatibility_date = "2024-12-30"
+compatibility_flags = ["nodejs_compat"]
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "art-prod"
+preview_bucket_name = "art-dev"
+
+# IMAGES binding is intentionally omitted: vitest-pool-workers' bundled
+# miniflare does not recognise the [images] section and crashes workerd.
+# Layer-A tests inject ImagesFake via mkTestEnv(); Layer-B hits the real
+# binding via `wrangler dev` which uses wrangler.toml (includes [images]).
+
+# WORKER_SIGNING_KEY is a secret — set via: wrangler secret put WORKER_SIGNING_KEY
+
+[dev]
+ip = "127.0.0.1"
+port = 8787

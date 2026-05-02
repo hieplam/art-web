@@ -1,0 +1,20 @@
+name = "art-web-worker"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "art-prod"
+preview_bucket_name = "art-dev"
+
+[images]
+binding = "IMAGES"
+
+# WORKER_SIGNING_KEY is a secret, set via:
+#   wrangler secret put WORKER_SIGNING_KEY
+# It is the hex-encoded byte-identical key the Go API also holds (contracts §11).
+
+[dev]
+ip = "127.0.0.1"
+port = 8787
