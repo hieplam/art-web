@@ -11,7 +11,7 @@ export default async function Tag({ params }: { params: { name: string } }) {
   const feed = await api<Feed>({
     base: apiBase(),
     path: `/tags/${encodeURIComponent(params.name)}?limit=24`,
-    cache: "force-cache",
+    next: { revalidate: 60 },
   });
   return (
     <main className="p-4">

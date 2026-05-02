@@ -40,17 +40,38 @@ const images: ImagesBinding = {
   input(stream) {
     return {
       transform() { return this; },
-      async output(opts: { format: string; quality?: number }) {
+      async output(_opts: { format: string; quality?: number }) {
+        // Consume stream and sniff MIME from magic bytes. The real Cloudflare
+        // binding re-encodes to opts.format; locally we pass through the raw
+        // bytes with the correct declared type so the browser can decode them.
+        const chunks: Uint8Array[] = [];
+        const reader = stream.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+        }
+        const len = chunks.reduce((n, c) => n + c.length, 0);
+        const bytes = new Uint8Array(len);
+        let off = 0;
+        for (const c of chunks) { bytes.set(c, off); off += c.length; }
         return {
-          response: () => new Response(stream, {
+          response: () => new Response(bytes, {
             status: 200,
-            headers: { "Content-Type": opts.format },
+            headers: { "Content-Type": sniffMime(bytes) },
           }),
         };
       },
     } as never;
   },
 };
+
+function sniffMime(b: Uint8Array): string {
+  if (b[0] === 0x89 && b[1] === 0x50) return "image/png";
+  if (b[0] === 0xff && b[1] === 0xd8) return "image/jpeg";
+  if (b[0] === 0x52 && b[1] === 0x49 && b[8] === 0x57) return "image/webp";
+  return "application/octet-stream";
+}
 
 const env: Env = { R2: r2, IMAGES: images, WORKER_SIGNING_KEY: SIGNING_KEY };
 

@@ -7,7 +7,7 @@ import type { Feed } from "@/lib/types";
 export const revalidate = 60;
 
 export default async function Home() {
-  const initial = await api<Feed>({ base: apiBase(), path: "/artworks?limit=24", cache: "force-cache" });
+  const initial = await api<Feed>({ base: apiBase(), path: "/artworks?limit=24", next: { revalidate: 60 } });
   return (
     <main>
       <HomeClient initialItems={initial.items} initialCursor={initial.next_cursor} apiBase={publicApiBase()} />

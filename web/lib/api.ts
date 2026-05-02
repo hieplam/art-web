@@ -13,6 +13,10 @@ export type ApiArgs = {
   cookie?: string;        // forwarded as the request `Cookie` header
   headers?: Record<string, string>;
   cache?: RequestCache;
+  // Next.js extensions to fetch. Use `next.revalidate` to cap a `force-cache`
+  // fetch's TTL — without it, Next stores the response for 31536000s (1 year)
+  // and the page's segment-level `revalidate` does NOT cap it.
+  next?: { revalidate?: number | false; tags?: string[] };
 };
 
 export async function api<T = unknown>(args: ApiArgs): Promise<T> {
@@ -26,6 +30,7 @@ export async function api<T = unknown>(args: ApiArgs): Promise<T> {
     body: args.body,
     headers,
     cache: args.cache ?? "no-store",
+    next: args.next,
     credentials: "include",
   });
   const text = await resp.text();

@@ -155,6 +155,101 @@ go.work     Go workspace pointing at api/ (gitignored — machine-local)
 
 ---
 
+## Image storage
+
+Images live in **MinIO** at the `art-dev` bucket (R2 stand-in for local dev). Three places hold image-related state, and only one of them holds the bytes:
+
+| Where | What | Authoritative for |
+|---|---|---|
+| **MinIO** `art-dev` bucket | Raw PNG/JPEG bytes | the actual image file |
+| **Postgres** `artwork_images` | `storage_key` + metadata (width, height, mime, blurhash, sha256) | which key belongs to which artwork |
+| **Worker** (`web-worker-1`) | Stateless | reads from MinIO via S3 client, transforms on the fly |
+
+### How a storage_key flows through the system
+
+```
+┌─────────────────┐         ┌──────────────────┐
+│ Postgres        │         │ MinIO            │
+│ artwork_images  │         │ Bucket: art-dev  │
+│   storage_key:  │ ──────> │   public/<aid>/  │
+│   public/aid/.. │         │     <iid>.png    │
+└────────┬────────┘         └────────┬─────────┘
+         │                           │
+         │ API serves                │ Worker reads
+         │ cover.url =               │ via S3 client
+         │   <CDN_BASE>/img/         │ (e2e-server.ts)
+         │   <storage_key>           │
+         ▼                           ▼
+┌─────────────────────────────────────────────────┐
+│ Browser GET                                     │
+│   http://localhost:8787/img/public/<aid>/<iid>  │
+│   ?w=480&fmt=auto&q=85                          │
+└─────────────────────────────────────────────────┘
+```
+
+Key layout: `{visibility}/{artworkID}/{imageID}.png` where `visibility` is `public` or `private`. Private keys require an HMAC-signed worker URL (`?sig=…&exp=…`); public keys are reachable by anyone who has the URL.
+
+### Inspecting storage
+
+**MinIO console (web UI)** — the console runs alongside the S3 API on port `9001`. To browse images interactively:
+
+1. Open <http://localhost:9001>
+2. Sign in with username `minioadmin` and password `minioadmin`
+3. In the left nav, click **Object Browser**
+4. Click the `art-dev` bucket
+5. Drill into `public/` or `private/` → `<artworkID>/` → click any `.png` to **preview**, **download**, **share**, or **delete**
+
+Use the **Upload** button at the top right to add bytes at any path — handy for swapping in a real image without touching the DB.
+
+**`mc` inside the container:**
+
+```bash
+docker exec web-minio-1 mc alias set local http://localhost:9000 minioadmin minioadmin
+docker exec web-minio-1 mc ls --recursive local/art-dev/
+docker exec web-minio-1 mc stat   local/art-dev/public/<aid>/<iid>.png
+docker exec web-minio-1 mc cp     local/art-dev/public/<aid>/<iid>.png /tmp/out.png
+docker cp web-minio-1:/tmp/out.png ./out.png
+```
+
+**`mc` from the host** (`brew install minio/stable/mc`):
+
+```bash
+mc alias set localdev http://localhost:9000 minioadmin minioadmin
+mc ls --recursive localdev/art-dev/
+```
+
+**S3 API directly** with the AWS CLI:
+
+```bash
+AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
+  aws --endpoint-url http://localhost:9000 s3 ls s3://art-dev/public/
+```
+
+**Postgres → key lookup** (which S3 keys back which artwork):
+
+```bash
+docker exec web-postgres-1 psql -U art -d artweb -c \
+  "SELECT a.title, ai.storage_key, ai.width, ai.height
+     FROM artworks a JOIN artwork_images ai ON ai.artwork_id = a.id
+     ORDER BY a.created_at DESC LIMIT 5;"
+```
+
+### Replacing a placeholder with a real image
+
+The DB columns `width`, `height`, `byte_size`, `source_sha256` are advisory — the worker doesn't validate them on read. Drop new bytes at the same `storage_key` and the next request gets the new image:
+
+```bash
+mc cp ./myart.png localdev/art-dev/public/<artworkID>/<imageID>.png
+```
+
+> **Heads up**: the worker sets `Cache-Control: public, max-age=31536000, immutable` on public images. After replacing bytes, browsers that already loaded the old URL won't re-fetch — bump the URL with a cache-buster or clear site data when iterating.
+
+### Volume lifecycle
+
+`/data` inside the MinIO container is an **anonymous Docker volume**. It survives `docker compose stop` / `up -d` / container recreates, but is **destroyed by `docker compose down -v`**. After a `down -v` you must reseed (`POST /dev/seed?many=N`) to repopulate the bucket.
+
+---
+
 ## Troubleshooting
 
 ### `NoSuchBucket: art-dev`

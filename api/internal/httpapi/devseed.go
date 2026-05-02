@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	stdimage "image"
+	"image/color"
+	"image/png"
 	"net/http"
 	"strconv"
 	"time"
@@ -134,8 +136,21 @@ func (h *DevSeed) handle(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(out)
 }
 
-// devSeedPNG is a 1×1 transparent PNG (67 bytes).
-var devSeedPNG = devMustDecodeBase64("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=")
+const devSeedDim = 64
+
+// devSeedPNG is a 64×64 solid warm-sand PNG used as a visible placeholder in local dev.
+var devSeedPNG = func() []byte {
+	img := stdimage.NewNRGBA(stdimage.Rect(0, 0, devSeedDim, devSeedDim))
+	warm := color.NRGBA{R: 196, G: 168, B: 130, A: 255}
+	for y := range devSeedDim {
+		for x := range devSeedDim {
+			img.SetNRGBA(x, y, warm)
+		}
+	}
+	var buf bytes.Buffer
+	_ = png.Encode(&buf, img)
+	return buf.Bytes()
+}()
 
 func (h *DevSeed) attachSeedImage(ctx context.Context, artworkID, visibility, clientID string, position int) error {
 	imageID := uuid.NewString()
@@ -147,7 +162,7 @@ func (h *DevSeed) attachSeedImage(ctx context.Context, artworkID, visibility, cl
 	_, err := h.Images.Insert(ctx, image.InsertInput{
 		ID: imageID, ArtworkID: artworkID, ClientImageID: clientID, ContentType: "image/png",
 		StorageKey: key, SourceSHA256: hex.EncodeToString(sum[:]),
-		Position: position, Width: 1, Height: 1, ByteSize: len(devSeedPNG),
+		Position: position, Width: devSeedDim, Height: devSeedDim, ByteSize: len(devSeedPNG),
 		Blurhash: "L00000fQfQfQfQfQfQfQfQfQfQfQ",
 	})
 	return err
@@ -165,10 +180,3 @@ func devRandHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-func devMustDecodeBase64(s string) []byte {
-	b, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		panic(err)
-	}
-	return b
-}
