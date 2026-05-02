@@ -1,0 +1,38 @@
+{
+  "name": "art-web-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "typecheck": "tsc --noEmit",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "blurhash": "^2.0.5",
+    "next": "14.2.0",
+    "pngjs": "^7.0.0",
+    "react": "18.3.0",
+    "react-dom": "18.3.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.43.0",
+    "@testing-library/jest-dom": "^6.4.0",
+    "@testing-library/react": "^15.0.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.0.0",
+    "@types/react-dom": "^18.0.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "image-size": "^1.1.1",
+    "jsdom": "^24.0.0",
+    "tailwindcss": "^3.4.0",
+    "typescript": "^5.4.0",
+    "vitest": "^2.1.0"
+  }
+}

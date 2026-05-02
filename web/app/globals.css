@@ -1,0 +1,5 @@
+/* web/app/globals.css */
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, sans-serif; }
+.masonry { columns: 4 240px; column-gap: 12px; }
+.masonry > * { break-inside: avoid; margin-bottom: 12px; display: block; }
