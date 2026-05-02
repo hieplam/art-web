@@ -5,17 +5,22 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"embed"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	stdimage "image"
 	"image/color"
+	_ "image/jpeg"
 	"image/png"
 	"math"
 	mrand "math/rand/v2"
 	"net/http"
+	"path"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/buckket/go-blurhash"
@@ -27,6 +32,15 @@ import (
 	"local/art-web/api/internal/storage"
 	"local/art-web/api/internal/user"
 )
+
+// seedsFS holds curated retro-style images bundled at compile time. Drop
+// your own images into api/internal/httpapi/seeds/ and rebuild — the
+// loader will pick them up. JPEG and PNG are both supported. If the
+// directory has no usable images, the procedural generator runs as a
+// fallback so /dev/seed never blocks on missing content.
+//
+//go:embed seeds
+var seedsFS embed.FS
 
 // DevSeed handles the POST /dev/seed endpoint, only active when AppEnv == "test".
 type DevSeed struct {
@@ -142,39 +156,138 @@ func (h *DevSeed) handle(w http.ResponseWriter, r *http.Request) {
 
 func (h *DevSeed) attachSeedImage(ctx context.Context, artworkID, visibility, clientID string, position int) error {
 	imageID := uuid.NewString()
-	key := fmt.Sprintf("%s/%s/%s.png", visibility, artworkID, imageID)
-
-	img, pngBytes, err := generateSeedArtwork(clientID)
+	src, err := pickSeedSource(clientID)
 	if err != nil {
 		return err
 	}
+	key := fmt.Sprintf("%s/%s/%s%s", visibility, artworkID, imageID, src.ext)
 
-	if err := h.Store.Put(ctx, key, bytes.NewReader(pngBytes), "image/png"); err != nil {
+	if err := h.Store.Put(ctx, key, bytes.NewReader(src.bytes), src.contentType); err != nil {
 		return err
 	}
-	sum := sha256.Sum256(pngBytes)
-
-	hash, err := blurhash.Encode(4, 3, img)
-	if err != nil {
-		// Blurhash is advisory; fall back to a flat-color hash so DB stays valid.
-		hash = "L00000fQfQfQfQfQfQfQfQfQfQfQ"
-	}
-
-	bounds := img.Bounds()
 	_, err = h.Images.Insert(ctx, image.InsertInput{
 		ID:            imageID,
 		ArtworkID:     artworkID,
 		ClientImageID: clientID,
-		ContentType:   "image/png",
+		ContentType:   src.contentType,
 		StorageKey:    key,
-		SourceSHA256:  hex.EncodeToString(sum[:]),
+		SourceSHA256:  src.sha256Hex,
 		Position:      position,
-		Width:         bounds.Dx(),
-		Height:        bounds.Dy(),
-		ByteSize:      len(pngBytes),
-		Blurhash:      hash,
+		Width:         src.width,
+		Height:        src.height,
+		ByteSize:      len(src.bytes),
+		Blurhash:      src.blurhash,
 	})
 	return err
+}
+
+// seedSource is one resolved seed image — either a curated file from
+// `seeds/` or a deterministically generated procedural image. Metadata
+// (dimensions, blurhash, sha256) is precomputed so attachSeedImage stays
+// cheap when the same source is reused across many seeded artworks.
+type seedSource struct {
+	bytes       []byte
+	contentType string
+	ext         string // includes leading dot, e.g. ".jpg"
+	width       int
+	height      int
+	blurhash    string
+	sha256Hex   string
+}
+
+var (
+	embeddedSeedsOnce sync.Once
+	embeddedSeeds     []seedSource
+)
+
+// pickSeedSource returns one image deterministically chosen from the curated
+// embedded library when available, falling back to a per-clientID procedural
+// artwork when the seeds directory is empty.
+func pickSeedSource(clientID string) (seedSource, error) {
+	loadEmbeddedSeeds()
+	if n := len(embeddedSeeds); n > 0 {
+		idx := int(seedFromString(clientID) % uint64(n))
+		return embeddedSeeds[idx], nil
+	}
+	img, raw, err := generateSeedArtwork(clientID)
+	if err != nil {
+		return seedSource{}, err
+	}
+	hash, err := blurhash.Encode(4, 3, img)
+	if err != nil {
+		hash = "L00000fQfQfQfQfQfQfQfQfQfQfQ"
+	}
+	sum := sha256.Sum256(raw)
+	return seedSource{
+		bytes:       raw,
+		contentType: "image/png",
+		ext:         ".png",
+		width:       img.Bounds().Dx(),
+		height:      img.Bounds().Dy(),
+		blurhash:    hash,
+		sha256Hex:   hex.EncodeToString(sum[:]),
+	}, nil
+}
+
+// loadEmbeddedSeeds walks the embedded seeds directory once and records every
+// usable JPEG/PNG. Non-image files (README.md, .gitkeep) are silently skipped.
+// A corrupt or unreadable image is also skipped, never fatal — the loader
+// degrades to whatever images remain, then to procedural.
+func loadEmbeddedSeeds() {
+	embeddedSeedsOnce.Do(func() {
+		entries, err := seedsFS.ReadDir("seeds")
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			// Quick extension gate to skip README.md / .gitkeep without paying
+			// the cost of a decode attempt on every non-image entry.
+			extLower := strings.ToLower(path.Ext(name))
+			if extLower != ".jpg" && extLower != ".jpeg" && extLower != ".png" {
+				continue
+			}
+			raw, err := seedsFS.ReadFile("seeds/" + name)
+			if err != nil || len(raw) < 256 {
+				continue
+			}
+			// Trust the bytes, not the filename. Some web galleries hand out
+			// .png-named URLs that contain JPEG-encoded data; the file
+			// extension is unreliable for content type. image.Decode tells
+			// us the actual format.
+			img, fmtName, err := stdimage.Decode(bytes.NewReader(raw))
+			if err != nil {
+				continue
+			}
+			var ct, ext string
+			switch fmtName {
+			case "jpeg":
+				ct, ext = "image/jpeg", ".jpg"
+			case "png":
+				ct, ext = "image/png", ".png"
+			default:
+				continue
+			}
+			hash, err := blurhash.Encode(4, 3, img)
+			if err != nil {
+				hash = "L00000fQfQfQfQfQfQfQfQfQfQfQ"
+			}
+			sum := sha256.Sum256(raw)
+			b := img.Bounds()
+			embeddedSeeds = append(embeddedSeeds, seedSource{
+				bytes:       raw,
+				contentType: ct,
+				ext:         ext,
+				width:       b.Dx(),
+				height:      b.Dy(),
+				blurhash:    hash,
+				sha256Hex:   hex.EncodeToString(sum[:]),
+			})
+		}
+	})
 }
 
 func writeSeedErr(w http.ResponseWriter, err error) {

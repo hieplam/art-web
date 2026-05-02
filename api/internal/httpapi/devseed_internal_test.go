@@ -79,6 +79,55 @@ func seedID(i int) string {
 	return "seed-bulk-" + string(rune('a'+i%26)) + string(rune('0'+i%10))
 }
 
+// TestPickSeedSource_Deterministic asserts the same clientID returns the same
+// source — across both the embedded-curated path and the procedural fallback.
+func TestPickSeedSource_Deterministic(t *testing.T) {
+	a, err := pickSeedSource("seed-bulk-7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := pickSeedSource("seed-bulk-7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.sha256Hex != b.sha256Hex {
+		t.Fatalf("same clientID returned different sha256: %s vs %s", a.sha256Hex, b.sha256Hex)
+	}
+	if a.width <= 0 || a.height <= 0 {
+		t.Fatalf("invalid dimensions: %dx%d", a.width, a.height)
+	}
+	if a.contentType != "image/png" && a.contentType != "image/jpeg" {
+		t.Fatalf("unexpected content type: %q", a.contentType)
+	}
+	if a.ext != ".png" && a.ext != ".jpg" && a.ext != ".jpeg" {
+		t.Fatalf("unexpected ext: %q", a.ext)
+	}
+	if a.blurhash == "" {
+		t.Fatal("blurhash must be non-empty")
+	}
+}
+
+// TestPickSeedSource_DistributesAcrossPool guards against picking the same
+// embedded image for every clientID. With ≥3 seeded images we expect to see
+// at least 2 distinct images across 30 clientIDs.
+func TestPickSeedSource_DistributesAcrossPool(t *testing.T) {
+	loadEmbeddedSeeds()
+	if len(embeddedSeeds) < 2 {
+		t.Skip("fewer than 2 embedded seeds — cannot test distribution")
+	}
+	seen := map[string]int{}
+	for i := range 30 {
+		s, err := pickSeedSource(seedID(i))
+		if err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+		seen[s.sha256Hex]++
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected ≥2 distinct images across 30 picks, got %d", len(seen))
+	}
+}
+
 func ratioBucket(w, h int) string {
 	switch {
 	case w*3 == h*2: // 2:3
