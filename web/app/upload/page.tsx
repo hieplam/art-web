@@ -22,9 +22,14 @@ export default async function UploadPage() {
   }
 
   return (
-    <main className="max-w-2xl mx-auto p-4">
-      <h1 className="text-2xl mb-3">New artwork</h1>
-      <ArtworkUploader apiBase={browserBase} />
+    <main style={{ maxWidth: "640px", margin: "0 auto", padding: "32px 16px" }}>
+      <header style={{ marginBottom: "20px" }}>
+        <div className="detail-eyebrow">New artwork</div>
+        <h1 style={{ fontSize: "1.5rem", marginTop: "4px" }}>Add work to your portfolio</h1>
+      </header>
+      <div className="panel">
+        <ArtworkUploader apiBase={browserBase} />
+      </div>
     </main>
   );
 }

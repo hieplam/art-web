@@ -47,16 +47,40 @@ export function ArtworkUploader({ apiBase }: { apiBase: string }) {
 
   return (
     <div className="space-y-3">
-      <input className="border p-2 w-full" placeholder="Title"
-             value={title} onChange={(e) => setTitle(e.target.value)} />
-      <input type="file" multiple accept="image/jpeg,image/png"
-             onChange={(e) => setFiles(Array.from(e.target.files ?? []))} />
-      <button className="bg-black text-white px-4 py-2"
-              disabled={!title || files.length === 0 || submitting}
-              onClick={submit}>
+      <div className="field">
+        <label className="label" htmlFor="art-title">Title</label>
+        <input
+          id="art-title"
+          className="input"
+          placeholder="Untitled"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+        />
+      </div>
+      <div className="field">
+        <label className="label" htmlFor="art-files">Files</label>
+        <input
+          id="art-files"
+          type="file"
+          multiple
+          accept="image/jpeg,image/png"
+          className="input-file"
+          onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
+        />
+        {files.length > 0 && (
+          <div style={{ fontFamily: "var(--font-mono)", fontSize: "0.75rem", color: "var(--ink-faint)" }}>
+            {files.length} file{files.length === 1 ? "" : "s"} selected
+          </div>
+        )}
+      </div>
+      <button
+        className="btn"
+        disabled={!title || files.length === 0 || submitting}
+        onClick={submit}
+      >
         {submitting ? "Uploading…" : "Upload"}
       </button>
-      {error && <div className="text-red-600">{error}</div>}
+      {error && <div className="error">{error}</div>}
     </div>
   );
 }

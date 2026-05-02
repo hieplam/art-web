@@ -19,32 +19,80 @@ export default async function Art({ params }: { params: { id: string } }) {
   }
   const images = data.images ?? [];
   const tags = data.tags ?? [];
+  const cover = images[0] ?? data.cover;
+  const rest = images.slice(1);
+
   return (
-    <main className="max-w-3xl mx-auto p-4">
-      <h1 className="text-2xl mb-1">{data.title}</h1>
-      <Link href={`/u/${data.artist.slug}`} className="text-gray-600">
-        {data.artist.display_name}
-      </Link>
-      {data.published_at && (
-        <time className="block text-gray-500 text-sm">{data.published_at.slice(0, 10)}</time>
-      )}
-      {data.description && <p className="my-3 whitespace-pre-wrap">{data.description}</p>}
-      <div className="space-y-3 mt-4">
-        {images.map((im) => (
-          <Image key={im.id}
-            src={im.url} width={im.width} height={im.height} alt={data.title} className="art-detail-image"
-            placeholder="blur" blurDataURL={blurhashToDataURL(im.blurhash)}
-            sizes="(max-width: 800px) 100vw, 800px"
+    <article className="detail">
+      <div className="detail-stage">
+        {cover && (
+          <Image
+            src={cover.url}
+            width={cover.width}
+            height={cover.height}
+            alt={data.title}
+            className="detail-image"
+            placeholder="blur"
+            blurDataURL={blurhashToDataURL(cover.blurhash)}
+            sizes="(max-width: 1023px) 100vw, calc(100vw - 392px)"
+            priority
           />
-        ))}
+        )}
       </div>
-      <div className="flex flex-wrap gap-2 mt-4">
-        {tags.map((t) => (
-          <Link key={t} href={`/tag/${encodeURIComponent(t)}`} className="text-sm px-2 py-1 bg-gray-100 rounded">
-            #{t}
-          </Link>
-        ))}
-      </div>
-    </main>
+
+      <aside className="detail-side">
+        <div className="detail-eyebrow">
+          {data.visibility === "private" ? "Private · Owner" : "Public"}
+        </div>
+        <h1 className="detail-title">{data.title}</h1>
+        <Link href={`/u/${data.artist.slug}`} className="detail-artist">
+          {data.artist.display_name}
+        </Link>
+        {data.published_at && (
+          <time className="detail-date">{data.published_at.slice(0, 10)}</time>
+        )}
+
+        {data.description && <p className="detail-description">{data.description}</p>}
+
+        {cover && (
+          <dl className="detail-meta-grid">
+            <dt>Format</dt>
+            <dd>PNG</dd>
+            <dt>Dimensions</dt>
+            <dd>{cover.width} × {cover.height}</dd>
+            <dt>Plates</dt>
+            <dd>{images.length || 1}</dd>
+          </dl>
+        )}
+
+        {tags.length > 0 && (
+          <div className="detail-tags">
+            {tags.map((t) => (
+              <Link key={t} href={`/tag/${encodeURIComponent(t)}`} className="tag">
+                #{t}
+              </Link>
+            ))}
+          </div>
+        )}
+      </aside>
+
+      {rest.length > 0 && (
+        <div className="detail-stage detail-extra">
+          {rest.map((im) => (
+            <Image
+              key={im.id}
+              src={im.url}
+              width={im.width}
+              height={im.height}
+              alt={data.title}
+              className="detail-image"
+              placeholder="blur"
+              blurDataURL={blurhashToDataURL(im.blurhash)}
+              sizes="(max-width: 1023px) 100vw, calc(100vw - 392px)"
+            />
+          ))}
+        </div>
+      )}
+    </article>
   );
 }

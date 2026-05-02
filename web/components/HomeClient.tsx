@@ -11,6 +11,15 @@ export function HomeClient(props: {
   initialCursor: string | null;
   apiBase: string;
 }) {
+  if (props.initialItems.length === 0) {
+    return (
+      <div className="empty">
+        no work seeded yet
+        <br />
+        <code>curl -X POST localhost:8080/dev/seed?many=50</code>
+      </div>
+    );
+  }
   return (
     <Masonry>
       <InfiniteFeed<ArtworkSummary>

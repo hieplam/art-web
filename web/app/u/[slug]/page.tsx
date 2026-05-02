@@ -22,14 +22,18 @@ export default async function Profile({ params }: { params: { slug: string } }) 
     throw e;
   }
   return (
-    <main className="p-4">
-      <header className="mb-4">
-        <h1 className="text-2xl">{data.user.display_name}</h1>
-        <div className="text-gray-500">@{data.user.slug}</div>
+    <main>
+      <header className="page-header">
+        <h1>{data.user.display_name}</h1>
+        <div className="slug">@{data.user.slug} · {data.artworks.length} works</div>
       </header>
-      <Masonry>
-        {data.artworks.map((it) => <ArtCard key={it.id} item={it} />)}
-      </Masonry>
+      {data.artworks.length === 0 ? (
+        <div className="empty">no work yet</div>
+      ) : (
+        <Masonry>
+          {data.artworks.map((it) => <ArtCard key={it.id} item={it} />)}
+        </Masonry>
+      )}
     </main>
   );
 }

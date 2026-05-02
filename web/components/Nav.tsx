@@ -14,9 +14,9 @@ export async function Nav() {
     }
   }
   return (
-    <nav className="flex items-center justify-between px-4 py-2 border-b">
-      <Link href="/" className="font-bold">artweb</Link>
-      <div className="flex gap-3">
+    <nav>
+      <Link href="/" className="brand">artweb</Link>
+      <div className="links">
         <Link href="/">Browse</Link>
         {me ? (
           <>
@@ -24,7 +24,7 @@ export async function Nav() {
             <Link href={`/u/${me.slug}`}>{me.display_name}</Link>
           </>
         ) : (
-          <a href={`${browserBase}/auth/google/start`}>Sign in</a>
+          <a href={`${browserBase}/auth/google/start`} className="signin">Sign in</a>
         )}
       </div>
     </nav>
