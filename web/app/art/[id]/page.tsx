@@ -17,6 +17,8 @@ export default async function Art({ params }: { params: { id: string } }) {
     if (e instanceof ApiClientError && e.status === 404) notFound();
     throw e;
   }
+  const images = data.images ?? [];
+  const tags = data.tags ?? [];
   return (
     <main className="max-w-3xl mx-auto p-4">
       <h1 className="text-2xl mb-1">{data.title}</h1>
@@ -28,16 +30,16 @@ export default async function Art({ params }: { params: { id: string } }) {
       )}
       {data.description && <p className="my-3 whitespace-pre-wrap">{data.description}</p>}
       <div className="space-y-3 mt-4">
-        {data.images.map((im) => (
+        {images.map((im) => (
           <Image key={im.id}
-            src={im.url} width={im.width} height={im.height} alt={data.title}
+            src={im.url} width={im.width} height={im.height} alt={data.title} className="art-detail-image"
             placeholder="blur" blurDataURL={blurhashToDataURL(im.blurhash)}
             sizes="(max-width: 800px) 100vw, 800px"
           />
         ))}
       </div>
       <div className="flex flex-wrap gap-2 mt-4">
-        {data.tags.map((t) => (
+        {tags.map((t) => (
           <Link key={t} href={`/tag/${encodeURIComponent(t)}`} className="text-sm px-2 py-1 bg-gray-100 rounded">
             #{t}
           </Link>

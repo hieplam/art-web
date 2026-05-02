@@ -1,5 +1,378 @@
 /* web/app/globals.css */
-* { box-sizing: border-box; }
-body { margin: 0; font-family: system-ui, sans-serif; }
-.masonry { columns: 4 240px; column-gap: 12px; }
-.masonry > * { break-inside: avoid; margin-bottom: 12px; display: block; }
+:root {
+  --bg: #efe5d8;
+  --bg-top: #f9f4ec;
+  --surface: rgba(255, 251, 246, 0.84);
+  --surface-strong: rgba(255, 255, 255, 0.96);
+  --border: rgba(102, 74, 49, 0.16);
+  --text: #211814;
+  --muted: #76675b;
+  --accent: #ab4f2d;
+  --shadow: 0 24px 60px rgba(70, 44, 28, 0.14);
+  --shadow-strong: 0 28px 72px rgba(70, 44, 28, 0.2);
+  --radius: 24px;
+  --heading-font: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+  --body-font: "Avenir Next", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--bg);
+  color: var(--text);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--text);
+  font-family: var(--body-font);
+  background:
+    radial-gradient(circle at top, rgba(238, 164, 104, 0.24), transparent 32%),
+    radial-gradient(circle at 85% 15%, rgba(172, 79, 45, 0.12), transparent 18%),
+    linear-gradient(180deg, var(--bg-top) 0%, var(--bg) 100%);
+}
+
+a {
+  color: inherit;
+}
+
+img {
+  max-width: 100%;
+}
+
+nav {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  backdrop-filter: blur(18px);
+  background: rgba(249, 244, 236, 0.82);
+}
+
+nav a {
+  text-decoration: none;
+}
+
+nav > div a,
+nav > div button {
+  border-radius: 999px;
+  padding: 0.45rem 0.9rem;
+  transition: background-color 180ms ease, color 180ms ease, transform 180ms ease;
+}
+
+nav > div a:hover,
+nav > div button:hover {
+  background: rgba(255, 255, 255, 0.66);
+  color: var(--accent);
+  transform: translateY(-1px);
+}
+
+main {
+  padding-bottom: 3rem;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--heading-font);
+  letter-spacing: -0.03em;
+  margin: 0;
+}
+
+input,
+button {
+  font: inherit;
+}
+
+input[type="file"] {
+  display: block;
+  width: 100%;
+  padding: 1rem 1.1rem;
+  border: 1px dashed var(--border);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.42);
+}
+
+button {
+  cursor: pointer;
+  border: 0;
+  transition: transform 180ms ease, opacity 180ms ease, box-shadow 180ms ease;
+}
+
+button:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  box-shadow: none;
+}
+
+.flex {
+  display: flex;
+}
+
+.items-center {
+  align-items: center;
+}
+
+.justify-between {
+  justify-content: space-between;
+}
+
+.flex-wrap {
+  flex-wrap: wrap;
+}
+
+.gap-2 {
+  gap: 0.5rem;
+}
+
+.gap-3 {
+  gap: 0.75rem;
+}
+
+.space-y-3 > * + * {
+  margin-top: 0.75rem;
+}
+
+.block {
+  display: block;
+}
+
+.border,
+.border-b {
+  border-color: var(--border);
+}
+
+.border {
+  border-style: solid;
+  border-width: 1px;
+}
+
+.border-b {
+  border-bottom-style: solid;
+  border-bottom-width: 1px;
+}
+
+.rounded {
+  border-radius: 999px;
+}
+
+.w-full {
+  width: 100%;
+}
+
+.font-bold {
+  font-weight: 700;
+}
+
+.text-white {
+  color: #fff;
+}
+
+.text-sm {
+  font-size: 0.92rem;
+}
+
+.text-2xl {
+  font-size: clamp(2.1rem, 4vw, 3.4rem);
+  line-height: 0.98;
+}
+
+.text-center {
+  text-align: center;
+}
+
+.text-gray-500 {
+  color: var(--muted);
+}
+
+.text-gray-600 {
+  color: color-mix(in srgb, var(--muted) 88%, var(--text));
+}
+
+.text-red-600 {
+  color: #b53b21;
+}
+
+.truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.whitespace-pre-wrap {
+  white-space: pre-wrap;
+}
+
+.bg-black {
+  background: linear-gradient(135deg, #2c1f1a 0%, #120d0b 100%);
+  box-shadow: 0 16px 32px rgba(18, 13, 11, 0.22);
+}
+
+.bg-gray-100 {
+  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid rgba(102, 74, 49, 0.1);
+}
+
+.bg-gray-200 {
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgba(102, 74, 49, 0.12);
+}
+
+.p-4 {
+  padding: 1rem;
+}
+
+.p-8 {
+  padding: 2rem;
+}
+
+.px-2 {
+  padding-left: 0.75rem;
+  padding-right: 0.75rem;
+}
+
+.px-4 {
+  padding-left: 1rem;
+  padding-right: 1rem;
+}
+
+.py-1 {
+  padding-top: 0.5rem;
+  padding-bottom: 0.5rem;
+}
+
+.py-2 {
+  padding-top: 0.65rem;
+  padding-bottom: 0.65rem;
+}
+
+.mb-1 {
+  margin-bottom: 0.25rem;
+}
+
+.mb-3 {
+  margin-bottom: 0.75rem;
+}
+
+.mb-4 {
+  margin-bottom: 1rem;
+}
+
+.mt-4 {
+  margin-top: 1rem;
+}
+
+.my-3 {
+  margin-top: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.mx-auto {
+  margin-left: auto;
+  margin-right: auto;
+}
+
+.max-w-md {
+  max-width: 32rem;
+}
+
+.max-w-2xl {
+  max-width: 48rem;
+}
+
+.max-w-3xl {
+  max-width: 64rem;
+}
+
+.masonry {
+  columns: 4 260px;
+  column-gap: 18px;
+}
+
+.masonry > * {
+  break-inside: avoid;
+  margin-bottom: 18px;
+  display: block;
+}
+
+.art-card {
+  overflow: hidden;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  text-decoration: none;
+  transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
+}
+
+.art-card:hover {
+  transform: translateY(-4px);
+  border-color: rgba(171, 79, 45, 0.24);
+  box-shadow: var(--shadow-strong);
+}
+
+.art-card-image {
+  display: block;
+  width: 100%;
+  height: auto;
+  min-height: 15rem;
+  object-fit: cover;
+  background:
+    linear-gradient(135deg, rgba(171, 79, 45, 0.18), rgba(255, 255, 255, 0.4)),
+    linear-gradient(180deg, rgba(33, 24, 20, 0.06), transparent);
+}
+
+.art-card-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.42));
+}
+
+.art-card-title {
+  font-family: var(--heading-font);
+  font-size: 1.16rem;
+}
+
+.art-card-subtitle {
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.art-detail-image {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: var(--surface-strong);
+  box-shadow: var(--shadow);
+}
+
+@media (max-width: 640px) {
+  .masonry {
+    columns: 2 140px;
+    column-gap: 12px;
+  }
+
+  .masonry > * {
+    margin-bottom: 12px;
+  }
+
+  .art-card-image {
+    min-height: 10rem;
+  }
+
+  nav > div a,
+  nav > div button {
+    padding-left: 0.7rem;
+    padding-right: 0.7rem;
+  }
+}
