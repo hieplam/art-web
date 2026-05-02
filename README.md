@@ -26,37 +26,71 @@ Storage in dev is **MinIO** (S3-compatible) standing in for Cloudflare R2. Datab
 
 ## Quick start (Docker Compose)
 
-Brings the entire stack up. Postgres → MinIO → bucket-init → API → Worker → Web, gated by health checks:
+The fastest path is the bring-up script at the project root:
 
 ```bash
-cd web
-docker compose -f docker-compose.e2e.yml up --build
+./dev-up.sh
 ```
 
-Open <http://localhost:3000>. The page is empty until you seed.
+It wipes prior data, rebuilds the api/worker/web images, waits for each service's public health endpoint, seeds 50 artworks, flushes the web ISR cache, and prints the alice cookie ready for paste-into-DevTools. Dependency graph: Postgres → MinIO → bucket-init → API → Worker → Web, gated by health checks.
 
-### Seed the database
+Open <http://localhost:3000> when it finishes.
 
-The API only exposes `/dev/seed` when `APP_ENV=test` (already set by compose):
+### Script flags
+
+| Flag | Effect | When to use |
+|---|---|---|
+| _(none)_ | wipe + rebuild + seed 50 | first run, or after Go / Next / CSS changes |
+| `--many=N` | seed `N` bulk artworks (cap 200) | larger feeds for masonry / stress testing |
+| `--keep-data` | skip the destructive `down -v` | iterating on UI without re-seeding |
+| `--no-build` | reuse already-built images | fastest path when only seed code changed |
+| `--no-flush` | skip the web cache flush | when you don't need the home feed to update immediately |
+| `--help` | print the flag list | — |
+
+Examples:
 
 ```bash
-# Two artworks (one public, one private) for two users:
-curl -X POST http://localhost:8080/dev/seed
+./dev-up.sh --many=120                       # bigger feed
+./dev-up.sh --keep-data --no-build           # quick re-seed only
+./dev-up.sh --keep-data --no-build --no-flush --many=10   # smallest dev iteration
+```
 
-# Plus 50 bulk public artworks for an obviously-populated feed:
+### What the script runs, step by step
+
+If you want to debug or understand the flow, the equivalent manual sequence:
+
+```bash
+# 1. Wipe containers + named volumes (Postgres + MinIO)
+docker compose -f web/docker-compose.e2e.yml down -v --remove-orphans
+
+# 2. Build images, boot the dependency graph, wait for compose healthchecks
+docker compose -f web/docker-compose.e2e.yml up --build -d --wait
+
+# 3. Poll public endpoints until they respond (api healthz, web home, worker healthz)
+curl -sf http://localhost:8080/healthz
+curl -sf http://localhost:3000
+curl -sf http://localhost:8787/healthz
+
+# 4. Seed via the dev-only endpoint (gated by APP_ENV=test)
 curl -X POST 'http://localhost:8080/dev/seed?many=50'
+
+# 5. Flush the Next.js ISR cache so the seed appears immediately
+docker compose -f web/docker-compose.e2e.yml exec -T web sh -c 'rm -rf .next/cache'
+docker compose -f web/docker-compose.e2e.yml restart web
 ```
 
-The home page caches the SSR feed for 60 s (`revalidate = 60`). After seeding, either wait a minute or restart the web container to flush the ISR cache:
+Step 5 exists because the home page is cached for 60 s (`revalidate = 60` in `web/app/page.tsx`). Without flushing, the feed reports "no work yet" for up to a minute after seeding. The script automates this; if you skip it, just wait a minute.
 
-```bash
-docker compose -f docker-compose.e2e.yml exec web sh -c 'rm -rf .next/cache' \
-  && docker compose -f docker-compose.e2e.yml restart web
-```
+### Seed images
+
+`POST /dev/seed` builds each artwork's image from one of two sources, in priority order:
+
+1. **`api/internal/httpapi/seeds/`** — any `.jpg` / `.jpeg` / `.png` files in this directory are baked into the API binary at compile time via `//go:embed seeds`. The handler picks one deterministically per `clientID` so the seeded feed reads as a curated drop. Drop your own images here (e.g. from grok.com/imagine) and rebuild — see [`api/internal/httpapi/seeds/README.md`](api/internal/httpapi/seeds/README.md).
+2. **Procedural fallback** — if the seeds directory has no usable images, a deterministic generator produces painterly compositions in three styles (gradient field, block constructivism, particle drift) across six aspect ratios so the masonry still feels gallery-grade.
 
 ### Sign in as a seeded user
 
-`POST /dev/seed` returns ready-to-paste auth cookies:
+`./dev-up.sh` prints the alice cookie at the end. To re-fetch it manually:
 
 ```bash
 curl -sX POST http://localhost:8080/dev/seed | jq -r .aliceCookie
@@ -73,7 +107,8 @@ Reload — the nav switches to authenticated mode.
 ### Tear down
 
 ```bash
-docker compose -f docker-compose.e2e.yml down -v   # -v drops postgres + minio volumes
+docker compose -f web/docker-compose.e2e.yml down       # keep volumes (re-up keeps data)
+docker compose -f web/docker-compose.e2e.yml down -v    # drop postgres + minio volumes
 ```
 
 ---
@@ -236,7 +271,11 @@ docker exec web-postgres-1 psql -U art -d artweb -c \
 
 ### Replacing a placeholder with a real image
 
-The DB columns `width`, `height`, `byte_size`, `source_sha256` are advisory — the worker doesn't validate them on read. Drop new bytes at the same `storage_key` and the next request gets the new image:
+There are two separate workflows depending on whether you want to change *the next seed* or *one specific live artwork*.
+
+**Change what `/dev/seed` produces** (compile-time, affects all future seeds): drop your images into `api/internal/httpapi/seeds/`, rebuild the api container. See "Seed images" in [Quick start](#quick-start-docker-compose).
+
+**Replace bytes on one already-seeded artwork** (runtime, affects only that S3 key): the DB columns `width`, `height`, `byte_size`, `source_sha256` are advisory — the worker doesn't validate them on read. Drop new bytes at the same `storage_key` and the next request gets the new image:
 
 ```bash
 mc cp ./myart.png localdev/art-dev/public/<artworkID>/<imageID>.png
@@ -261,7 +300,7 @@ docker run --rm --network web_default --entrypoint sh minio/mc -c \
 ```
 
 ### Home page is blank after seeding
-ISR cache. See "Seed the database" above for the cache-flush command. Or just wait 60 s.
+ISR cache. The home feed is cached for 60 s (`revalidate = 60`). Either re-run `./dev-up.sh --keep-data --no-build` (it flushes the cache as step 5) or run the manual flush from "What the script runs, step by step" above. Or just wait 60 s.
 
 ### Docker build fails with `apk add` SSL `certificate verify failed`
 Host machine is doing TLS interception (corporate proxy, VPN). The api Dockerfile already switches apk repos to HTTP and copies a CA bundle from the build stage — if you see this in a different image, apply the same pattern:
