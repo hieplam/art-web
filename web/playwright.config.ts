@@ -14,7 +14,7 @@ export default defineConfig({
     // `page.goto("/")` in tests resolves against this app server.
     baseURL: process.env.WEB_BASE || "http://localhost:3000",
     headless: !isHeaded,
-    launchOptions: { slowMo: Number.isFinite(slowMo) ? slowMo : 500 },
+    launchOptions: isHeaded ? { slowMo: Number.isFinite(slowMo) ? slowMo : 500 } : {},
     extraHTTPHeaders: {},
   },
   projects: [
