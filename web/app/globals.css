@@ -186,6 +186,14 @@ main {
   display: block;
 }
 
+.feed-sentinel {
+  display: block;
+  height: 1px;
+  margin: 0;
+  break-inside: avoid;
+  column-span: all;
+}
+
 @media (min-width: 640px) {
   .masonry { columns: 3; column-gap: 6px; padding: 6px; }
   .masonry > * { margin-bottom: 6px; }

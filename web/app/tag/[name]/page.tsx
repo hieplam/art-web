@@ -4,15 +4,16 @@ import { Masonry } from "@/components/Masonry";
 import { ArtCard } from "@/components/ArtCard";
 import type { Feed } from "@/lib/types";
 
-// Public-only by spec §8.6.1 case 5 — cacheable.
-export const revalidate = 60;
+// Tag pages must reflect visibility changes immediately; caching here leaks
+// stale public HTML after an artwork is made private.
+export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
 
 export default async function Tag({ params }: { params: { name: string } }) {
   const name = decodeURIComponent(params.name);
   const feed = await api<Feed>({
     base: apiBase(),
     path: `/tags/${encodeURIComponent(params.name)}?limit=24`,
-    next: { revalidate: 60 },
   });
   return (
     <main>

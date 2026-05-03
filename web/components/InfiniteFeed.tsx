@@ -34,7 +34,7 @@ export function InfiniteFeed<T extends { id: string }>(props: Props<T>) {
       } finally {
         loadingRef.current = false;
       }
-    });
+    }, { rootMargin: "400px 0px" });
     obs.observe(el);
     return () => obs.disconnect();
   }, [cursor]);
@@ -46,7 +46,7 @@ export function InfiniteFeed<T extends { id: string }>(props: Props<T>) {
           {props.renderItem(item)}
         </React.Fragment>
       ))}
-      {cursor && <div ref={sentinelRef} aria-hidden style={{ height: 1 }} />}
+      {cursor && <div ref={sentinelRef} aria-hidden className="feed-sentinel" />}
     </>
   );
 }

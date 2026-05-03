@@ -41,8 +41,7 @@ test("case 24 — lazy loading: only near-viewport images fetched initially", as
   await page.waitForLoadState("networkidle");
   const initialCount = requested.length;
   await page.evaluate(() => window.scrollBy(0, window.innerHeight * 3));
-  await page.waitForLoadState("networkidle");
-  expect(requested.length).toBeGreaterThan(initialCount);
+  await expect.poll(() => requested.length, { timeout: 5_000 }).toBeGreaterThan(initialCount);
 });
 
 test("case 25 — flip private + incognito → disappearance", async ({ browser }) => {
