@@ -76,7 +76,13 @@ build_flag=()
 $NO_BUILD || build_flag=(--build)
 
 step "starting stack ${build_flag[*]:-(no rebuild)}"
-"${COMPOSE[@]}" up "${build_flag[@]}" -d --wait
+# bash 3.2 (macOS stock /bin/bash) treats an empty array as unset under `set -u`,
+# so guard the expansion when no extra flags are needed.
+if (( ${#build_flag[@]} > 0 )); then
+  "${COMPOSE[@]}" up "${build_flag[@]}" -d --wait
+else
+  "${COMPOSE[@]}" up -d --wait
+fi
 
 # ── 3. Probe service readiness ───────────────────────────────────────────────
 # `--wait` already blocks on healthchecks, but those checks are defined inside
