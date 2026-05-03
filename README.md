@@ -104,6 +104,31 @@ In the browser DevTools → **Application → Cookies → http://localhost:3000*
 
 Reload — the nav switches to authenticated mode.
 
+### Sign in via Google OAuth (optional)
+
+The seed-cookie path above covers most local dev — you don't need real Google credentials to work on the app. Set this up only if you specifically want to exercise the OAuth flow end-to-end.
+
+1. Open <https://console.cloud.google.com> and create (or select) a project.
+2. **APIs & Services → OAuth consent screen**: user type `External`. Add scopes `openid`, `userinfo.email`, `userinfo.profile`. Add your Gmail under **Test users** — without this, Google blocks unverified-app sign-ins with "Access blocked: app is being tested".
+3. **APIs & Services → Credentials → + CREATE CREDENTIALS → OAuth client ID**: type `Web application`. Authorized redirect URI: `http://localhost:8080/auth/google/callback` (must match exactly — trailing-slash, port, and scheme are all literal).
+4. Copy the values into a new `api/.env.dev` (gitignored — see `api/.env.dev.example` for the template):
+
+   ```sh
+   GOOGLE_OAUTH_CLIENT_ID=<paste>.apps.googleusercontent.com
+   GOOGLE_OAUTH_CLIENT_SECRET=GOCSPX-<paste>
+   GOOGLE_OAUTH_REDIRECT_URL=http://localhost:8080/auth/google/callback
+   ```
+
+5. Restart the stack so the API picks up the new env vars (no rebuild needed — env is runtime-only):
+
+   ```bash
+   ./dev-up.sh --keep-data --no-build
+   ```
+
+6. Visit <http://localhost:3000> and click **Sign in**. Google consent → callback → land back signed in.
+
+If `api/.env.dev` is missing or empty, the API still boots — the compose `env_file` directive uses `required: false` — but the Sign-in button will fail at Google with `Missing required parameter: client_id`. Use the seed-cookie injection above instead.
+
 ### Tear down
 
 ```bash

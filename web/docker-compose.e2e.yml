@@ -41,6 +41,9 @@ services:
     build:
       context: ../api
       dockerfile: Dockerfile
+    env_file:
+      - path: ../api/.env.dev
+        required: false
     environment:
       ADDR: ":8080"
       APP_ENV: test

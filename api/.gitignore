@@ -4,3 +4,4 @@
 coverage.out
 .env
 .env.local
+.env.dev
