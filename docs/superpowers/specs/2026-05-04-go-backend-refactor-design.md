@@ -100,15 +100,15 @@ The current API emits errors as JSON in two distinct shapes. Both are part of th
 
 Content-Type: `application/json; charset=utf-8`.
 
-**Shape-A paths (verified):** `unauthorized`, `not_found`, `bad_json`, `bad_visibility`, `bad_cover_position`, `create_failed`, `patch_failed`, `flip_failed`, `tag_failed`, `delete_failed`, `list_failed`, `user_lookup_failed`, `user_failed`, `unknown_provider` (auth), `bad_state` (auth), `exchange_failed` (auth), `upsert_failed` (auth), `sign_failed` (auth), `unsupported_media_type` (image), `bad_multipart` (image), `manifest_required` (image), `file_count_mismatch` (image), `open_file` (image), `position_taken` (image), `too_large` (image), `decode_failed` (image), `upload_failed` (image).
+**Shape-A paths (verified — stable codes):** `unauthorized`, `not_found`, `bad_json`, `bad_visibility`, `bad_cover_position`, `create_failed`, `patch_failed`, `flip_failed`, `tag_failed`, `delete_failed`, `list_failed`, `user_lookup_failed`, `user_failed`, `unknown_provider` (auth), `bad_state` (auth), `exchange_failed` (auth), `upsert_failed` (auth), `sign_failed` (auth), `unsupported_media_type` (image), `bad_multipart` (image), `manifest_required` (image), `file_count_mismatch` (image), `open_file` (image), `position_taken` (image), `too_large` (image), `decode_failed` (image), `upload_failed` (image).
 
-**Shape-B paths (verified):**
+**Shape-A quirky variant (verified — `error` value is a free-form string, not a stable code):**
+- ParseManifest errors — `image/handler.go:51` — emits `{"error": err.Error()}` where `err.Error()` is the parse-error string itself (e.g., `"manifest: line 3: invalid client_image_id"`). No `message` key. This is a current API quirk that's frozen into the contract until a future cleanup PR.
+
+**Shape-B paths (verified — stable code + detail message):**
 - `bad_cursor` — `httpapi/artworks.go:87` — `message` is the parse-error string
-- ParseManifest errors — `image/handler.go:51` — `message` is the parse-error string (`error` field is *also* set to the message — see note below)
 - `fingerprint_mismatch` — `image/handler.go:72-75` — `message: "client_image_id reused with different bytes"`
 - `content_type_mismatch` — `image/handler.go:84-87` — `message: "body does not match declared content_type"`
-
-> Quirk: ParseManifest's error path uses `map[string]string{"error": err.Error()}` (no `message` key), so it actually emits **shape A with the error string as the code**. That's a current bug in the API surface but it's frozen into the contract until a follow-up clean-up PR. PR 0.8 captures this as-is.
 
 The Phase 1 implementation reproduces all of these exactly.
 
@@ -307,7 +307,13 @@ After PR 0.8 captures snapshots, Phase 1 must reproduce them **exactly**, post-n
 - **JSON key order — alphabetical, not declaration order.** Current handlers build responses from `map[string]any{...}` and `map[string]string{...}` (e.g., `httpapi/render.go:25-30`, `httpapi/artworks.go:109`). Go's `encoding/json` marshals map keys in sorted order. Phase 1 DTO structs must declare fields **in alphabetical JSON-tag order** to reproduce current bytes. This is enforced via a CI lint pass (`json_field_order`) that parses each DTO struct and verifies tag-name sort.
 - **Trailing newline — non-uniform across paths.** `internal/httpapi/render.go` uses `json.NewEncoder(w).Encode(...)` which emits a trailing `\n`. `internal/auth/handlers.go` uses `w.Write([]byte(rawJSON))` which does not. The contract captures both behaviors. Phase 1's `WriteError` and per-handler response writers must match the source path's current behavior — `auth/adapters/http/handlers.go` uses raw writes for the error paths the current `auth/handlers.go` does; everywhere else uses `Encode`.
 - **Time formatting.** Current code uses `time.Time.UTC().Format(time.RFC3339)` for `created_at`/`published_at` (`httpapi/render.go:53,65`) and `time.RFC3339Nano` for cursor encoding (`httpapi/artworks.go:43,54`). Phase 1 mappers preserve both formats per field.
-- **Nullable fields.** Current code mixes `*string` with `omitempty` (avatar URL omitted when empty) and explicit `null` for some types (cover when nil, `httpapi/artworks.go:55-58`). The actual rendering is captured in snapshots; DTOs must use the same nilness rules.
+- **Nullable fields — keys are always present, values may be `null`.** Verified against `httpapi/render.go:19-31` (`renderUser`) and `httpapi/render.go:50-69` (`renderArtworkSummary`). The current code uses `map[string]any{...}` with `*string` or `*Time` *values*, so `nil` values render as JSON `null` and the key remains present in the output. Examples:
+  - `avatar_url`: always present, `null` when `User.AvatarURL == ""` (`render.go:20-24,29`).
+  - `published_at`: always present, `null` when `Artwork.PublishedAt == nil` (`render.go:51-55,64`).
+  - `cover`: always present, `null` when no images attached (`render.go:56-58,66`).
+  - `description`: included by `getArtworkHandler` only when non-empty (`artworks.go:269-272,288`) — explicit conditional, not `omitempty`.
+  - `next_cursor`: present, `null` when no more pages (`encodeCursor` returns `*string`).
+  Phase 1 DTOs must NOT use `,omitempty` on these fields. If using a struct with `*string` / `*time.Time`, the JSON tag should be plain `json:"avatar_url"` (no omitempty), so a nil value emits `"avatar_url": null` rather than dropping the key.
 - **Two error shapes from §3** — `{"error":"x"}` and `{"error":"x","message":"y"}` — emitted from the appropriate paths.
 
 #### 5.3.2 Dynamic-byte normalization
@@ -564,17 +570,31 @@ adapters/postgres  ← translates gorm.ErrRecordNotFound → domain.ErrNotFound,
 
 ### 7.2 Domain sentinels
 
-Each slice has `<feature>/domain/errors.go`:
+Each slice has `<feature>/domain/errors.go`. Sentinels are split into **HTTP-observable** (which the boundary maps to a status code visible to clients) and **internal-only** (which services *must* translate to a different sentinel before returning, to preserve current bytes).
 
 ```go
 // internal/artwork/domain/errors.go
 var (
-    ErrNotFound         = errors.New("artwork: not found")
+    // HTTP-observable
+    ErrNotFound         = errors.New("artwork: not found")            // → 404 not_found
+    ErrNoImages         = errors.New("artwork: no images attached")   // → service-only, becomes 500/specific code
+
+    // Internal-only — MUST be translated by the service before return
     ErrForbidden        = errors.New("artwork: caller does not own resource")
     ErrAlreadyPublished = errors.New("artwork: already published")
-    ErrNoImages         = errors.New("artwork: no images attached")
 )
 ```
+
+#### 7.2.1 Internal-only sentinel translation rules
+
+The current API does NOT emit 403, and PATCH-with-current-visibility returns 204 (no error). To preserve those bytes, services translate internal sentinels at their public surface:
+
+| Internal sentinel | Service-layer translation | Why |
+|---|---|---|
+| `domain.ErrForbidden` (caller doesn't own resource) | Service returns `domain.ErrNotFound` instead | Verified against `httpapi/artworks.go:174,236,254`: every non-owner access on a private/owned resource collapses to 404 (`err != nil \|\| a.UserID != uid` → `not_found`). The new code preserves this at the service boundary so handlers stay simple. |
+| `domain.ErrAlreadyPublished` (Publish() called on already-public artwork) | `VisibilityService.Flip` returns `nil` (no-op) when target == current visibility | Verified against `internal/artwork/visibility.go:31-33` (early-return) and `httpapi/artworks.go:227` (handler writes 204 unconditionally after flip). The new code's domain method `Publish()` returns `ErrAlreadyPublished` for clarity inside the domain, but the visibility service catches it and returns nil to preserve the 204. |
+
+**These sentinels MUST NOT appear in `WriteError`'s switch (§7.4).** A test verifies that no path maps to 403 or 409 in the contract suite.
 
 ### 7.3 Validation policy
 
@@ -638,23 +658,27 @@ type HTTPError struct {
 }
 
 func WriteError(w http.ResponseWriter, log zerolog.Logger, err error) {
+    // NOTE: domain.ErrForbidden and domain.ErrAlreadyPublished are NOT in this
+    // switch. Per §7.2.1 they are internal-only; services translate them to
+    // ErrNotFound or no-op (nil) before returning. A contract-suite test asserts
+    // no path emits 403 or 409 (other than image upload's 409 fingerprint_mismatch
+    // which is its own image-layer code, not a domain error).
     switch {
     case errors.Is(err, domain.ErrNotFound):
         write(w, 404, HTTPError{Error: "not_found"})
-    case errors.Is(err, domain.ErrForbidden):
-        write(w, 403, HTTPError{Error: "forbidden"})
-    case errors.Is(err, domain.ErrAlreadyPublished):
-        write(w, 409, HTTPError{Error: "already_published"})
     case errors.As(err, &validator.ValidationErrors{}):
         write(w, 400, validationToHTTPError(err))      // see §7.5
     case errors.Is(err, errBadJSON):                          // http-layer parse error
         write(w, 400, HTTPError{Error: "bad_json"})
     case errors.Is(err, errBadCursor):                         // http-layer parse error
         write(w, 400, HTTPError{Error: "bad_cursor", Message: err.Error()})
-    // ... and so on for every code observed in the current code
+    // ... and so on for every code in §3 — note that several codes (e.g.,
+    // create_failed, patch_failed, flip_failed) are operation-name leaks that
+    // get emitted on opaque 500s. The mapping uses operation context from the
+    // wrapped error to decide which code to emit, matching current behavior.
     default:
         log.Error().Err(err).Msg("internal error")
-        write(w, 500, HTTPError{Error: "internal"})    // matches current 500 fallback
+        write(w, 500, HTTPError{Error: "internal_error"})    // confirm exact code via PR 0.8 snapshot
     }
 }
 ```
