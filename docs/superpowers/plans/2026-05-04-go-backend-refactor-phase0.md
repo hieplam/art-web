@@ -2857,6 +2857,11 @@ func (fixedRand) Read(p []byte) (int, error) {
 }
 
 // seedResponse mirrors the /dev/seed response shape (httpapi/devseed.go:57-64).
+//
+// IMPORTANT: AliceCookie / BobCookie are the FULL Set-Cookie value
+// ("auth=<JWT>") — devseed.go:~280 builds them as `"auth=" + jwt`. Strip the
+// "auth=" prefix before using them as a cookie value, otherwise requests
+// produce `Cookie: auth=auth=<JWT>` and JWT verification fails with 401.
 type seedResponse struct {
 	AliceCookie string `json:"aliceCookie"`
 	BobCookie   string `json:"bobCookie"`
@@ -2864,6 +2869,9 @@ type seedResponse struct {
 	PID         string `json:"pId"` // public artwork
 	QID         string `json:"qId"` // private artwork
 }
+
+// jwtFromAuthCookie strips the "auth=" prefix devseed.go writes around the JWT.
+func jwtFromAuthCookie(s string) string { return strings.TrimPrefix(s, "auth=") }
 
 type contractCase struct {
 	name     string
@@ -2934,9 +2942,9 @@ func bootContract(t *testing.T) (string, seedResponse, func(c contractCase) *htt
 		}
 		switch c.viewer {
 		case "owner":
-			req.AddCookie(&http.Cookie{Name: "auth", Value: seed.AliceCookie})
+			req.AddCookie(&http.Cookie{Name: "auth", Value: jwtFromAuthCookie(seed.AliceCookie)})
 		case "other":
-			req.AddCookie(&http.Cookie{Name: "auth", Value: seed.BobCookie})
+			req.AddCookie(&http.Cookie{Name: "auth", Value: jwtFromAuthCookie(seed.BobCookie)})
 		case "anon":
 			// no cookie
 		default:
