@@ -340,8 +340,25 @@ func TestNormalizeHeader_ReplacesAuthCookie(t *testing.T) {
 	h.Add("Set-Cookie", "auth=abc.def.ghi; Path=/; HttpOnly; SameSite=Lax")
 	dbtest.NormalizeHeaders(h)
 	got := h.Get("Set-Cookie")
-	if !strings.Contains(got, "auth=<JWT>") {
-		t.Fatalf("expected auth=<JWT>, got %q", got)
+	want := "auth=<JWT>; Path=/; HttpOnly; SameSite=Lax"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+// TestNormalizeHeader_EmptyAuthCookie_Preserved verifies the cookie-clearing
+// path: ClearAuthCookie writes Set-Cookie: auth=; Max-Age=0; ... When the
+// value is empty, [^;]+ does not match, so the regex leaves the cookie
+// untouched. This is the correct contract behavior — an empty cleared value
+// is part of the byte-strict snapshot, not noise to be normalized away.
+func TestNormalizeHeader_EmptyAuthCookie_Preserved(t *testing.T) {
+	h := http.Header{}
+	h.Add("Set-Cookie", "auth=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
+	dbtest.NormalizeHeaders(h)
+	got := h.Get("Set-Cookie")
+	want := "auth=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax"
+	if got != want {
+		t.Fatalf("empty-value cookie must be preserved verbatim; got %q want %q", got, want)
 	}
 }
 ```
@@ -607,10 +624,15 @@ var snapshotHeaders = map[string]bool{
 func pickHeaders(h http.Header) map[string][]string {
 	out := map[string][]string{}
 	for k, vs := range h {
-		if !snapshotHeaders[http.CanonicalHeaderKey(k)] {
+		// Canonicalize once and use the result for both the allowlist check
+		// AND the storage key. Defends against any production code that ever
+		// stored headers via h["set-cookie"] directly (an anti-pattern but
+		// legal Go), so the snapshot key stays "Set-Cookie".
+		canonical := http.CanonicalHeaderKey(k)
+		if !snapshotHeaders[canonical] {
 			continue
 		}
-		out[k] = append([]string(nil), vs...)
+		out[canonical] = append([]string(nil), vs...)
 	}
 	// Sort header values within each key so multi-value headers don't drift.
 	for _, vs := range out {
@@ -734,6 +756,9 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 		clock = func() time.Time { return opts.FixedNow }
 	}
 	jwts := auth.NewJWT(opts.JWTKey, clock)
+	// Use a fixed URL base so image-ref URLs in responses are stable across
+	// runs; snapshots compare bytes, not actual reachability. The real
+	// httptest port is in srv.URL but never appears in response bodies.
 	urls := auth.NewURLBuilder("http://localhost:8787", opts.SignKey, clock)
 	arts := artwork.NewRepo(pool)
 	images := image.NewRepo(pool)
