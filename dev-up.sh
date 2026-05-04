@@ -52,6 +52,62 @@ step()  { printf "${C_BOLD}▸ %s${C_RESET}\n" "$*"; }
 ok()    { printf "${C_OK}✓ %s${C_RESET}\n" "$*"; }
 fail()  { printf "${C_ERR}✗ %s${C_RESET}\n" "$*" >&2; exit 1; }
 
+# Classify each seed image by aspect ratio so we can flag a portrait-only
+# (or landscape-only) pool that won't exercise the home feed's tier-driven
+# layout. Thresholds mirror tierFor() in web/components/ArtCard.tsx — keep
+# them in sync if either side moves. macOS-only (uses sips); silently
+# skipped on other platforms.
+audit_seed_pool() {
+  local seeds_dir="$SCRIPT_DIR/api/internal/httpapi/seeds"
+  command -v sips >/dev/null 2>&1 || return 0
+  [[ -d "$seeds_dir" ]] || return 0
+  local n_narrow=0 n_square=0 n_wide=0 n_panoramic=0 total=0
+  shopt -s nullglob
+  local f
+  for f in "$seeds_dir"/*.jpg "$seeds_dir"/*.jpeg "$seeds_dir"/*.png; do
+    [[ -f "$f" ]] || continue
+    local dims w h tier
+    dims="$(sips -g pixelWidth -g pixelHeight "$f" 2>/dev/null || true)"
+    w="$(printf '%s' "$dims" | awk '/pixelWidth:/  {print $2}')"
+    h="$(printf '%s' "$dims" | awk '/pixelHeight:/ {print $2}')"
+    [[ -z "$w" || -z "$h" || "$h" -eq 0 ]] && continue
+    tier="$(awk -v w="$w" -v h="$h" 'BEGIN {
+      r = w / h
+      if      (r <= 0.8) print "narrow"
+      else if (r <= 1.2) print "square"
+      else if (r <= 1.7) print "wide"
+      else               print "panoramic"
+    }')"
+    case "$tier" in
+      narrow)    n_narrow=$((n_narrow + 1)) ;;
+      square)    n_square=$((n_square + 1)) ;;
+      wide)      n_wide=$((n_wide + 1)) ;;
+      panoramic) n_panoramic=$((n_panoramic + 1)) ;;
+    esac
+    total=$((total + 1))
+  done
+  shopt -u nullglob
+  if [[ "$total" -eq 0 ]]; then
+    printf "${C_DIM}  seed pool: empty — feed will use procedural fallback${C_RESET}\n"
+    return 0
+  fi
+  printf "${C_DIM}  seed pool composition: %d images, by aspect-ratio tier${C_RESET}\n" "$total"
+  printf "    narrow    (r ≤ 0.8)        %2d\n" "$n_narrow"
+  printf "    square    (0.8 < r ≤ 1.2)  %2d\n" "$n_square"
+  printf "    wide      (1.2 < r ≤ 1.7)  %2d\n" "$n_wide"
+  printf "    panoramic (r > 1.7)        %2d\n" "$n_panoramic"
+  # Hint when any tier is missing — the home feed's variation degenerates
+  # to "all one shape + spotlights" if the pool only fills one bucket.
+  local empty=0
+  [[ "$n_narrow"    -eq 0 ]] && empty=$((empty + 1))
+  [[ "$n_square"    -eq 0 ]] && empty=$((empty + 1))
+  [[ "$n_wide"      -eq 0 ]] && empty=$((empty + 1))
+  [[ "$n_panoramic" -eq 0 ]] && empty=$((empty + 1))
+  if [[ "$empty" -gt 0 ]]; then
+    printf "${C_DIM}  hint: %d tier(s) empty — drop varied-aspect images into seeds/ to balance${C_RESET}\n" "$empty"
+  fi
+}
+
 random_hex_key() {
   if command -v openssl >/dev/null 2>&1; then
     openssl rand -hex 32
@@ -212,6 +268,7 @@ echo "  http://localhost:9001     minio console (minioadmin/minioadmin)"
 echo
 ok "seeded ${SEED_COUNT} bulk artworks (+ public P, private Q)"
 [[ -n "$P_ID" ]] && echo "  public artwork P id: $P_ID"
+audit_seed_pool
 echo
 echo "to sign in as alice, paste this into devtools › application › cookies:"
 echo "  ${C_DIM}name:${C_RESET}  auth"
