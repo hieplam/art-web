@@ -3,7 +3,6 @@ package dbtest
 
 import (
 	"context"
-	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -72,6 +71,11 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 		t.Fatalf("db.New: %v", err)
 	}
 	t.Cleanup(func() { pool.Close() })
+	// NOTE: StartPostgres shares one container via sync.Once. If multiple tests
+	// in the same binary both call BootApp concurrently, the second TruncateAll
+	// will wipe data seeded by the first. Call BootApp once per suite invocation
+	// (not once per test case), or migrate to per-call sub-schemas if isolation
+	// is required. PR 0.7's contract suite only seeds once via /dev/seed.
 	TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
 		_, err := pool.Exec(ctx, sql)
 		return err
@@ -114,12 +118,4 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
 	return srv
-}
-
-// StatusOf is a convenience for callers that only need the status code.
-func StatusOf(resp *http.Response) int {
-	if resp == nil {
-		return 0
-	}
-	return resp.StatusCode
 }
