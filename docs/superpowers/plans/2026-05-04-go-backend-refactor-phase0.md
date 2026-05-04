@@ -22,7 +22,7 @@ The Phase 0 layout is the **current** flat layout — no slice-internal director
 |---|---|---|
 | `api/internal/dbtest/postgres.go` | Modify | Existing testcontainers Postgres. Extend with `StartMinio(t)`. |
 | `api/internal/dbtest/minio.go` | Create | New testcontainers MinIO harness shared with the contract suite. |
-| `api/internal/dbtest/bootapp.go` | Create | `BootApp(t, opts) *http.Server` — boots the in-process API with deterministic clocks/RNG/IDProvider for the contract suite. |
+| `api/internal/dbtest/bootapp.go` | Create | `BootApp(t, opts) *httptest.Server` — boots the in-process API with deterministic clocks/RNG/IDProvider for the contract suite. |
 | `api/internal/dbtest/normalize.go` | Create | Dynamic-byte normalizer (UUID, timestamp, JWT, HMAC, cursor regex replacers). |
 | `api/internal/dbtest/golden.go` | Create | `assertGolden(t, name, resp)` helper with `GOLDEN_UPDATE=1` write-mode. |
 | `api/internal/user/repo_test.go` | Modify | Add slugify, slug-collision, slug-exhaustion, ErrNotFound, lookupExistingOAuth tests. |
@@ -78,7 +78,7 @@ The Phase 0 layout is the **current** flat layout — no slice-internal director
 **Acceptance criteria:**
 - All current tests still pass (`make test` green).
 - New `dbtest.StartMinio(t)` boots a MinIO container and returns endpoint/access keys.
-- New `dbtest.BootApp(t, opts)` returns an `*http.Server` that the contract suite can call.
+- New `dbtest.BootApp(t, opts)` returns an `*httptest.Server` that the contract suite can call.
 - New `dbtest.AssertGolden(t, name, resp)` exists, with `GOLDEN_UPDATE=1` write mode.
 - New `dbtest.Normalize(body, headers)` rewrites dynamic bytes per spec §5.3.2.
 - A self-test in `dbtest/bootapp_test.go` boots the API and asserts `GET /healthz` returns 200.
@@ -650,7 +650,6 @@ package dbtest
 
 import (
 	"context"
-	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -719,6 +718,11 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 		t.Fatalf("db.New: %v", err)
 	}
 	t.Cleanup(func() { pool.Close() })
+	// NOTE: StartPostgres shares one container via sync.Once. If multiple tests
+	// in the same binary both call BootApp concurrently, the second TruncateAll
+	// will wipe data seeded by the first. Call BootApp once per suite invocation
+	// (not once per test case), or migrate to per-call sub-schemas if isolation
+	// is required. PR 0.7's contract suite only seeds once via /dev/seed.
 	TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
 		_, err := pool.Exec(ctx, sql)
 		return err
@@ -761,14 +765,6 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
 	return srv
-}
-
-// StatusOf is a convenience for callers that only need the status code.
-func StatusOf(resp *http.Response) int {
-	if resp == nil {
-		return 0
-	}
-	return resp.StatusCode
 }
 ```
 
