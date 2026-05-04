@@ -3,7 +3,6 @@ package dbtest_test
 import (
 	"encoding/base64"
 	"net/http"
-	"strings"
 	"testing"
 
 	"local/art-web/api/internal/dbtest"
@@ -81,7 +80,24 @@ func TestNormalizeHeader_ReplacesAuthCookie(t *testing.T) {
 	h.Add("Set-Cookie", "auth=abc.def.ghi; Path=/; HttpOnly; SameSite=Lax")
 	dbtest.NormalizeHeaders(h)
 	got := h.Get("Set-Cookie")
-	if !strings.Contains(got, "auth=<JWT>") {
-		t.Fatalf("expected auth=<JWT>, got %q", got)
+	want := "auth=<JWT>; Path=/; HttpOnly; SameSite=Lax"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+// TestNormalizeHeader_EmptyAuthCookie_Preserved verifies the cookie-clearing
+// path: ClearAuthCookie writes Set-Cookie: auth=; Max-Age=0; ... When the
+// value is empty, [^;]+ does not match, so the regex leaves the cookie
+// untouched. This is the correct contract behavior — an empty cleared value
+// is part of the byte-strict snapshot, not noise to be normalized away.
+func TestNormalizeHeader_EmptyAuthCookie_Preserved(t *testing.T) {
+	h := http.Header{}
+	h.Add("Set-Cookie", "auth=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax")
+	dbtest.NormalizeHeaders(h)
+	got := h.Get("Set-Cookie")
+	want := "auth=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax"
+	if got != want {
+		t.Fatalf("empty-value cookie must be preserved verbatim; got %q want %q", got, want)
 	}
 }

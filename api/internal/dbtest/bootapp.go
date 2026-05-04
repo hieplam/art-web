@@ -87,6 +87,9 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 		clock = func() time.Time { return opts.FixedNow }
 	}
 	jwts := auth.NewJWT(opts.JWTKey, clock)
+	// Use a fixed URL base so image-ref URLs in responses are stable across
+	// runs; snapshots compare bytes, not actual reachability. The real
+	// httptest port is in srv.URL but never appears in response bodies.
 	urls := auth.NewURLBuilder("http://localhost:8787", opts.SignKey, clock)
 	arts := artwork.NewRepo(pool)
 	images := image.NewRepo(pool)

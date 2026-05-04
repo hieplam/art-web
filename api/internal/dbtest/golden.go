@@ -97,10 +97,15 @@ var snapshotHeaders = map[string]bool{
 func pickHeaders(h http.Header) map[string][]string {
 	out := map[string][]string{}
 	for k, vs := range h {
-		if !snapshotHeaders[http.CanonicalHeaderKey(k)] {
+		// Canonicalize once and use the result for both the allowlist check
+		// AND the storage key. Defends against any production code that ever
+		// stored headers via h["set-cookie"] directly (an anti-pattern but
+		// legal Go), so the snapshot key stays "Set-Cookie".
+		canonical := http.CanonicalHeaderKey(k)
+		if !snapshotHeaders[canonical] {
 			continue
 		}
-		out[k] = append([]string(nil), vs...)
+		out[canonical] = append([]string(nil), vs...)
 	}
 	// Sort header values within each key so multi-value headers don't drift.
 	for _, vs := range out {
