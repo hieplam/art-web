@@ -221,8 +221,20 @@ main {
   transition: outline-color var(--t-base) var(--ease-out),
               transform var(--t-base) var(--ease-out);
   will-change: transform;
-  /* Grid cells are uniform squares; spotlight cells (below) are 2×2 squares. */
+  /* Mobile fallback: uniform squares so 2-col layout stays predictable.
+     Tier-driven shapes are layered on at >=640px below. */
   aspect-ratio: 1 / 1;
+}
+
+/* Tier-driven cell shapes — variation comes from each artwork's own
+   aspect ratio, computed in ArtCard.tsx. Only kicks in once the grid
+   is wide enough (>=640px) to host non-square cells without a single
+   wide card eating an entire mobile row. Spotlight overrides any tier. */
+@media (min-width: 640px) {
+  .art-card[data-tier="narrow"]    { aspect-ratio: 1 / 2;  grid-row: span 2; }
+  .art-card[data-tier="square"]    { aspect-ratio: 1 / 1; }
+  .art-card[data-tier="wide"]      { aspect-ratio: 2 / 1;  grid-column: span 2; }
+  .art-card[data-tier="panoramic"] { aspect-ratio: 3 / 1;  grid-column: span 3; }
 }
 
 .art-card-image {
@@ -243,6 +255,9 @@ main {
   .art-card-spotlight {
     grid-column: span 2;
     grid-row: span 2;
+    /* Spotlight cells are always 2×2 squares regardless of the underlying
+       artwork's tier — overrides the tier-driven aspect-ratio above. */
+    aspect-ratio: 1 / 1;
   }
 }
 
