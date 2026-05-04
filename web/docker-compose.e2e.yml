@@ -44,12 +44,12 @@ services:
     env_file:
       - path: ../api/.env.dev
         required: false
+      - path: ./.env.local
+        required: true
     environment:
       ADDR: ":8080"
       APP_ENV: test
       DATABASE_URL: postgres://art:art@postgres:5432/artweb?sslmode=disable
-      JWT_SIGNING_KEY: "3031323334353637383961626364656630313233343536373839616263646566"
-      WORKER_SIGNING_KEY: "3031323334353637383961626364656630313233343536373839616263646566"
       CDN_ORIGIN: "http://localhost:8787"
       FRONTEND_URL: "http://localhost:3000/"
       S3_ENDPOINT: "http://minio:9000"
@@ -71,9 +71,11 @@ services:
     build:
       context: ../worker
       dockerfile: Dockerfile.e2e
+    env_file:
+      - path: ./.env.local
+        required: true
     environment:
       PORT: "8787"
-      WORKER_SIGNING_KEY: "3031323334353637383961626364656630313233343536373839616263646566"
       S3_ENDPOINT: "http://minio:9000"
       S3_ACCESS_KEY_ID: "minioadmin"
       S3_SECRET_ACCESS_KEY: "minioadmin"

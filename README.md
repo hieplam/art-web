@@ -32,7 +32,7 @@ The fastest path is the bring-up script at the project root:
 ./dev-up.sh
 ```
 
-It wipes prior data, rebuilds the api/worker/web images, waits for each service's public health endpoint, seeds 50 artworks, flushes the web ISR cache, and prints the alice cookie ready for paste-into-DevTools. Dependency graph: Postgres → MinIO → bucket-init → API → Worker → Web, gated by health checks.
+It generates local signing keys in `web/.env.local`, wipes prior data, rebuilds the api/worker/web images, waits for each service's public health endpoint, seeds 50 artworks, flushes the web ISR cache, and prints the alice cookie ready for paste-into-DevTools. Dependency graph: Postgres → MinIO → bucket-init → API → Worker → Web, gated by health checks.
 
 Open <http://localhost:3000> when it finishes.
 
@@ -45,6 +45,7 @@ Open <http://localhost:3000> when it finishes.
 | `--keep-data` | skip the destructive `down -v` | iterating on UI without re-seeding |
 | `--no-build` | reuse already-built images | fastest path when only seed code changed |
 | `--no-flush` | skip the web cache flush | when you don't need the home feed to update immediately |
+| `--init-env` | manage `web/.env.local` only, then exit | manual compose/native setup |
 | `--help` | print the flag list | — |
 
 Examples:
@@ -60,6 +61,9 @@ Examples:
 If you want to debug or understand the flow, the equivalent manual sequence:
 
 ```bash
+# 0. Rotate local signing keys for the API + Worker
+./dev-up.sh --init-env
+
 # 1. Wipe containers + named volumes (Postgres + MinIO)
 docker compose -f web/docker-compose.e2e.yml down -v --remove-orphans
 
@@ -78,6 +82,8 @@ curl -X POST 'http://localhost:8080/dev/seed?many=50'
 docker compose -f web/docker-compose.e2e.yml exec -T web sh -c 'rm -rf .next/cache'
 docker compose -f web/docker-compose.e2e.yml restart web
 ```
+
+Step 0 creates or rotates `web/.env.local`, which is gitignored. A normal destructive `./dev-up.sh` rotates these keys before the stack starts; `--keep-data` preserves the existing keys so cookies and signed image URLs remain valid while you iterate.
 
 Step 5 exists because the home page is cached for 60 s (`revalidate = 60` in `web/app/page.tsx`). Without flushing, the feed reports "no work yet" for up to a minute after seeding. The script automates this; if you skip it, just wait a minute.
 
@@ -145,6 +151,9 @@ Run each service natively for fast feedback. Start infra with compose, then nati
 **Prereqs:** Docker, Go 1.25, [Bun](https://bun.com) 1.x.
 
 ```bash
+# 0. Generate local signing keys if web/.env.local does not exist yet
+./dev-up.sh --init-env --keep-data
+
 # 1. Infra only
 cd web
 docker compose -f docker-compose.e2e.yml up postgres minio minio-init
@@ -153,10 +162,11 @@ docker compose -f docker-compose.e2e.yml up postgres minio minio-init
 ```bash
 # 2. API
 cd api
+set -a
+source ../web/.env.local
+set +a
 export APP_ENV=test
 export DATABASE_URL='postgres://art:art@localhost:5432/artweb?sslmode=disable'
-export JWT_SIGNING_KEY='3031323334353637383961626364656630313233343536373839616263646566'
-export WORKER_SIGNING_KEY='3031323334353637383961626364656630313233343536373839616263646566'
 export S3_ENDPOINT='http://localhost:9000'
 export R2_ACCESS_KEY_ID=minioadmin
 export R2_ACCESS_KEY_SECRET=minioadmin
@@ -178,8 +188,6 @@ cd web
 bun install
 bun run dev          # next dev → :3000
 ```
-
-> **Note**: the dev keys above are 32-byte fixtures from the compose file — fine for local, never use in production.
 
 ---
 
