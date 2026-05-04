@@ -240,27 +240,50 @@ Phase 1 — "Big bang" (single branch, single PR, internally a sequence of small
 
 ### 5.2 Contract test matrix
 
-For every endpoint in the current `internal/httpapi/router.go`, the suite runs the cartesian product of:
+For every endpoint in the current `internal/httpapi/router.go` **except `/dev/seed`** (see §5.2.1 for exclusion rationale), the suite runs the cartesian product of:
 
 | Axis | Values |
 |---|---|
 | Auth state | anon, self-user, other-user |
-| Resource state | empty, single, paginated, public/private mix, soft-deleted |
-| Request shape | minimal-valid, full-valid, boundary (max len, 0), malformed JSON |
-| Expected status | 200, 201, 204, 400, 401, 403, 404, 409, 422 |
+| Resource state | empty, single, paginated, public/private mix |
+| Request shape | minimal-valid, full-valid, boundary (max len, 0), malformed JSON, malformed multipart, wrong Content-Type |
+| Expected status | 200, 201, 204, **302** (auth redirects), 400, 401, 403, 404, 409, **412** (image position taken), **415** (image bad content-type), 422, 500, **502** (oauth exchange failed) |
+
+**Status-code provenance** (verified against current code):
+
+| Status | Path | Source |
+|---|---|---|
+| 302 | `GET /auth/{provider}/start`, `GET /auth/{provider}/callback` | `auth/handlers.go` redirects |
+| 412 | `POST /artworks/{id}/images` | `image/handler.go` `ErrPositionTaken` |
+| 415 | `POST /artworks/{id}/images` | `image/handler.go` non-multipart Content-Type |
+| 422 | `POST /artworks/{id}/images` | `image/handler.go` `ErrTooLarge`, `ErrContentTypeMismatch`, `decode_failed` |
+| 502 | `GET /auth/{provider}/callback` | `auth/handlers.go` OAuth `exchange_failed` |
+
+Resource states **exclude "soft-deleted"** because the schema does hard deletes (verified against `migrations/0001_init.up.sql` — no `deleted_at` columns; only `ON DELETE CASCADE` foreign keys).
+
+#### 5.2.1 `/dev/seed` is excluded from the HTTP contract
+
+The current router mounts `/dev/seed` only when `AppEnv == "test"` (`internal/httpapi/router.go:63-70`). It is a development/testing utility, not part of the product API surface that the frontend or external clients depend on.
+
+- **PR 0.5** still adds direct tests for `/dev/seed` to lift `httpapi` package coverage to ≥ 80%, but those tests are not part of the byte-strict contract suite.
+- **PR 0.7 / PR 0.8** do not snapshot `/dev/seed`.
+- **Phase 1** is permitted to drop `/dev/seed` from the router (functionality moves to `cmd/seeder`).
+
+This is the only documented gap between "every router endpoint" and "every contract endpoint."
 
 Each test:
 1. Boots a fresh `testcontainers/postgres` + `testcontainers/minio` instance.
 2. Runs migrations (`golang-migrate`).
 3. Seeds via `cmd/seeder` binary or `infrastructure/testing/fixtures/*.sql`.
-4. Boots the API in-process via the helper `infrastructure/testing.BootApp(t)`.
-5. Issues an HTTP request and snapshots:
+4. Boots the API in-process via the helper `infrastructure/testing.BootApp(t)` with deterministic sources injected (see §5.3.2).
+5. Issues an HTTP request, normalizes dynamic bytes (see §5.3.2), and snapshots:
    - Status code
-   - Selected response headers (Content-Type, Cache-Control, Set-Cookie)
-   - Full JSON body (byte-strict)
+   - Selected response headers (Content-Type, Cache-Control, Set-Cookie — with cookie value normalized)
+   - Full JSON body (byte-strict, post-normalization)
 
 ```go
 func assertGolden(t *testing.T, name string, got *http.Response) {
+    body := normalizeDynamicBytes(got.Body)   // see §5.3.2
     // First run with GOLDEN_UPDATE=1: writes golden/<name>.json
     // Subsequent runs: byte-compare; diff fails the test
 }
@@ -268,13 +291,35 @@ func assertGolden(t *testing.T, name string, got *http.Response) {
 
 ### 5.3 Snapshot strictness — byte-strict
 
-After PR 0.8 captures snapshots, Phase 1 must reproduce them **exactly**, including:
-- `time.Time` formatted as RFC3339 with UTC offset
-- Nullable fields rendered consistently (current code uses `*string` + `omitempty` for some, explicit `null` for others — capture as-is)
-- JSON key order (Go's `encoding/json` preserves declaration order — DTOs must keep field order)
-- The two error shapes from §3 — `{"error":"x"}` and `{"error":"x","message":"y"}` — emitted from the appropriate paths
+After PR 0.8 captures snapshots, Phase 1 must reproduce them **exactly**, post-normalization (see §5.3.2). Encoding details that matter:
 
-To keep GORM compatible:
+#### 5.3.1 Static encoding rules
+
+- **JSON key order — alphabetical, not declaration order.** Current handlers build responses from `map[string]any{...}` and `map[string]string{...}` (e.g., `httpapi/render.go:25-30`, `httpapi/artworks.go:109`). Go's `encoding/json` marshals map keys in sorted order. Phase 1 DTO structs must declare fields **in alphabetical JSON-tag order** to reproduce current bytes. This is enforced via a CI lint pass (`json_field_order`) that parses each DTO struct and verifies tag-name sort.
+- **Trailing newline — non-uniform across paths.** `internal/httpapi/render.go` uses `json.NewEncoder(w).Encode(...)` which emits a trailing `\n`. `internal/auth/handlers.go` uses `w.Write([]byte(rawJSON))` which does not. The contract captures both behaviors. Phase 1's `WriteError` and per-handler response writers must match the source path's current behavior — `auth/adapters/http/handlers.go` uses raw writes for the error paths the current `auth/handlers.go` does; everywhere else uses `Encode`.
+- **Time formatting.** Current code uses `time.Time.UTC().Format(time.RFC3339)` for `created_at`/`published_at` (`httpapi/render.go:53,65`) and `time.RFC3339Nano` for cursor encoding (`httpapi/artworks.go:43,54`). Phase 1 mappers preserve both formats per field.
+- **Nullable fields.** Current code mixes `*string` with `omitempty` (avatar URL omitted when empty) and explicit `null` for some types (cover when nil, `httpapi/artworks.go:55-58`). The actual rendering is captured in snapshots; DTOs must use the same nilness rules.
+- **Two error shapes from §3** — `{"error":"x"}` and `{"error":"x","message":"y"}` — emitted from the appropriate paths.
+
+#### 5.3.2 Dynamic-byte normalization
+
+Several response bytes are non-deterministic in production (UUIDs, JWTs, signed-URL HMACs, random OAuth state, DB `now()` timestamps). The contract harness handles each via injection-where-possible-otherwise-normalization:
+
+| Dynamic source | Strategy |
+|---|---|
+| `time.Now` for JWT issuance | **Inject** — `auth/jwt.go` already accepts a `time.Now func() time.Time`. Tests pass a fixed-clock provider. |
+| `time.Now` for signed URL expiry | **Inject** — `auth/imgurl.go` (`URLBuilder`) already takes `time.Now func() time.Time`. Tests use the same fixed clock. |
+| `uuid.New()` (artwork/user/image IDs, OAuth state) | **Inject** — Phase 0 PR 0.1 introduces a `IDProvider` interface with a deterministic counter implementation for tests; production uses `uuid.New()`. Existing call sites are switched in PR 0.1 as a no-op refactor. |
+| OAuth state cookie value | **Inject** via `IDProvider` (above). Cookie raw bytes are deterministic in tests. |
+| DB `now()` timestamps in `created_at`/`updated_at` | **Normalize** — Postgres `now()` is not easily injectable. Snapshot normalizer regex-replaces `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z` with `<TIMESTAMP>` before compare. |
+| Signed URL HMAC suffix | **Normalize** — even with injected clock, the HMAC depends on the signing key (which is per-environment). Normalizer replaces `\?sig=[0-9a-f]+&exp=\d+` with `?sig=<SIG>&exp=<EXP>`. |
+| JWT cookie value | **Normalize** — Set-Cookie header value for `auth=` is replaced with `auth=<JWT>` in normalized snapshots. |
+
+The normalizer is implemented once in `internal/infrastructure/testing/normalize.go` and applied uniformly. Snapshot golden files store the **post-normalization** bytes, so a Phase 1 implementation that emits a different UUID format would still fail (the normalizer would not match the new format).
+
+#### 5.3.3 GORM compatibility
+
+To keep GORM compatible with the locked snapshots:
 - Pin GORM driver to its pgx-backed implementation (`gorm.io/driver/postgres` wraps pgx).
 - Use explicit GORM type tags: `Type:"timestamp(6) with time zone"` etc., matching migrations.
 - Forbid `db.AutoMigrate` (see §10).
@@ -294,13 +339,15 @@ To keep GORM compatible:
 | `internal/infrastructure/...` | excluded | covered transitively by contract suite |
 | `pkg/signing/` | yes (target ~95%) | focused unit tests |
 
-The 80% threshold is the **statement-weighted average across counted subpackages per slice**. CI command per slice:
+The 80% threshold is the **statement-weighted average across counted subpackages per slice**. CI command per slice (Phase 1 layout):
 
 ```bash
-go test -coverpkg=./internal/auth/... -coverprofile=auth.out -tags=integration \
-        $(go list ./internal/auth/... | grep -v /ports)
+PKGS=$(go list ./internal/auth/... | grep -v /ports | grep -v /mocks | tr '\n' ',' | sed 's/,$//')
+go test -coverpkg=$PKGS -coverprofile=auth.out -tags=integration $PKGS
 go tool cover -func=auth.out | tail -1
 ```
+
+Both `/ports` (interfaces — no statements) and `/mocks` (generated code — would skew coverage) must be excluded from **both** the `-coverpkg` instrumentation list and the test-run package list.
 
 ### 5.5 Mocks
 
@@ -517,17 +564,42 @@ var (
 
 ### 7.3 Validation policy
 
-- **DTO** (`adapters/http/dto.go`) validates **shape only**: presence, length, regex, range, enum. Produces 400 with field details. Uses `go-playground/validator/v10`.
+- **DTO** (`adapters/http/dto.go`) validates **shape only**: presence, length, regex, range, enum. Produces 400 with the current API's error code. Uses `go-playground/validator/v10`.
 - **Domain constructor** validates **cross-field invariants only**: things that can't be a single-field tag. Produces domain sentinel errors.
 - **No overlap.** A single-field rule lives in exactly one place: the DTO.
 
-```go
-type CreateArtworkRequest struct {
-    Title      string   `json:"title"      validate:"required,min=1,max=200"`
-    Tags       []string `json:"tags"       validate:"max=20,dive,min=2,max=40,alphanumdash"`
-    Visibility string   `json:"visibility" validate:"required,oneof=public private"`
-}
+#### 7.3.1 Phase 1 validation must mirror current behavior, not "ideal" behavior
 
+The current handlers do **minimal** input validation. Verified against `internal/httpapi/artworks.go`:
+
+| Endpoint | Currently validated | Currently NOT validated |
+|---|---|---|
+| `POST /artworks` (create) | `bad_json` (decode), `bad_visibility` (`oneof`), defaults `Visibility=""` to `"private"` | `Title` empty, `Title` length, `Tags` length/format, `Description` length |
+| `PATCH /artworks/{id}` | `bad_json`, `bad_visibility`, `bad_cover_position` (`< 0`) | All field lengths, tag formats |
+| `POST /artworks/{id}/images` | `unsupported_media_type`, `bad_multipart`, `manifest_required`, `file_count_mismatch` | (most edge cases via image service errors) |
+
+The Phase 1 DTOs and validator config must **reproduce exactly this validation surface** — no stricter, no looser. Adding `required` or `max=200` to a field that today accepts any string would generate a 400 where today the request succeeds. That's a contract break.
+
+Illustrative mapping (the actual validator tags are confirmed against PR 0.8 snapshots):
+
+```go
+// internal/artwork/adapters/http/dto.go — matches current behavior
+type CreateArtworkRequest struct {
+    Description string   `json:"description"`                               // no validation
+    Tags        []string `json:"tags"`                                      // no validation
+    Title       string   `json:"title"`                                     // no validation
+    Visibility  string   `json:"visibility" validate:"omitempty,oneof=public private"`  // omitempty preserves the empty-string default-to-private behavior
+}
+// Note: alphabetical declaration order (per §5.3.1).
+// "Visibility = '' → defaults to 'private'" is handled in the handler post-validation,
+// matching httpapi/artworks.go:150-152 today.
+```
+
+If the team later wants stricter validation, that ships as a follow-up `phase-0-behavior-change` PR (per §5.6) — captured by snapshots, then locked. **It is not part of this refactor's scope.**
+
+#### 7.3.2 Domain invariants are unchanged in scope
+
+```go
 func (a *Artwork) Publish() error {
     if a.Visibility == VisibilityPublic { return ErrAlreadyPublished }
     if len(a.Images) == 0                { return ErrNoImages }
@@ -535,6 +607,8 @@ func (a *Artwork) Publish() error {
     return nil
 }
 ```
+
+Domain invariants are NEW logic (the current code has no centralized "publish" rule), but they sit **inside** the existing flip path. `Publish()` is called by `service.VisibilityService` which today is `internal/artwork/visibility.go`. The current code has no equivalent of `ErrAlreadyPublished` — it returns `nil` early when the visibility already matches (`visibility.go:31-33`). Phase 1 must preserve that no-op behavior at the HTTP boundary: a `PATCH` with `visibility=current_value` returns 204 today and must return 204 in Phase 1, even though the new domain method returns `ErrAlreadyPublished`. The service translates `ErrAlreadyPublished` to a no-op 204 to match.
 
 ### 7.4 HTTP error mapping — locked to current bytes
 
@@ -617,46 +691,112 @@ func DB(ctx context.Context, fallback *gorm.DB) *gorm.DB {
 }
 ```
 
-Every repo method calls `database.DB(ctx, r.db)` to get the active GORM handle (transactional or not). Services compose multiple repos in a single `WithinTx`:
+Every repo method calls `database.DB(ctx, r.db)` to get the active GORM handle (transactional or not).
+
+#### 7.6.1 The visibility-flip flow — preserves current "storage-first, DB-within-tx, compensate-on-failure" semantics
+
+Verified against current `internal/artwork/visibility.go:23-93`. The current code's order is:
+
+```
+1. Read images (artwork_images rows) — outside any transaction
+2. Move ALL files in storage to the new visibility prefix
+   - Track `completed []flipMove` as each succeeds
+   - On any move failure: rollback completed moves (best-effort), return error.
+     No DB writes have happened yet.
+3. Begin DB transaction
+4. UPDATE artwork_images SET storage_key = new_path  (within tx)
+5. UPDATE artworks SET visibility = target          (within tx)
+6. COMMIT
+   - On any DB error or commit failure: rollback storage moves (best-effort), return error.
+7. RollbackLog fires only when a *compensating* storage rollback move itself fails
+   (i.e., we tried to undo and the undo failed — a leak).
+```
+
+The Phase 1 service preserves this exact ordering. **DB-tx-first is incompatible with "no observable side effects"** because a successful DB commit followed by a failed storage move would leak a published artwork with files still in the private prefix (a state the current code never produces).
 
 ```go
-func (s *VisibilityService) Publish(ctx context.Context, id uuid.UUID) error {
-    var art *domain.Artwork
-    err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
-        var err error
-        if art, err = s.arts.Get(ctx, id); err != nil       { return err }
-        if err = art.Publish(); err != nil                  { return err }
-        if err = s.arts.Save(ctx, art); err != nil          { return err }
-        return s.tags.IncrementUsage(ctx, art.Tags)
-    })
-    if err != nil { return err }
+// internal/artwork/service/visibility.go
+func (s *VisibilityService) Flip(ctx context.Context, artworkID string, target string) error {
+    if target != "public" && target != "private" { return ErrBadTarget }
 
-    // Outside DB tx — storage is a separate consistency domain.
-    if err := s.storage.Move(ctx, art.PrivatePath(), art.PublicPath()); err != nil {
-        s.rollback.Report(ctx, art.ID, err)   // matches current artwork.RollbackLog contract
+    art, err := s.arts.Get(ctx, artworkID)
+    if err != nil { return err }
+    if art.Visibility == target { return nil }   // matches current early-return at visibility.go:31-33
+
+    // Step 1 + 2: read images, move storage. NO DB tx open yet.
+    moves, err := s.arts.PendingFlipMoves(ctx, artworkID, art.Visibility, target)
+    if err != nil { return err }
+    completed, err := s.movesApply(ctx, moves)
+    if err != nil {
+        s.movesRollback(ctx, completed)   // best-effort
+        return err
+    }
+
+    // Step 3-6: DB tx that updates artwork_images.storage_key + artworks.visibility.
+    err = s.tx.WithinTx(ctx, func(ctx context.Context) error {
+        if err := s.arts.UpdateImageStorageKeys(ctx, completed); err != nil { return err }
+        return s.arts.SetVisibility(ctx, artworkID, target)
+    })
+    if err != nil {
+        s.movesRollback(ctx, completed)   // best-effort; logs each failed undo via RollbackReporter
         return err
     }
     return nil
+}
+
+func (s *VisibilityService) movesRollback(ctx context.Context, completed []flipMove) {
+    for i := len(completed) - 1; i >= 0; i-- {
+        m := completed[i]
+        if err := s.storage.Move(ctx, m.dst, m.src); err != nil {
+            s.rollback.Report(ctx, m.id, err)   // matches current RollbackLog semantics:
+                                                // fired only when the *undo* itself fails (a leak)
+        }
+    }
+}
+```
+
+#### 7.6.2 Other multi-repo transactions
+
+For flows that are purely DB-bound (e.g., create-artwork-with-tags), the `WithinTx` pattern is straightforward — no storage involvement, no compensating actions:
+
+```go
+func (s *ArtworkService) Create(ctx context.Context, uid string, req CreateInput) (string, error) {
+    var id string
+    err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
+        var err error
+        id, err = s.arts.Insert(ctx, uid, req)
+        if err != nil { return err }
+        if len(req.Tags) > 0 {
+            return s.tags.SetTags(ctx, id, req.Tags)
+        }
+        return nil
+    })
+    return id, err
 }
 ```
 
 ### 7.7 RollbackReporter (preserves `artwork.RollbackLog`)
 
-The current code uses a global `artwork.RollbackLog = func(err error) { log.Error(...) }` set in `cmd/api/main.go`. Phase 1 replaces this with a Wire-injected interface:
+The current code uses a package-level global `artwork.RollbackLog = func(err error) { ... }` (`internal/artwork/visibility.go:104`, set in `cmd/api/main.go:74`). It fires **only when a compensating storage-rollback move itself fails** — i.e., the primary op failed, we tried to undo, and the undo failed (a leak). It does NOT fire on the primary op's failure.
+
+Phase 1 replaces this with a Wire-injected interface preserving the same fire condition:
 
 ```go
 // internal/artwork/ports/rollback.go
 type RollbackReporter interface {
-    Report(ctx context.Context, artworkID uuid.UUID, err error)
+    // Report is invoked when a compensating storage-rollback move fails after a
+    // primary operation has already failed. The artwork may now have storage
+    // objects in an inconsistent location relative to its DB state.
+    Report(ctx context.Context, imageID string, err error)
 }
 
-// Default implementation in adapters/log:
-func (r *zerologRollbackReporter) Report(ctx context.Context, id uuid.UUID, err error) {
-    r.log.Error().Err(err).Str("artwork_id", id.String()).Msg("flip rollback")
+// internal/artwork/adapters/log/rollback.go — default implementation
+func (r *zerologRollbackReporter) Report(ctx context.Context, imageID string, err error) {
+    r.log.Error().Err(err).Str("image_id", imageID).Msg("flip rollback")
 }
 ```
 
-A contract test triggers this path (mocked storage failure post-commit) and asserts the artwork ends in the inconsistent-but-recoverable state today's code produces.
+A contract test triggers this path (mocked storage `Move` returns ok on forward direction, fails on reverse direction; DB tx then fails to commit; rollback fires for each completed forward move) and asserts the reporter fires once per image with the same fields today's code logs.
 
 ### 7.8 Mappers — pure on already-loaded models
 
@@ -700,10 +840,10 @@ Each error appears in logs **exactly once**. A grep for `log/slog` after Phase 1
 | **0.2** `user` 63.8 → 80 | Tests for: slug uniqueness conflict, `Get(404)`, profile update no-fields, soft-delete read. | `go test ./internal/user/... -cover` ≥ 80%. |
 | **0.3** `storage` 69.1 → 80 | Tests for: r2 multi-part edge cases, localfs path-traversal guard, missing-bucket error, content-type round-trip. | `go test ./internal/storage/... -cover` ≥ 80%. |
 | **0.4** `image` 69.7 → 80 | Tests for: orphan cleanup race, content-type mismatch, signed-URL expiry boundary, blurhash error path. | `go test ./internal/image/... -cover` ≥ 80%. |
-| **0.5** `httpapi` 69.2 → 80 | Tests for: privacy matrix completeness, devseed gated routes, error responses for every 4xx path. | `go test ./internal/httpapi/... -cover` ≥ 80%. |
+| **0.5** `httpapi` 69.2 → 80 | Tests for: privacy matrix completeness, devseed gated routes (coverage only — `/dev/seed` is not part of the byte-strict contract per §5.2.1), error responses for every 4xx path including 412/415/422 from image upload. | `go test ./internal/httpapi/... -cover` ≥ 80%. |
 | **0.6** `db` + `artwork` top-up | `artwork` 78.3 → 80 (visibility transition edge cases) — required for the slice's 80% gate. `db` 75 → 80 is opportunistic (infrastructure is excluded from the gate per §5.4) but worth doing while the harness work is fresh. | `artwork` ≥ 80%; `db` ≥ 80% best-effort. |
-| **0.7** Build the HTTP contract matrix | Add the cartesian-matrix test file under `internal/infrastructure/testing/contract/`. **No goldens yet.** Tests fail without snapshots — that's expected. | Reviewers focus on whether the matrix is *complete and correct*. |
-| **0.8** Lock the snapshots | Run with `GOLDEN_UPDATE=1`; commit `golden/*.json`; activate `contract_suite` as a required CI check; add CODEOWNERS protection on `golden/`. Build the validation translator table by inspecting captured bytes. | `contract_suite` passes; `golden/` is non-empty; CODEOWNERS blocks unauthorized changes. |
+| **0.7** Build the HTTP contract matrix + deterministic injection | Add the cartesian-matrix test file under `internal/infrastructure/testing/contract/`. Add `IDProvider` interface and switch existing UUID call sites to use it (no-op refactor — production uses `uuid.New()`, tests use a deterministic counter). Add normalizer (`internal/infrastructure/testing/normalize.go`) per §5.3.2. **No goldens yet.** Tests fail without snapshots — that's expected. | Reviewers focus on (a) matrix completeness, (b) `IDProvider` adoption is a no-op, (c) normalizer rules are correct. |
+| **0.8** Lock the snapshots | Run with `GOLDEN_UPDATE=1`; commit `golden/*.json`; activate `contract_suite` as a required CI check; add CODEOWNERS protection on `golden/`. Build the validator-translator table (§7.5) and confirm validator-config table (§7.3.1) by inspecting captured bytes. Confirm `/dev/seed` is excluded from the snapshot set per §5.2.1. | `contract_suite` passes; `golden/` is non-empty; CODEOWNERS blocks unauthorized changes; `/dev/seed` snapshots are absent. |
 
 Bug fixes between coverage uplifts and PR 0.8 lock land as separate `phase-0-behavior-change` PRs (see §5.6).
 
@@ -782,6 +922,7 @@ Mappers ship in the GORM commit because they map between domain types and GORM m
 | `smoke_test` | `cmd/api/main_test.go` boots `InitializeApp`, makes one request per slice, shuts down | Boot/runtime error |
 | `existing_unit_tests` | Re-run after each commit, not just at HEAD | Bisect to offending commit |
 | `mockery_check` | `mockery --check` confirms mocks match interfaces | Re-run `make mocks` and commit |
+| `json_field_order` | DTO struct fields are declared in alphabetical JSON-tag order (per §5.3.1) | Re-order fields; matches current map-based output |
 
 ### 10.2 GORM AutoMigrate is forbidden
 
