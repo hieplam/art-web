@@ -86,7 +86,7 @@ api/
 - **Object storage:** AWS SDK v2 → R2 / MinIO / local filesystem
 - **JWT:** `golang-jwt/jwt/v5`
 
-### Current error response shape (locked from `internal/httpapi/`)
+### Current error response shape (locked from current handlers)
 
 The current API emits errors as JSON in two distinct shapes. Both are part of the contract:
 
@@ -94,14 +94,23 @@ The current API emits errors as JSON in two distinct shapes. Both are part of th
 // Shape A — most paths
 { "error": "<snake_case_code>" }
 
-// Shape B — parse/cursor errors with detail
-{ "error": "<snake_case_code>", "message": "<original error string>" }
+// Shape B — paths that surface a detail message
+{ "error": "<snake_case_code>", "message": "<detail>" }
 ```
 
-Content-Type: `application/json; charset=utf-8`. Observed code values include:
-`unauthorized`, `not_found`, `bad_json`, `bad_cursor`, `bad_visibility`, `bad_cover_position`,
-`create_failed`, `patch_failed`, `flip_failed`, `tag_failed`, `delete_failed`,
-`list_failed`, `user_lookup_failed`. The Phase 1 implementation reproduces these exactly.
+Content-Type: `application/json; charset=utf-8`.
+
+**Shape-A paths (verified):** `unauthorized`, `not_found`, `bad_json`, `bad_visibility`, `bad_cover_position`, `create_failed`, `patch_failed`, `flip_failed`, `tag_failed`, `delete_failed`, `list_failed`, `user_lookup_failed`, `user_failed`, `unknown_provider` (auth), `bad_state` (auth), `exchange_failed` (auth), `upsert_failed` (auth), `sign_failed` (auth), `unsupported_media_type` (image), `bad_multipart` (image), `manifest_required` (image), `file_count_mismatch` (image), `open_file` (image), `position_taken` (image), `too_large` (image), `decode_failed` (image), `upload_failed` (image).
+
+**Shape-B paths (verified):**
+- `bad_cursor` — `httpapi/artworks.go:87` — `message` is the parse-error string
+- ParseManifest errors — `image/handler.go:51` — `message` is the parse-error string (`error` field is *also* set to the message — see note below)
+- `fingerprint_mismatch` — `image/handler.go:72-75` — `message: "client_image_id reused with different bytes"`
+- `content_type_mismatch` — `image/handler.go:84-87` — `message: "body does not match declared content_type"`
+
+> Quirk: ParseManifest's error path uses `map[string]string{"error": err.Error()}` (no `message` key), so it actually emits **shape A with the error string as the code**. That's a current bug in the API surface but it's frozen into the contract until a follow-up clean-up PR. PR 0.8 captures this as-is.
+
+The Phase 1 implementation reproduces all of these exactly.
 
 > Note: codes like `*_failed` leak internal operation names. They are frozen into the contract; cleanup is a post-Phase-1 follow-up.
 
@@ -305,15 +314,17 @@ After PR 0.8 captures snapshots, Phase 1 must reproduce them **exactly**, post-n
 
 Several response bytes are non-deterministic in production (UUIDs, JWTs, signed-URL HMACs, random OAuth state, DB `now()` timestamps). The contract harness handles each via injection-where-possible-otherwise-normalization:
 
-| Dynamic source | Strategy |
-|---|---|
-| `time.Now` for JWT issuance | **Inject** — `auth/jwt.go` already accepts a `time.Now func() time.Time`. Tests pass a fixed-clock provider. |
-| `time.Now` for signed URL expiry | **Inject** — `auth/imgurl.go` (`URLBuilder`) already takes `time.Now func() time.Time`. Tests use the same fixed clock. |
-| `uuid.New()` (artwork/user/image IDs, OAuth state) | **Inject** — Phase 0 PR 0.1 introduces a `IDProvider` interface with a deterministic counter implementation for tests; production uses `uuid.New()`. Existing call sites are switched in PR 0.1 as a no-op refactor. |
-| OAuth state cookie value | **Inject** via `IDProvider` (above). Cookie raw bytes are deterministic in tests. |
-| DB `now()` timestamps in `created_at`/`updated_at` | **Normalize** — Postgres `now()` is not easily injectable. Snapshot normalizer regex-replaces `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z` with `<TIMESTAMP>` before compare. |
-| Signed URL HMAC suffix | **Normalize** — even with injected clock, the HMAC depends on the signing key (which is per-environment). Normalizer replaces `\?sig=[0-9a-f]+&exp=\d+` with `?sig=<SIG>&exp=<EXP>`. |
-| JWT cookie value | **Normalize** — Set-Cookie header value for `auth=` is replaced with `auth=<JWT>` in normalized snapshots. |
+| Dynamic source | Where generated | Strategy |
+|---|---|---|
+| `time.Now` for JWT issuance | Go: `auth/jwt.go` (already injectable) | **Inject** — pass a fixed-clock provider in tests. |
+| `time.Now` for signed URL expiry | Go: `auth/imgurl.go` (`URLBuilder`, already injectable) | **Inject** — same fixed clock as JWT. |
+| Image upload IDs (`uuid.NewString()`) | Go: `image/service.go:84` | **Inject** — Phase 0 PR 0.7 introduces an `IDProvider` interface; production uses `uuid.NewString()`, tests use a deterministic counter. The single Go-side call site is switched in PR 0.7 as a no-op refactor. |
+| OAuth state cookie value (`crypto/rand` → hex) | Go: `auth/handlers.go:123-127` (`randState`) | **Inject** — Phase 0 PR 0.7 makes `randState` accept a `RandReader` (defaulting to `crypto/rand.Reader`); tests inject a deterministic source. |
+| User IDs, artwork IDs, image-row IDs, tag IDs, artwork_image IDs | **DB:** `gen_random_uuid()` as column DEFAULT (`migrations/0001_init.up.sql:3,15,31,48`). The INSERTs do not specify `id` — they rely on the DB default and `RETURNING id`. | **Normalize** — Go-side injection would require rewriting every INSERT to suppress the DB default (a behavior change forbidden by §1 non-goals). Snapshot normalizer regex-replaces UUID patterns (`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`) with `<UUID>` before compare. |
+| DB `now()` timestamps in `created_at`/`updated_at`/`published_at` | DB: `now()` as column DEFAULT, plus explicit `now()` in artwork visibility flip | **Normalize** — Postgres `now()` is not easily injectable. Snapshot normalizer regex-replaces `\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z` with `<TIMESTAMP>` before compare. |
+| Signed URL HMAC suffix | Go: `auth/imgurl.go` (depends on per-env signing key) | **Normalize** — replace `\?sig=[0-9a-f]+&exp=\d+` with `?sig=<SIG>&exp=<EXP>`. |
+| JWT cookie value | Go: `auth/jwt.go` (depends on per-env signing key) | **Normalize** — Set-Cookie header value for `auth=` is replaced with `auth=<JWT>` in normalized snapshots. |
+| Cursor base64 strings | Go: `httpapi/artworks.go` (depends on the timestamp + UUID inside) | **Normalize** — captured normalized to `<CURSOR>` because they wrap normalized timestamps and UUIDs anyway. |
 
 The normalizer is implemented once in `internal/infrastructure/testing/normalize.go` and applied uniformly. Snapshot golden files store the **post-normalization** bytes, so a Phase 1 implementation that emits a different UUID format would still fail (the normalizer would not match the new format).
 
@@ -342,12 +353,15 @@ To keep GORM compatible with the locked snapshots:
 The 80% threshold is the **statement-weighted average across counted subpackages per slice**. CI command per slice (Phase 1 layout):
 
 ```bash
-PKGS=$(go list ./internal/auth/... | grep -v /ports | grep -v /mocks | tr '\n' ',' | sed 's/,$//')
-go test -coverpkg=$PKGS -coverprofile=auth.out -tags=integration $PKGS
+# Go test takes packages as space-separated args; -coverpkg takes a comma-separated list.
+# Use two distinct variable shapes to avoid collapsing N packages into one comma-containing path.
+TESTPKGS=$(go list ./internal/auth/... | grep -v /ports | grep -v /mocks)
+COVERPKG=$(echo "$TESTPKGS" | tr '\n' ',' | sed 's/,$//')
+go test -coverpkg="$COVERPKG" -coverprofile=auth.out -tags=integration $TESTPKGS
 go tool cover -func=auth.out | tail -1
 ```
 
-Both `/ports` (interfaces — no statements) and `/mocks` (generated code — would skew coverage) must be excluded from **both** the `-coverpkg` instrumentation list and the test-run package list.
+Both `/ports` (interfaces — no statements) and `/mocks` (generated code — would skew coverage) are excluded from **both** the `-coverpkg` instrumentation list and the test-run package list.
 
 ### 5.5 Mocks
 
@@ -662,9 +676,10 @@ func validationToHTTPError(verrs validator.ValidationErrors) HTTPError {
     switch {
     case fe.Field() == "Visibility" && fe.Tag() == "oneof":
         return HTTPError{Error: "bad_visibility"}
-    case fe.Field() == "Title":
-        return HTTPError{Error: "bad_title"}        // verify against snapshot
-    // ... full table built during PR 0.8
+    // The full table is built during PR 0.8 from captured snapshots.
+    // Note: per §7.3.1 the current API does NOT validate Title/Tags/Description
+    // length or format, so there is no `bad_title`, `bad_tags`, etc. — those would
+    // be new error codes and are explicitly out of scope for this refactor.
     default:
         return HTTPError{Error: "bad_json"}
     }
@@ -837,7 +852,7 @@ Each error appears in logs **exactly once**. A grep for `log/slog` after Phase 1
 | PR | Scope | Acceptance criteria |
 |---|---|---|
 | **0.1** Test harness | Move `internal/dbtest` → `internal/infrastructure/testing`. Add testcontainers + minio harness, `BootApp(t)` helper, golden-file machinery, `GOLDEN_UPDATE=1` regen mode. Add CI job `contract_suite` (skipped initially). | All current tests pass; harness compiles; harness self-test boots current API and asserts `GET /healthz` returns 200. |
-| **0.2** `user` 63.8 → 80 | Tests for: slug uniqueness conflict, `Get(404)`, profile update no-fields, soft-delete read. | `go test ./internal/user/... -cover` ≥ 80%. |
+| **0.2** `user` 63.8 → 80 | Tests for the actual surface area of `internal/user/repo.go`: `slugify` edge cases (empty input → `"user"`, length truncation at 32, non-ASCII characters), slug-collision retry path (`UpsertOAuth` loop in `repo.go:59-83`), slug-exhaustion error after 50 attempts, `oauth_provider+oauth_subject` unique-constraint re-read path (`repo.go:73-79`), `Get(404) → ErrNotFound` mapping, `GetBySlug` non-existent-slug pass-through, non-`23505` Postgres error pass-through (`uniqueConstraint`). **Excludes:** profile-update tests (no PATCH route exists), soft-delete tests (no `deleted_at` column — schema has hard deletes only). | `go test ./internal/user/... -cover` ≥ 80%. |
 | **0.3** `storage` 69.1 → 80 | Tests for: r2 multi-part edge cases, localfs path-traversal guard, missing-bucket error, content-type round-trip. | `go test ./internal/storage/... -cover` ≥ 80%. |
 | **0.4** `image` 69.7 → 80 | Tests for: orphan cleanup race, content-type mismatch, signed-URL expiry boundary, blurhash error path. | `go test ./internal/image/... -cover` ≥ 80%. |
 | **0.5** `httpapi` 69.2 → 80 | Tests for: privacy matrix completeness, devseed gated routes (coverage only — `/dev/seed` is not part of the byte-strict contract per §5.2.1), error responses for every 4xx path including 412/415/422 from image upload. | `go test ./internal/httpapi/... -cover` ≥ 80%. |
