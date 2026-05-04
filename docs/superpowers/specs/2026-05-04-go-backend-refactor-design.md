@@ -256,7 +256,7 @@ For every endpoint in the current `internal/httpapi/router.go` **except `/dev/se
 | Auth state | anon, self-user, other-user |
 | Resource state | empty, single, paginated, public/private mix |
 | Request shape | minimal-valid, full-valid, boundary (max len, 0), malformed JSON, malformed multipart, wrong Content-Type |
-| Expected status | 200, 201, 204, **302** (auth redirects), 400, 401, 403, 404, 409, **412** (image position taken), **415** (image bad content-type), 422, 500, **502** (oauth exchange failed) |
+| Expected status | 200, 201, 204, **302** (auth redirects), 400, 401, 404, 409 (image `fingerprint_mismatch`), **412** (image `position_taken`), **415** (image bad Content-Type), 422, 500, **502** (oauth `exchange_failed`) |
 
 **Status-code provenance** (verified against current code):
 
@@ -269,6 +269,18 @@ For every endpoint in the current `internal/httpapi/router.go` **except `/dev/se
 | 502 | `GET /auth/{provider}/callback` | `auth/handlers.go` OAuth `exchange_failed` |
 
 Resource states **exclude "soft-deleted"** because the schema does hard deletes (verified against `migrations/0001_init.up.sql` — no `deleted_at` columns; only `ON DELETE CASCADE` foreign keys).
+
+#### 5.2.0a "Must not appear" status assertions
+
+Some statuses are *deliberately* absent from the cartesian-product list because no current path emits them, and emitting one in Phase 1 would be an observable contract change. The contract suite includes a meta-test that scans every captured golden file and **fails if any of these statuses appear**:
+
+| Status | Why forbidden | Source of constraint |
+|---|---|---|
+| 403 | Current API never emits 403; non-owner access on private resources collapses to 404. See §7.2.1 ownership-translation rule. | `httpapi/artworks.go:174,236,254` |
+| 409 from translated domain errors | Only `image/handler.go:72-75` (`fingerprint_mismatch`) legitimately emits 409. Any 409 from `ErrAlreadyPublished` or other translated domain errors is forbidden — same-visibility PATCH must remain 204. | §7.2.1 already-published translation |
+| 410 / 451 / 511 / etc. | Not emitted by any current handler; introducing them is out of scope per §1 non-goals. | grep verified across all handlers |
+
+A new test file `internal/infrastructure/testing/contract/forbidden_status_test.go` enumerates all `golden/*.json` files, parses the recorded status, and asserts none match the forbidden set. This is the "must not appear" guard, not a coverage path.
 
 #### 5.2.1 `/dev/seed` is excluded from the HTTP contract
 
