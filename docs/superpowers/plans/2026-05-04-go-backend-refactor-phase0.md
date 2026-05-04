@@ -40,8 +40,11 @@ The Phase 0 layout is the **current** flat layout — no slice-internal director
 | `api/internal/image/service.go` | Modify | Replace `uuid.NewString()` at line 84 with `s.ids.NewID()`. |
 | `api/internal/auth/handlers.go` | Modify | Replace `randState()` body with `RandReader.Read` injection (default `crypto/rand.Reader`). |
 | `api/internal/auth/randreader.go` | Create | `RandReader` interface + default + deterministic test impl. |
-| `api/internal/httpapi/contract/matrix_test.go` | Create | Cartesian-product HTTP contract suite. |
+| `api/internal/httpapi/contract/doc.go` | Create | Empty package created in PR 0.1 so `make test-contract` compiles before PR 0.7. |
+| `api/internal/httpapi/contract/placeholder_test.go` | Create | Trivial test in PR 0.1; replaced by matrix_test.go in PR 0.7. |
+| `api/internal/httpapi/contract/matrix_test.go` | Create | Cartesian-product HTTP contract suite (PR 0.7 — replaces placeholder). |
 | `api/internal/httpapi/contract/forbidden_status_test.go` | Create | Meta-test: scans `golden/*.json` for forbidden statuses (403, translated 409). |
+| `api/internal/httpapi/contract/fake_provider.go` | Create | Deterministic `auth.Provider` for the contract suite (PR 0.7). |
 | `api/internal/httpapi/contract/golden/` | Create | Per-test JSON snapshot files. Empty until PR 0.8. |
 | `api/Makefile` | Modify | Add `test-contract`, `test-cover`, `test-cover-slices` targets. |
 | `.github/workflows/contract.yml` (or equivalent) | Create | CI job `contract_suite`. Skipped initially (PR 0.1), required after PR 0.8. |
@@ -572,6 +575,12 @@ type BootOpts struct {
 	// JWTKey / SignKey default to fixed 32-byte test keys.
 	JWTKey  []byte
 	SignKey []byte
+
+	// Providers, when non-nil, is the auth.Provider map handed to httpapi.New.
+	// Tests inject a deterministic fake here so /auth/{provider}/start emits a
+	// real 302 redirect (default empty map → unknown_provider 404, which would
+	// lock the wrong contract bytes — see Finding 4 of the round-1 review).
+	Providers map[string]auth.Provider
 }
 
 // BootApp returns an *httptest.Server backed by the real httpapi.Deps stack
@@ -621,11 +630,15 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 	upload := image.NewHandler(imgSvc, arts, urls)
 	vis := artwork.NewVisibilityService(arts, store)
 
+	providers := opts.Providers
+	if providers == nil {
+		providers = map[string]auth.Provider{}
+	}
 	router := httpapi.New(&httpapi.Deps{
 		AppEnv:        opts.AppEnv,
 		JWT:           jwts,
 		URL:           urls,
-		Providers:     map[string]auth.Provider{},
+		Providers:     providers,
 		Users:         user.NewRepo(pool),
 		Artworks:      arts,
 		Tags:          artwork.NewTagsRepo(pool),
@@ -691,6 +704,55 @@ Expected: PASS.
 ```bash
 git add api/internal/dbtest/bootapp.go api/internal/dbtest/bootapp_test.go
 git commit -m "[0.1-test-harness] feat: add BootApp helper for contract suite"
+```
+
+### Task 1.4b — Create placeholder contract package
+
+The contract package itself is filled in by PR 0.7 / 0.8. PR 0.1 only creates an empty package + one trivial test so `make test-contract` (added in Task 1.5) compiles immediately rather than erroring on a missing path.
+
+**Files:**
+- Create: `api/internal/httpapi/contract/doc.go`
+- Create: `api/internal/httpapi/contract/placeholder_test.go`
+
+- [ ] **Step 1: Create the package marker.**
+
+Write `api/internal/httpapi/contract/doc.go`:
+
+```go
+// Package contract holds the byte-strict HTTP contract suite. PR 0.7 fills in
+// the cartesian matrix, PR 0.8 captures golden snapshots, and a forbidden-
+// status meta-test guards against contract drift in Phase 1.
+package contract
+```
+
+- [ ] **Step 2: Create the placeholder test.**
+
+Write `api/internal/httpapi/contract/placeholder_test.go`:
+
+```go
+package contract_test
+
+import "testing"
+
+// TestPlaceholder keeps `make test-contract` green until PR 0.7 replaces this
+// file with the real matrix. Delete this file as the first step of PR 0.7.
+func TestPlaceholder(t *testing.T) {}
+```
+
+- [ ] **Step 3: Verify the target works.**
+
+```bash
+cd /Users/todd.lam/WORK/_TestScripts/art-web/api
+go test ./internal/httpapi/contract/... -v
+```
+
+Expected: `--- PASS: TestPlaceholder` and `ok local/art-web/api/internal/httpapi/contract`.
+
+- [ ] **Step 4: Commit.**
+
+```bash
+git add api/internal/httpapi/contract/doc.go api/internal/httpapi/contract/placeholder_test.go
+git commit -m "[0.1-test-harness] feat: scaffold contract package (placeholder until PR 0.7)"
 ```
 
 ### Task 1.5 — Add Makefile targets and CI stub
@@ -766,7 +828,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
-        with: { go-version: '1.22' }
+        with:
+          # Pin to whatever api/go.mod declares (currently go 1.25.0). Don't
+          # hardcode a version — go.mod drift would silently break CI.
+          go-version-file: api/go.mod
       - name: contract
         run: cd api && make test-contract
 ```
@@ -1256,9 +1321,13 @@ Open `api/internal/image/service.go` and add **above** the `Service` struct:
 ```go
 // imageRepo is a narrow seam for service-level tests. *Repo satisfies it; this
 // interface is not exported.
+//
+// IMPORTANT: signatures must match repo.go exactly. Insert returns
+// (*InsertResult, error) — pointer to InsertResult — and FindByClientImageID
+// returns nil (not the zero value) when the row is missing.
 type imageRepo interface {
 	FindByClientImageID(ctx context.Context, artworkID, clientImageID string) (*InsertedImage, error)
-	Insert(ctx context.Context, in InsertInput) (InsertResult, error)
+	Insert(ctx context.Context, in InsertInput) (*InsertResult, error)
 }
 ```
 
@@ -1303,19 +1372,20 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"local/art-web/api/internal/artwork"
 )
 
 type stubRepo struct {
 	findFn   func(ctx context.Context, art, cid string) (*InsertedImage, error)
-	insertFn func(ctx context.Context, in InsertInput) (InsertResult, error)
+	insertFn func(ctx context.Context, in InsertInput) (*InsertResult, error)
 }
 
 func (s *stubRepo) FindByClientImageID(ctx context.Context, art, cid string) (*InsertedImage, error) {
 	return s.findFn(ctx, art, cid)
 }
-func (s *stubRepo) Insert(ctx context.Context, in InsertInput) (InsertResult, error) {
+func (s *stubRepo) Insert(ctx context.Context, in InsertInput) (*InsertResult, error) {
 	return s.insertFn(ctx, in)
 }
 
@@ -1343,7 +1413,7 @@ func (s *stubStore) Move(context.Context, string, string) error { return nil }
 func (s *stubStore) Exists(context.Context, string) (bool, error) {
 	return false, nil
 }
-func (s *stubStore) SignedURL(context.Context, string, _ /* time.Duration */ any) (string, error) {
+func (s *stubStore) SignedURL(context.Context, string, time.Duration) (string, error) {
 	return "", nil
 }
 
@@ -1358,7 +1428,7 @@ func loadJPEG(t *testing.T) []byte {
 func TestUploadOne_StoragePutFailure_Surfaces(t *testing.T) {
 	repo := &stubRepo{
 		findFn:   func(_ context.Context, _, _ string) (*InsertedImage, error) { return nil, nil },
-		insertFn: func(_ context.Context, _ InsertInput) (InsertResult, error) { return InsertResult{}, nil },
+		insertFn: func(_ context.Context, _ InsertInput) (*InsertResult, error) { return &InsertResult{}, nil },
 	}
 	store := &stubStore{failPut: true}
 	svc := &Service{store: store, images: repo, artworks: nil}
@@ -1382,8 +1452,8 @@ func TestUploadOne_StoragePutFailure_Surfaces(t *testing.T) {
 func TestUploadOne_InsertFails_OrphanIsDeleted(t *testing.T) {
 	repo := &stubRepo{
 		findFn: func(_ context.Context, _, _ string) (*InsertedImage, error) { return nil, nil },
-		insertFn: func(_ context.Context, _ InsertInput) (InsertResult, error) {
-			return InsertResult{}, errors.New("insert failure")
+		insertFn: func(_ context.Context, _ InsertInput) (*InsertResult, error) {
+			return nil, errors.New("insert failure")
 		},
 	}
 	store := &stubStore{}
@@ -1415,8 +1485,8 @@ func TestUploadOne_IdempotentInsertButRowNotFound_ErrorsClearly(t *testing.T) {
 			// at service.go line 109-111.
 			return nil, nil
 		},
-		insertFn: func(_ context.Context, _ InsertInput) (InsertResult, error) {
-			return InsertResult{ID: "imgX", Existed: true}, nil
+		insertFn: func(_ context.Context, _ InsertInput) (*InsertResult, error) {
+			return &InsertResult{ID: "imgX", Existed: true}, nil
 		},
 	}
 	store := &stubStore{}
@@ -1435,8 +1505,6 @@ func TestUploadOne_IdempotentInsertButRowNotFound_ErrorsClearly(t *testing.T) {
 	}
 }
 ```
-
-> Note: `stubStore.SignedURL`'s third parameter is `time.Duration` in the real interface; the stub uses `any` to avoid a `time` import. If your linter complains, change to `time.Duration` and import `time`.
 
 - [ ] **Step 4: Run.**
 
@@ -1604,14 +1672,56 @@ git add api/internal/httpapi/privacy_matrix_test.go api/internal/httpapi/testuti
 git commit -m "[0.5-httpapi] test: fill privacy-matrix gaps (other/anon × public/private × verbs)"
 ```
 
-### Task 5.3 — Cover every Shape-A and Shape-B error code
+### Task 5.3 — Cover every Shape-A and Shape-B error code via PR-0.5 + the existing tests
 
 **Files:**
 - Create: `api/internal/httpapi/error_codes_test.go`
 
-- [ ] **Step 1: Write one test per code listed in spec §3.**
+The contract has many error codes (spec §3 lists ~25). Some are already covered by existing tests in lower-level packages (`internal/image/handler_test.go`, `internal/auth/handlers_test.go`), and PR 0.7's matrix will then exercise them again from the HTTP boundary. This task closes the **httpapi-package** gap so the slice's coverage hits ≥ 80 %, and also pins the response body shape (status + JSON keys) for codes that lower-level tests don't pin.
 
-The tests are deliberately small and assert the exact JSON shape so PR 0.7 / 0.8 can lock the bytes.
+#### Coverage mapping — every code listed in spec §3
+
+The table below enumerates every Shape-A and Shape-B error code from spec §3 and identifies where each is exercised. PR 0.5 adds tests only for cells marked `add (PR 0.5)` so we don't duplicate work.
+
+| Status | Code | Shape | Source endpoint(s) | Where covered |
+|---|---|---|---|---|
+| 401 | `unauthorized` | A | `/me`, auth-gated PATCH/DELETE/POST artworks | privacy-matrix tests + `add (PR 0.5)` for /me |
+| 404 | `not_found` | A | GET/PATCH/DELETE artwork by id, GET user, GET tag, image upload (non-owner) | privacy-matrix tests (already) |
+| 400 | `bad_json` | A | POST/PATCH artworks (decode) | `add (PR 0.5)` |
+| 400 | `bad_visibility` | A | POST/PATCH artworks | `add (PR 0.5)` |
+| 400 | `bad_cover_position` | A | PATCH artworks | `add (PR 0.5)` |
+| 400 | `bad_cursor` | **B** | GET /artworks?cursor=…, GET /users/{slug}?cursor=… | `add (PR 0.5)` |
+| 500 | `create_failed` | A | POST /artworks | covered transitively in matrix; not actionable from httpapi tests (requires DB-side failure) — note in PR description |
+| 500 | `patch_failed` | A | PATCH /artworks | same — DB-failure path |
+| 500 | `flip_failed` | A | PATCH visibility | same |
+| 500 | `tag_failed` | A | tags via PATCH | same |
+| 500 | `delete_failed` | A | DELETE /artworks | same |
+| 500 | `list_failed` | A | GET /artworks, GET /users/{slug} | same |
+| 500 | `user_lookup_failed` | A | /me when DB fails | same |
+| 500 | `user_failed` | A | GET /artworks/{id} when artist lookup fails | same |
+| 404 | `unknown_provider` | A | /auth/{provider}/start, /auth/{provider}/callback | `add (PR 0.5)` |
+| 400 | `bad_state` | A | /auth/{provider}/callback | covered in `auth/handlers_test.go` (verify with grep — if absent, `add (PR 0.5)`) |
+| 502 | `exchange_failed` | A | /auth/{provider}/callback | covered in `auth/handlers_test.go` (verify) |
+| 500 | `upsert_failed` | A | /auth/{provider}/callback | covered in `auth/handlers_test.go` (verify) |
+| 500 | `sign_failed` | A | /auth/{provider}/callback | covered in `auth/handlers_test.go` (verify) |
+| 415 | `unsupported_media_type` | A | POST /artworks/{id}/images | covered in `image/handler_test.go` + `add (PR 0.5)` to pin the body shape |
+| 400 | `bad_multipart` | A | POST /artworks/{id}/images | `add (PR 0.5)` |
+| 400 | `manifest_required` | A | POST /artworks/{id}/images | `add (PR 0.5)` |
+| 400 | `file_count_mismatch` | A | POST /artworks/{id}/images | `add (PR 0.5)` |
+| 400 | `open_file` | A | POST /artworks/{id}/images | very hard to provoke (requires multipart file Open() error); document as "captured by PR 0.7 matrix only if it triggers organically; otherwise document the gap." |
+| 412 | `position_taken` | A | POST /artworks/{id}/images | covered in `image/handler_test.go` |
+| 422 | `too_large` | A | POST /artworks/{id}/images | `add (PR 0.5)` |
+| 422 | `decode_failed` | A | POST /artworks/{id}/images | covered in `image/handler_test.go` |
+| 500 | `upload_failed` | A | POST /artworks/{id}/images | DB-failure path (skip) |
+| 409 | `fingerprint_mismatch` | **B** | POST /artworks/{id}/images | covered in `image/handler_test.go` |
+| 422 | `content_type_mismatch` | **B** | POST /artworks/{id}/images | covered in `image/handler_test.go` |
+| 400 | (free-form ParseManifest message) | A-quirky | POST /artworks/{id}/images | `add (PR 0.5)` — pin the quirky shape |
+
+**Cells marked "DB-failure path (skip)"**: produced only when underlying DB operations fail at runtime. Reproducing them requires either a stubbed repo (which contradicts the integration-test approach) or fault injection in Postgres (brittle). Spec §3 says these codes are "frozen into the contract" — they'll be locked from snapshots PR 0.8 captures *if* organic test traffic hits them. Document as known gaps in the PR description.
+
+#### Test snippets
+
+The tests below cover every cell marked `add (PR 0.5)`. They're deliberately small and assert the exact JSON shape so PR 0.7 / 0.8 can lock the bytes.
 
 Write `api/internal/httpapi/error_codes_test.go`:
 
@@ -1777,11 +1887,168 @@ func TestErrors_ImageUpload_400_FileCountMismatch(t *testing.T) {
 	}
 }
 
-// 412 / 415 / 422 image-upload paths are already covered by
-// internal/image/handler_test.go. The privacy-matrix and these tests cover the
-// remaining httpapi-package surface for those statuses; no new image tests
-// belong here.
+// 412 / 422-decode / 409-fingerprint / 422-content_type / 412-position
+// image-upload paths are already covered by internal/image/handler_test.go.
+// The privacy-matrix and these tests cover the remaining httpapi-package surface
+// for those statuses; no duplicate image tests belong here.
+
+// ---- Additional cells from the coverage table ----
+
+// /me — unauthorized 401 (Shape A).
+func TestErrors_Me_Unauthorized(t *testing.T) {
+	env := setupMatrixEnv(t)
+	body, code := env.request(t, "anon", "GET", "/me")
+	if code != 401 {
+		t.Fatalf("status=%d want 401", code)
+	}
+	got := decodeError(t, strings.NewReader(body))
+	if got.Error != "unauthorized" {
+		t.Fatalf("error=%q want unauthorized", got.Error)
+	}
+}
+
+// PATCH bad_json (decode failure).
+func TestErrors_ArtworkPatch_BadJSON_Body(t *testing.T) {
+	env := setupMatrixEnv(t)
+	body, code := env.requestWithJSONBody(t, "owner", "PATCH", "/artworks/"+env.PID, "this is not json")
+	if code != 400 {
+		t.Fatalf("status=%d want 400", code)
+	}
+	got := decodeError(t, strings.NewReader(body))
+	if got.Error != "bad_json" {
+		t.Fatalf("error=%q want bad_json", got.Error)
+	}
+}
+
+// POST bad_json (decode failure).
+func TestErrors_ArtworkCreate_BadJSON(t *testing.T) {
+	env := setupMatrixEnv(t)
+	body, code := env.requestWithJSONBody(t, "owner", "POST", "/artworks", "not json")
+	if code != 400 {
+		t.Fatalf("status=%d want 400", code)
+	}
+	got := decodeError(t, strings.NewReader(body))
+	if got.Error != "bad_json" {
+		t.Fatalf("error=%q want bad_json", got.Error)
+	}
+}
+
+// /users/{slug} cursor parse failure (Shape B).
+func TestErrors_UserProfile_BadCursor(t *testing.T) {
+	env := setupMatrixEnv(t)
+	body, code := env.request(t, "anon", "GET", "/users/alice-"+env.AliceSuffix+"?cursor=not-base64!!")
+	if code != 400 {
+		t.Fatalf("status=%d want 400", code)
+	}
+	got := decodeError(t, strings.NewReader(body))
+	if got.Error != "bad_cursor" || got.Message == "" {
+		t.Fatalf("expected Shape B bad_cursor, got %+v", got)
+	}
+}
+
+// /auth/{provider}/callback unknown_provider (404).
+func TestErrors_AuthCallback_UnknownProvider(t *testing.T) {
+	env := setupMatrixEnv(t)
+	body, code := env.request(t, "anon", "GET", "/auth/notreal/callback?state=x&code=y")
+	if code != 404 {
+		t.Fatalf("status=%d want 404", code)
+	}
+	if !strings.Contains(body, "unknown_provider") {
+		t.Fatalf("expected unknown_provider, got %s", body)
+	}
+}
+
+// 400 bad_multipart — declare multipart but send a malformed body.
+func TestErrors_ImageUpload_400_BadMultipart(t *testing.T) {
+	env := setupMatrixEnv(t)
+
+	req := httptest.NewRequest("POST", "/artworks/"+env.PID+"/images",
+		strings.NewReader("not a real multipart payload"))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=fake")
+	req.AddCookie(&http.Cookie{Name: "auth", Value: env.ownerToken})
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+
+	if rec.Code != 400 {
+		t.Fatalf("status=%d want 400", rec.Code)
+	}
+	got := decodeError(t, rec.Body)
+	if got.Error != "bad_multipart" {
+		t.Fatalf("error=%q want bad_multipart", got.Error)
+	}
+}
+
+// 422 too_large — manifest declares a file size > 25 MB.
+func TestErrors_ImageUpload_422_TooLarge(t *testing.T) {
+	env := setupMatrixEnv(t)
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	_ = mw.WriteField("manifest",
+		`[{"client_image_id":"K1","position":0,"content_type":"image/jpeg"}]`)
+	w, _ := mw.CreateFormFile("files", "f.jpg")
+	// 26 MB — exceeds image.MaxBytes (25 MB).
+	_, _ = w.Write(bytes.Repeat([]byte{0xFF}, 26*1024*1024))
+	mw.Close()
+
+	req := httptest.NewRequest("POST", "/artworks/"+env.PID+"/images", body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.AddCookie(&http.Cookie{Name: "auth", Value: env.ownerToken})
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+
+	if rec.Code != 422 {
+		t.Fatalf("status=%d want 422", rec.Code)
+	}
+	got := decodeError(t, rec.Body)
+	if got.Error != "too_large" {
+		t.Fatalf("error=%q want too_large", got.Error)
+	}
+}
+
+// Shape-A quirky — ParseManifest emits the parse-error string verbatim as the
+// "error" value. Pin this so PR 0.8 captures the quirky shape and Phase 1's
+// translator faithfully reproduces it.
+func TestErrors_ImageUpload_400_ParseManifestQuirk(t *testing.T) {
+	env := setupMatrixEnv(t)
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	// Manifest with an invalid line that ParseManifest will reject. The exact
+	// message string is implementation-defined; we only assert it's NOT a stable
+	// snake_case code (i.e., it contains "manifest" or whitespace).
+	_ = mw.WriteField("manifest", "this is not a manifest")
+	w, _ := mw.CreateFormFile("files", "f.jpg")
+	_, _ = w.Write([]byte("anything"))
+	mw.Close()
+
+	req := httptest.NewRequest("POST", "/artworks/"+env.PID+"/images", body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.AddCookie(&http.Cookie{Name: "auth", Value: env.ownerToken})
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+
+	if rec.Code != 400 {
+		t.Fatalf("status=%d want 400", rec.Code)
+	}
+	got := decodeError(t, rec.Body)
+	// The quirk: the value is the parse-error string itself, not a snake_case
+	// code. We don't assert the exact message — that's what PR 0.8 locks. We
+	// do assert it's NOT one of the stable codes.
+	stableCodes := map[string]bool{
+		"bad_json": true, "bad_multipart": true, "manifest_required": true,
+		"file_count_mismatch": true, "unsupported_media_type": true,
+	}
+	if stableCodes[got.Error] {
+		t.Fatalf("expected free-form ParseManifest message, got stable code %q", got.Error)
+	}
+	if got.Message != "" {
+		t.Fatalf("ParseManifest quirk has no `message` key; got %q", got.Message)
+	}
+}
 ```
+
+> Add `"net/http"`, `"bytes"`, `"mime/multipart"`, `"net/http/httptest"` to imports if not already present.
 
 - [ ] **Step 2: Run.**
 
@@ -2343,14 +2610,109 @@ git add api/internal/dbtest/bootapp.go
 git commit -m "[0.7-contract-matrix] feat: wire ID and Rand injection into BootApp"
 ```
 
-### Task 7.4 — Write the cartesian contract matrix
+### Task 7.4a — Add the deterministic fake auth provider
 
 **Files:**
+- Create: `api/internal/httpapi/contract/fake_provider.go`
+
+The current `auth.Provider` interface has three methods (`auth/provider.go:13-17`): `Name()`, `AuthURL(state) string`, `Exchange(ctx, code) (*Profile, error)`. The contract suite needs a deterministic fake so:
+
+- `/auth/google/start` produces a real 302 redirect (not a 404 from `unknown_provider`).
+- `/auth/google/callback` produces a deterministic Profile so the resulting `Set-Cookie auth=…` is stable post-normalization.
+
+- [ ] **Step 1: Write the fake.**
+
+Write `api/internal/httpapi/contract/fake_provider.go`:
+
+```go
+// api/internal/httpapi/contract/fake_provider.go
+package contract
+
+import (
+	"context"
+
+	"local/art-web/api/internal/auth"
+)
+
+// fakeGoogleProvider is a deterministic auth.Provider for the contract suite.
+// The behavior is chosen to exercise every auth response branch:
+//
+//   /auth/google/start   → 302 to a fixed AuthURL (stable post-normalization)
+//   /auth/google/callback?state=…&code=valid     → 302 to frontend home
+//   /auth/google/callback?state=…&code=fail      → 502 exchange_failed
+//   /auth/google/callback?state=mismatch          → 400 bad_state
+type fakeGoogleProvider struct{}
+
+func (fakeGoogleProvider) Name() string { return "google" }
+
+func (fakeGoogleProvider) AuthURL(state string) string {
+	// State is dynamic by definition, but the contract harness already injects a
+	// deterministic RandReader, so `state` is stable across runs.
+	return "https://example.com/oauth2/auth?state=" + state
+}
+
+func (fakeGoogleProvider) Exchange(_ context.Context, code string) (*auth.Profile, error) {
+	if code == "fail" {
+		return nil, errFakeExchange
+	}
+	return &auth.Profile{
+		Subject:     "fake-subject-1",
+		Email:       "fake@example.com",
+		DisplayName: "Fake User",
+		AvatarURL:   "",
+	}, nil
+}
+
+// errFakeExchange is the sentinel returned for code=fail; the handler maps any
+// non-nil exchange error to 502 exchange_failed.
+var errFakeExchange = &exchangeFailure{}
+
+type exchangeFailure struct{}
+
+func (*exchangeFailure) Error() string { return "fake exchange failure" }
+
+// FakeProviders returns the providers map the contract suite hands to BootApp.
+// Keep it small: only "google" is wired today.
+func FakeProviders() map[string]auth.Provider {
+	return map[string]auth.Provider{"google": fakeGoogleProvider{}}
+}
+```
+
+- [ ] **Step 2: Build to confirm it compiles.**
+
+```bash
+cd /Users/todd.lam/WORK/_TestScripts/art-web/api
+go build ./internal/httpapi/contract/...
+```
+
+Expected: green.
+
+- [ ] **Step 3: Commit.**
+
+```bash
+git add api/internal/httpapi/contract/fake_provider.go
+git commit -m "[0.7-contract-matrix] feat: deterministic fake auth.Provider for contract"
+```
+
+### Task 7.4 — Write the full cartesian contract matrix
+
+**Files:**
+- Delete: `api/internal/httpapi/contract/placeholder_test.go` (replaced by `matrix_test.go`)
 - Create: `api/internal/httpapi/contract/matrix_test.go`
 
-- [ ] **Step 1: Write the matrix file.**
+- [ ] **Step 1: Delete the placeholder.**
+
+```bash
+rm /Users/todd.lam/WORK/_TestScripts/art-web/api/internal/httpapi/contract/placeholder_test.go
+```
+
+- [ ] **Step 2: Write the full matrix file.**
 
 The matrix enumerates one entry per cell of (auth × resource × request shape) per the table in spec §5.2. The test loops over the matrix and calls `dbtest.AssertGolden`. Because no goldens exist yet, every assertion fails — that is expected. PR 0.8 turns those failures into committed snapshots.
+
+**Critical wiring:**
+- The HTTP client uses `CheckRedirect: http.ErrUseLastResponse` so 302 redirects are captured as 302, not followed silently.
+- `BootApp` receives `Providers: contract.FakeProviders()` so `/auth/google/start` produces a real 302 instead of a 404.
 
 Write `api/internal/httpapi/contract/matrix_test.go`:
 
@@ -2360,11 +2722,16 @@ package contract_test
 import (
 	"bytes"
 	"encoding/json"
+	"io"
+	"mime/multipart"
 	"net/http"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"local/art-web/api/internal/dbtest"
+	"local/art-web/api/internal/httpapi/contract"
 	"local/art-web/api/internal/image"
 )
 
@@ -2376,64 +2743,78 @@ type fixedRand struct{}
 
 func (fixedRand) Read(p []byte) (int, error) {
 	for i := range p {
-		p[i] = byte(i + 1) // 0x01, 0x02, 0x03, ...
+		p[i] = byte(i + 1)
 	}
 	return len(p), nil
 }
 
-type contractCase struct {
-	name   string
-	method string
-	path   string
-	viewer string // "anon", "owner", "other"
-	body   string // JSON or empty
-	ctype  string // Content-Type override; empty → application/json when body != ""
-}
-
 // seedResponse mirrors the /dev/seed response shape (httpapi/devseed.go:57-64).
-// Only the fields the contract suite needs are decoded.
 type seedResponse struct {
 	AliceCookie string `json:"aliceCookie"`
 	BobCookie   string `json:"bobCookie"`
+	AliceSlug   string `json:"aliceSlug"`
 	PID         string `json:"pId"` // public artwork
 	QID         string `json:"qId"` // private artwork
 }
 
-func bootContract(t *testing.T) (string, func(c contractCase) *http.Response) {
+type contractCase struct {
+	name    string
+	method  string
+	path    string
+	viewer  string // "anon", "owner", "other"
+	body    string // body bytes; empty allowed
+	ctype   string // Content-Type override; if empty and body != "" defaults to application/json
+	bodyMP  func(t *testing.T) (io.Reader, string) // optional: builds a multipart body & returns ctype
+}
+
+// noRedirectClient prevents auto-following 302s so we capture the redirect
+// as the actual response — auth/start and auth/callback both 302.
+var noRedirectClient = &http.Client{
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+func bootContract(t *testing.T) (string, seedResponse, func(c contractCase) *http.Response) {
 	srv := dbtest.BootApp(t, dbtest.BootOpts{
 		FixedNow:   fixedNow,
 		IDProvider: &image.CounterIDProvider{},
 		RandReader: fixedRand{},
+		Providers:  contract.FakeProviders(),
 	})
 
-	// Seed Alice (owner) and Bob (other) once. /dev/seed is mounted because
-	// BootOpts.AppEnv defaults to "test".
-	resp, err := http.Post(srv.URL+"/dev/seed", "application/json", nil)
+	// Seed once via /dev/seed (mounted because AppEnv defaults to "test").
+	r, err := noRedirectClient.Post(srv.URL+"/dev/seed", "application/json", nil)
 	if err != nil {
 		t.Fatalf("POST /dev/seed: %v", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("seed status=%d want 200", resp.StatusCode)
+	defer r.Body.Close()
+	if r.StatusCode != 200 {
+		t.Fatalf("seed status=%d want 200", r.StatusCode)
 	}
 	var seed seedResponse
-	if err := json.NewDecoder(resp.Body).Decode(&seed); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&seed); err != nil {
 		t.Fatalf("decode seed: %v", err)
 	}
 
 	send := func(c contractCase) *http.Response {
-		var bodyReader *bytes.Reader
-		if c.body != "" {
-			bodyReader = bytes.NewReader([]byte(c.body))
-		} else {
-			bodyReader = bytes.NewReader(nil)
+		var bodyReader io.Reader
+		var ctype string
+		switch {
+		case c.bodyMP != nil:
+			bodyReader, ctype = c.bodyMP(t)
+		case c.body != "":
+			bodyReader = strings.NewReader(c.body)
+			ctype = "application/json"
+		default:
+			bodyReader = nil
+		}
+		if c.ctype != "" {
+			ctype = c.ctype
 		}
 		req, _ := http.NewRequest(c.method, srv.URL+c.path, bodyReader)
-		switch {
-		case c.ctype != "":
-			req.Header.Set("Content-Type", c.ctype)
-		case c.body != "":
-			req.Header.Set("Content-Type", "application/json")
+		if ctype != "" {
+			req.Header.Set("Content-Type", ctype)
 		}
 		switch c.viewer {
 		case "owner":
@@ -2445,73 +2826,154 @@ func bootContract(t *testing.T) (string, func(c contractCase) *http.Response) {
 		default:
 			t.Fatalf("unknown viewer %q", c.viewer)
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := noRedirectClient.Do(req)
 		if err != nil {
 			t.Fatalf("do %s %s: %v", c.method, c.path, err)
 		}
 		return resp
 	}
 
-	return srv.URL, send
+	return srv.URL, seed, send
 }
 
-// PR 0.8 extends matrix_test.go to reference seed.PID / seed.QID in
-// viewer-aware GET/PATCH/DELETE cells.
+// validImageUpload returns a multipart body builder that uploads a tiny PNG.
+// The PNG bytes are the same 1×1 transparent PNG used in
+// httpapi/testutil_test.go:28-37 — base64-decoded once at init time.
+func validImageUpload(clientID string, position int) func(*testing.T) (io.Reader, string) {
+	return func(t *testing.T) (io.Reader, string) {
+		buf := &bytes.Buffer{}
+		mw := multipart.NewWriter(buf)
+		manifest := `[{"client_image_id":"` + clientID + `","position":` +
+			strconv.Itoa(position) + `,"content_type":"image/png"}]`
+		_ = mw.WriteField("manifest", manifest)
+		w, _ := mw.CreateFormFile("files", clientID+".png")
+		_, _ = w.Write(seedPNGBytes)
+		_ = mw.Close()
+		return buf, mw.FormDataContentType()
+	}
+}
 
-// TestContractMatrix enumerates every (auth × resource × shape) cell. Each cell
-// is asserted against a checked-in golden. Until PR 0.8 these all fail.
+// seedPNGBytes is a 1×1 transparent PNG (67 bytes), copied from testutil_test.go.
+var seedPNGBytes = []byte{
+	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+	0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+	0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00,
+	0x0b, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xff, 0x1f, 0x00,
+	0x03, 0x03, 0x02, 0x00, 0xef, 0xbf, 0xa7, 0xdb, 0x00, 0x00, 0x00, 0x00,
+	0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+}
+
+// TestContractMatrix enumerates every (auth × resource × shape) cell from spec
+// §5.2. Each cell asserts against a checked-in golden. Until PR 0.8 these fail.
 func TestContractMatrix(t *testing.T) {
 	if testing.Short() {
 		t.Skip("contract suite is slow; run without -short")
 	}
-	_, send := bootContract(t)
+	_, seed, send := bootContract(t)
 
+	missingID := "00000000-0000-0000-0000-000000000000"
 	cases := []contractCase{
-		// --- /healthz ---
+		// === /healthz ===
 		{name: "healthz_anon", method: "GET", path: "/healthz", viewer: "anon"},
 
-		// --- GET /artworks (feed) ---
-		{name: "feed_anon_empty", method: "GET", path: "/artworks", viewer: "anon"},
-		{name: "feed_anon_bad_cursor", method: "GET", path: "/artworks?cursor=not-base64!!", viewer: "anon"},
-		{name: "feed_anon_limit_oob", method: "GET", path: "/artworks?limit=9999", viewer: "anon"},
+		// === /me ===
+		{name: "me_anon_401", method: "GET", path: "/me", viewer: "anon"},
+		{name: "me_owner_200", method: "GET", path: "/me", viewer: "owner"},
+		{name: "me_other_200", method: "GET", path: "/me", viewer: "other"},
 
-		// --- POST /artworks ---
+		// === GET /artworks (feed) ===
+		{name: "feed_anon", method: "GET", path: "/artworks", viewer: "anon"},
+		{name: "feed_owner", method: "GET", path: "/artworks", viewer: "owner"},
+		{name: "feed_anon_limit_1", method: "GET", path: "/artworks?limit=1", viewer: "anon"},
+		{name: "feed_anon_limit_oob", method: "GET", path: "/artworks?limit=9999", viewer: "anon"},
+		{name: "feed_anon_bad_cursor", method: "GET", path: "/artworks?cursor=not-base64!!", viewer: "anon"},
+
+		// === POST /artworks ===
 		{name: "create_anon_401", method: "POST", path: "/artworks", viewer: "anon", body: `{"title":"x"}`},
 		{name: "create_owner_minimal", method: "POST", path: "/artworks", viewer: "owner", body: `{"title":"x"}`},
-		{name: "create_owner_bad_visibility", method: "POST", path: "/artworks", viewer: "owner", body: `{"title":"x","visibility":"draft"}`},
+		{name: "create_owner_full", method: "POST", path: "/artworks", viewer: "owner", body: `{"title":"x","description":"d","visibility":"public","tags":["a","b"]}`},
+		{name: "create_owner_default_visibility", method: "POST", path: "/artworks", viewer: "owner", body: `{"title":"x","visibility":""}`},
 		{name: "create_owner_bad_json", method: "POST", path: "/artworks", viewer: "owner", body: `not json`},
+		{name: "create_owner_bad_visibility", method: "POST", path: "/artworks", viewer: "owner", body: `{"title":"x","visibility":"draft"}`},
 
-		// --- GET /artworks/{id} ---
-		// owner_get_public, other_get_public, anon_get_public, owner_get_private,
-		// other_get_private, anon_get_private — six cells. Only the IDs differ; the
-		// PR 0.8 capture step seeds two artworks (P public, Q private) via dev/seed
-		// and replays the matching cells.
-		{name: "get_artwork_anon_missing", method: "GET", path: "/artworks/00000000-0000-0000-0000-000000000000", viewer: "anon"},
+		// === GET /artworks/{id} — full 7-cell privacy matrix ===
+		{name: "get_artwork_owner_public", method: "GET", path: "/artworks/" + seed.PID, viewer: "owner"},
+		{name: "get_artwork_other_public", method: "GET", path: "/artworks/" + seed.PID, viewer: "other"},
+		{name: "get_artwork_anon_public", method: "GET", path: "/artworks/" + seed.PID, viewer: "anon"},
+		{name: "get_artwork_owner_private", method: "GET", path: "/artworks/" + seed.QID, viewer: "owner"},
+		{name: "get_artwork_other_private_404", method: "GET", path: "/artworks/" + seed.QID, viewer: "other"},
+		{name: "get_artwork_anon_private_404", method: "GET", path: "/artworks/" + seed.QID, viewer: "anon"},
+		{name: "get_artwork_anon_missing", method: "GET", path: "/artworks/" + missingID, viewer: "anon"},
 
-		// --- PATCH /artworks/{id} ---
-		{name: "patch_anon_401", method: "PATCH", path: "/artworks/00000000-0000-0000-0000-000000000000", viewer: "anon", body: `{"title":"x"}`},
+		// === PATCH /artworks/{id} ===
+		{name: "patch_anon_401", method: "PATCH", path: "/artworks/" + seed.PID, viewer: "anon", body: `{"title":"x"}`},
+		{name: "patch_owner_title_204", method: "PATCH", path: "/artworks/" + seed.PID, viewer: "owner", body: `{"title":"renamed"}`},
+		{name: "patch_owner_same_visibility_204", method: "PATCH", path: "/artworks/" + seed.PID, viewer: "owner", body: `{"visibility":"public"}`},
+		{name: "patch_owner_flip_to_private_204", method: "PATCH", path: "/artworks/" + seed.PID, viewer: "owner", body: `{"visibility":"private"}`},
+		{name: "patch_owner_full_204", method: "PATCH", path: "/artworks/" + seed.QID, viewer: "owner", body: `{"title":"t","description":"d","cover_position":0,"tags":["a"]}`},
+		{name: "patch_owner_bad_json", method: "PATCH", path: "/artworks/" + seed.PID, viewer: "owner", body: `not json`},
+		{name: "patch_owner_bad_visibility", method: "PATCH", path: "/artworks/" + seed.PID, viewer: "owner", body: `{"visibility":"draft"}`},
+		{name: "patch_owner_bad_cover_position", method: "PATCH", path: "/artworks/" + seed.PID, viewer: "owner", body: `{"cover_position":-1}`},
+		{name: "patch_other_public_404", method: "PATCH", path: "/artworks/" + seed.PID, viewer: "other", body: `{"title":"x"}`},
+		{name: "patch_other_private_404", method: "PATCH", path: "/artworks/" + seed.QID, viewer: "other", body: `{"title":"x"}`},
 
-		// --- DELETE /artworks/{id} ---
-		{name: "delete_anon_401", method: "DELETE", path: "/artworks/00000000-0000-0000-0000-000000000000", viewer: "anon"},
+		// === DELETE /artworks/{id} ===
+		{name: "delete_anon_401", method: "DELETE", path: "/artworks/" + seed.PID, viewer: "anon"},
+		{name: "delete_other_public_404", method: "DELETE", path: "/artworks/" + seed.PID, viewer: "other"},
+		{name: "delete_other_private_404", method: "DELETE", path: "/artworks/" + seed.QID, viewer: "other"},
+		{name: "delete_owner_missing_404", method: "DELETE", path: "/artworks/" + missingID, viewer: "owner"},
 
-		// --- POST /artworks/{id}/images ---
-		{name: "upload_anon_401", method: "POST", path: "/artworks/00000000-0000-0000-0000-000000000000/images", viewer: "anon", ctype: "multipart/form-data; boundary=fake"},
+		// === POST /artworks/{id}/images ===
+		{name: "upload_anon_401", method: "POST", path: "/artworks/" + seed.PID + "/images", viewer: "anon",
+			ctype: "multipart/form-data; boundary=fake"},
+		{name: "upload_other_404", method: "POST", path: "/artworks/" + seed.QID + "/images", viewer: "other",
+			ctype: "multipart/form-data; boundary=fake"},
+		{name: "upload_owner_415_non_multipart", method: "POST", path: "/artworks/" + seed.QID + "/images", viewer: "owner",
+			body: `{}`},
+		{name: "upload_owner_400_no_manifest", method: "POST", path: "/artworks/" + seed.QID + "/images", viewer: "owner",
+			bodyMP: func(t *testing.T) (io.Reader, string) {
+				buf := &bytes.Buffer{}
+				mw := multipart.NewWriter(buf)
+				_ = mw.Close()
+				return buf, mw.FormDataContentType()
+			}},
+		{name: "upload_owner_400_file_count_mismatch", method: "POST", path: "/artworks/" + seed.QID + "/images", viewer: "owner",
+			bodyMP: func(t *testing.T) (io.Reader, string) {
+				buf := &bytes.Buffer{}
+				mw := multipart.NewWriter(buf)
+				_ = mw.WriteField("manifest", `[{"client_image_id":"K","position":0,"content_type":"image/png"}]`)
+				_ = mw.Close()
+				return buf, mw.FormDataContentType()
+			}},
+		{name: "upload_owner_201", method: "POST", path: "/artworks/" + seed.QID + "/images", viewer: "owner",
+			bodyMP: validImageUpload("K-new", 1)},
 
-		// --- /me ---
-		{name: "me_anon_401", method: "GET", path: "/me", viewer: "anon"},
-
-		// --- /users/{slug} ---
+		// === /users/{slug} ===
+		{name: "user_profile_owner_self", method: "GET", path: "/users/" + seed.AliceSlug, viewer: "owner"},
+		{name: "user_profile_anon", method: "GET", path: "/users/" + seed.AliceSlug, viewer: "anon"},
 		{name: "user_profile_missing_slug", method: "GET", path: "/users/no-such-slug", viewer: "anon"},
+		{name: "user_profile_bad_cursor", method: "GET", path: "/users/" + seed.AliceSlug + "?cursor=not-base64!!", viewer: "anon"},
 
-		// --- /tags/{name} ---
+		// === /tags/{name} ===
+		{name: "tag_present", method: "GET", path: "/tags/t", viewer: "anon"},
 		{name: "tag_missing", method: "GET", path: "/tags/no-such-tag", viewer: "anon"},
 
-		// --- /auth/{provider}/start ---
-		{name: "auth_unknown_provider", method: "GET", path: "/auth/notreal/start", viewer: "anon"},
-		{name: "auth_callback_bad_state", method: "GET", path: "/auth/google/callback?state=mismatch", viewer: "anon"},
+		// === /auth/{provider}/start — fake provider produces 302 ===
+		{name: "auth_google_start_anon_302", method: "GET", path: "/auth/google/start", viewer: "anon"},
+		{name: "auth_unknown_provider_404", method: "GET", path: "/auth/notreal/start", viewer: "anon"},
 
-		// --- /auth/logout ---
-		{name: "logout_anon", method: "POST", path: "/auth/logout", viewer: "anon"},
+		// === /auth/{provider}/callback ===
+		{name: "auth_callback_unknown_provider_404", method: "GET", path: "/auth/notreal/callback?state=x&code=y", viewer: "anon"},
+		{name: "auth_callback_bad_state_400", method: "GET", path: "/auth/google/callback?state=mismatch&code=y", viewer: "anon"},
+		// Exchange-failure path: code=fail in fake_provider triggers 502.
+		// state matching requires the state cookie, so this case only exercises
+		// the unknown-provider / bad-state branches reachable from anon. The full
+		// callback happy-path requires cookie pre-seeding; document and add in a
+		// follow-up if PR 0.8 capture finds the gap matters.
+
+		// === /auth/logout ===
+		{name: "logout_anon_204", method: "POST", path: "/auth/logout", viewer: "anon"},
+		{name: "logout_owner_204", method: "POST", path: "/auth/logout", viewer: "owner"},
 	}
 
 	for _, c := range cases {
@@ -2524,17 +2986,19 @@ func TestContractMatrix(t *testing.T) {
 }
 ```
 
-> Remaining viewer-aware cells (owner/other × public/private artwork variants, plus the full image-upload happy path) require seeding artworks before each request. PR 0.8's capture step extends `bootContract` to seed via the existing `/dev/seed` handler before each viewer-aware run. For PR 0.7, the framework + the anon cells above are enough — reviewers focus on whether the matrix covers each axis from spec §5.2.
+> The matrix covers every (auth × resource × shape) cell from spec §5.2 except: (a) `/dev/seed` (excluded by §5.2.1), (b) the auth-callback happy path (requires cookie pre-seed beyond what fake_provider provides cleanly — captured by inspecting whether the body bytes change in PR 0.8). If PR 0.8's capture surfaces additional cells that need explicit handling, add them and re-run with `GOLDEN_UPDATE=1`.
 
-- [ ] **Step 2: Run.**
+- [ ] **Step 3: Run.**
 
 Run: `go test ./internal/httpapi/contract/... -v`
 Expected: every subtest fails with "rerun with GOLDEN_UPDATE=1 to create" — that is the intended state until PR 0.8.
 
-- [ ] **Step 3: Commit.**
+- [ ] **Step 4: Commit (and stage the deletion).**
 
 ```bash
+cd /Users/todd.lam/WORK/_TestScripts/art-web
 git add api/internal/httpapi/contract/matrix_test.go
+git rm api/internal/httpapi/contract/placeholder_test.go
 git commit -m "[0.7-contract-matrix] feat: enumerate cartesian HTTP contract cells (no goldens yet)"
 ```
 
@@ -2643,16 +3107,19 @@ gh pr create --base master --title "[0.7-contract-matrix] HTTP contract matrix +
 ## Summary
 - Add `image.IDProvider` interface (production: `uuid.NewString`; tests: `CounterIDProvider`); switch the only Go-side image-ID call site to use it.
 - Add `auth.RandReader` interface; switch `randState` to use it.
-- Wire both into `dbtest.BootApp`.
-- Write the cartesian contract matrix (no goldens yet — fails as expected; PR 0.8 captures).
+- Wire both into `dbtest.BootApp` alongside fixed clock and fake auth provider.
+- Add `contract.FakeProviders()` so `/auth/google/start` produces a real 302 redirect (not 404 from `unknown_provider`).
+- Replace placeholder_test.go with the full cartesian contract matrix covering every (auth × resource × shape) cell from spec §5.2.
+- Use `noRedirectClient` (`CheckRedirect: http.ErrUseLastResponse`) so 302s are captured as 302, not silently followed.
 - Write the forbidden-status meta-test (skips until goldens exist).
 
 ## Test plan
 - [ ] All existing tests still pass (the IDProvider/RandReader switches are no-op refactors)
-- [ ] `go test ./internal/httpapi/contract/...` fails with golden-not-found errors (intended)
+- [ ] `go test ./internal/httpapi/contract/...` fails with golden-not-found errors for every cell (intended; PR 0.8 captures)
 - [ ] `go vet ./...` clean
+- [ ] `auth_google_start_anon_302` cell hits the fake provider's 302 (not the unknown_provider 404)
 
-Refs spec §5.3.2 (dynamic-byte injection), §5.2.0a (forbidden statuses).
+Refs spec §5.2 (matrix), §5.2.0a (forbidden statuses), §5.3.2 (dynamic-byte injection).
 EOF
 )"
 ```
