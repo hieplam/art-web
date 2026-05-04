@@ -180,7 +180,11 @@ main {
 .masonry {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  grid-auto-rows: 1fr;
+  /* Row tracks size to content. Each cell carries an explicit aspect-ratio
+     (set by tier or spotlight), so items dictate their own height — fixing
+     `1fr` here would force equal-height tracks that fight the aspect rules
+     and leave gaps between the cell edge and the image. */
+  grid-auto-rows: auto;
   grid-auto-flow: dense;
   gap: 4px;
   padding: 4px;
