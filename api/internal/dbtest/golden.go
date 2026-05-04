@@ -25,11 +25,21 @@ type goldenEnvelope struct {
 //
 // Default golden directory: ./golden relative to the test file's package.
 // Override via GOLDEN_DIR for unit tests of the helper itself.
+//
+// `name` must be a leaf filename (no path separators). The helper rejects names
+// containing "/" so a typo can't silently write outside the golden directory.
 func AssertGolden(t *testing.T, name string, resp *http.Response) {
 	t.Helper()
+	if filepath.Base(name) != name {
+		t.Fatalf("golden name %q must not contain path separators", name)
+	}
 
+	defer resp.Body.Close()
 	NormalizeHeaders(resp.Header)
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
 	bodyBytes = NormalizeBody(bodyBytes)
 
 	envelope := goldenEnvelope{
@@ -74,8 +84,9 @@ func AssertGolden(t *testing.T, name string, resp *http.Response) {
 }
 
 // pickHeaders selects only the headers the contract is anchored to: status-
-// equivalent metadata (Content-Type, Cache-Control) and Set-Cookie. Returning
-// a sorted map keeps the on-disk envelope deterministic.
+// equivalent metadata (Content-Type, Cache-Control), Set-Cookie, and Location
+// (for 302 redirect cells). Returning a sorted map keeps the on-disk envelope
+// deterministic.
 var snapshotHeaders = map[string]bool{
 	"Content-Type":  true,
 	"Cache-Control": true,
