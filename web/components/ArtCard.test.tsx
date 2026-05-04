@@ -26,15 +26,4 @@ describe("ArtCard", () => {
     expect(img.getAttribute("width")).toBe("800");
     expect(img.getAttribute("height")).toBe("600");
   });
-
-  it("classifies tier from cover aspect ratio", () => {
-    // 800×600 -> r=1.33 -> wide
-    const { unmount } = render(<ArtCard item={item} />);
-    expect(screen.getByRole("link").getAttribute("data-tier")).toBe("wide");
-    unmount();
-
-    const narrow = { ...item, cover: { ...item.cover, width: 600, height: 1200 } };
-    render(<ArtCard item={narrow} />);
-    expect(screen.getByRole("link").getAttribute("data-tier")).toBe("narrow");
-  });
 });

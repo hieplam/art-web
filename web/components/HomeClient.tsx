@@ -30,14 +30,7 @@ export function HomeClient(props: {
           if (!r.ok) throw new Error(`feed fetch failed: ${r.status}`);
           return r.json() as Promise<Feed>;
         }}
-        // Periodic spotlights: every 7th tile (index 6, 13, 20, ...) breaks
-        // the grid rhythm with a 2x2 frame. 7 is prime, so the spotlight
-        // position visually drifts across rows for any column count (3-6),
-        // avoiding a vertical stripe. The InfiniteFeed index continues
-        // monotonically across paginated loads, so cadence is preserved.
-        renderItem={(it, idx) => (
-          <ArtCard key={it.id} item={it} spotlight={idx > 0 && (idx + 1) % 7 === 0} />
-        )}
+        renderItem={(it) => <ArtCard key={it.id} item={it} />}
       />
     </Masonry>
   );
