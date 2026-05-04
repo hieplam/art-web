@@ -172,44 +172,45 @@ main {
   min-height: calc(100vh - var(--nav-h));
 }
 
-/* ── Masonry feed (edge-bleed, mobile first) ──────────────────────────── */
+/* ── Feed grid — uniform cells, periodic 2×2 spotlights break the rhythm ──
+   Switched from CSS multi-column to CSS Grid so a tile can claim a
+   2-col × 2-row "spotlight" frame every 7th card. `grid-auto-flow: dense`
+   lets ordinary tiles backfill any holes the spotlight would leave. */
 
 .masonry {
-  columns: 2;
-  column-gap: 4px;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  /* Row tracks size to content. Each cell carries an explicit aspect-ratio
+     (set by tier or spotlight), so items dictate their own height — fixing
+     `1fr` here would force equal-height tracks that fight the aspect rules
+     and leave gaps between the cell edge and the image. */
+  grid-auto-rows: auto;
+  grid-auto-flow: dense;
+  gap: 4px;
   padding: 4px;
-}
-
-.masonry > * {
-  break-inside: avoid;
-  margin-bottom: 4px;
-  display: block;
 }
 
 .feed-sentinel {
   display: block;
   height: 1px;
   margin: 0;
-  break-inside: avoid;
-  column-span: all;
+  grid-column: 1 / -1;
 }
 
 @media (min-width: 640px) {
-  .masonry { columns: 3; column-gap: 6px; padding: 6px; }
-  .masonry > * { margin-bottom: 6px; }
+  .masonry { grid-template-columns: repeat(3, 1fr); gap: 6px; padding: 6px; }
 }
 
 @media (min-width: 1024px) {
-  .masonry { columns: 4; column-gap: var(--gutter); padding: var(--gutter); }
-  .masonry > * { margin-bottom: var(--gutter); }
+  .masonry { grid-template-columns: repeat(4, 1fr); gap: var(--gutter); padding: var(--gutter); }
 }
 
 @media (min-width: 1440px) {
-  .masonry { columns: 5; }
+  .masonry { grid-template-columns: repeat(5, 1fr); }
 }
 
 @media (min-width: 1920px) {
-  .masonry { columns: 6; }
+  .masonry { grid-template-columns: repeat(6, 1fr); }
 }
 
 /* ── ArtCard — the artwork is the only protagonist ────────────────────── */
@@ -224,13 +225,60 @@ main {
   transition: outline-color var(--t-base) var(--ease-out),
               transform var(--t-base) var(--ease-out);
   will-change: transform;
+  /* Mobile fallback: uniform squares so 2-col layout stays predictable.
+     Tier-driven shapes are layered on at >=640px below. */
+  aspect-ratio: 1 / 1;
+}
+
+/* Tier-driven cell shapes — variation comes from each artwork's own
+   aspect ratio, computed in ArtCard.tsx. Only kicks in once the grid
+   is wide enough (>=640px) to host non-square cells without a single
+   wide card eating an entire mobile row. Spotlight overrides any tier. */
+@media (min-width: 640px) {
+  .art-card[data-tier="narrow"]    { aspect-ratio: 1 / 2;  grid-row: span 2; }
+  .art-card[data-tier="square"]    { aspect-ratio: 1 / 1; }
+  .art-card[data-tier="wide"]      { aspect-ratio: 2 / 1;  grid-column: span 2; }
+  .art-card[data-tier="panoramic"] { aspect-ratio: 3 / 1;  grid-column: span 3; }
 }
 
 .art-card-image {
   display: block;
   width: 100%;
-  height: auto;
+  height: 100%;
+  object-fit: cover;
   background: var(--bg-elev-1);
+}
+
+/* Spotlight — every 7th tile claims a 2×2 frame. On mobile (2-col layout)
+   a 2-span would consume the entire row and read as a hero, so we collapse
+   to a 1×1 cell there and only break the rhythm from 640px up. The image
+   stays a `next/image` but uses a wider sizes hint so the CDN serves a
+   higher resolution. Metadata is permanently visible: when an artwork
+   earns a spotlight, the title/artist earn presence too. */
+@media (min-width: 640px) {
+  .art-card-spotlight {
+    grid-column: span 2;
+    grid-row: span 2;
+    /* Spotlight cells are always 2×2 squares regardless of the underlying
+       artwork's tier — overrides the tier-driven aspect-ratio above. */
+    aspect-ratio: 1 / 1;
+  }
+}
+
+.art-card-spotlight .art-card-meta {
+  opacity: 1;
+  transform: none;
+  padding: 36px 16px 14px;
+  background: linear-gradient(180deg, transparent 0%, oklch(0 0 0 / 0.55) 55%, oklch(0 0 0 / 0.85) 100%);
+}
+
+.art-card-spotlight .art-card-title {
+  font-size: 1rem;
+  letter-spacing: -0.01em;
+}
+
+.art-card-spotlight .art-card-subtitle {
+  font-size: 0.75rem;
 }
 
 .art-card-meta {
