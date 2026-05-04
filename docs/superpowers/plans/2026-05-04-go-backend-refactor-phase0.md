@@ -1,0 +1,2869 @@
+# Go backend refactor — Phase 0 implementation plan ("Test net")
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build the safety net (≥ 80 % coverage on the four business slices + a byte-strict HTTP contract suite with locked golden snapshots) that lets the Phase 1 big-bang refactor land with zero observable side effects.
+
+**Architecture:** 8 small, independently-mergeable PRs on `master`, in order. Each PR builds on the previous. PR 0.1 extends the testcontainers harness; 0.2–0.6 raise package coverage to ≥ 80 %; 0.7 introduces the HTTP contract matrix and the deterministic-ID injection points; 0.8 captures and locks the golden snapshots.
+
+**Tech Stack:** Go, `testcontainers-go`, `golang-migrate`, `chi/v5`, `pgx/v5`, `httptest`. **No new runtime libraries land in Phase 0.** GORM, Wire, zerolog, validator are all Phase 1.
+
+**Spec reference:** `docs/superpowers/specs/2026-05-04-go-backend-refactor-design.md`. When this plan and the spec disagree, the spec wins — file an issue and update the plan.
+
+**Out of scope for this plan:** Phase 1 (the layout move + GORM/Wire/zerolog swap). Phase 1's exact validator-translator table and HTTP error mapping are *derived from* PR 0.8's captured snapshots, so Phase 1 gets its own plan written **after** PR 0.8 lands.
+
+---
+
+## File structure created or modified by this plan
+
+The Phase 0 layout is the **current** flat layout — no slice-internal directories yet. Phase 0 changes only `api/internal/dbtest/` and `api/internal/httpapi/contract/` plus per-package `*_test.go` files.
+
+| Path | Status | Responsibility |
+|---|---|---|
+| `api/internal/dbtest/postgres.go` | Modify | Existing testcontainers Postgres. Extend with `StartMinio(t)`. |
+| `api/internal/dbtest/minio.go` | Create | New testcontainers MinIO harness shared with the contract suite. |
+| `api/internal/dbtest/bootapp.go` | Create | `BootApp(t, opts) *http.Server` — boots the in-process API with deterministic clocks/RNG/IDProvider for the contract suite. |
+| `api/internal/dbtest/normalize.go` | Create | Dynamic-byte normalizer (UUID, timestamp, JWT, HMAC, cursor regex replacers). |
+| `api/internal/dbtest/golden.go` | Create | `assertGolden(t, name, resp)` helper with `GOLDEN_UPDATE=1` write-mode. |
+| `api/internal/user/repo_test.go` | Modify | Add slugify, slug-collision, slug-exhaustion, ErrNotFound, lookupExistingOAuth tests. |
+| `api/internal/user/slugify_test.go` | Create | Pure-function tests for `slugify` (currently unexported — see PR 0.2). |
+| `api/internal/storage/localfs_test.go` | Modify | Add path-traversal-edge cases, missing-source for Move, signed-URL roundtrip. |
+| `api/internal/storage/r2_test.go` | Modify | Add multipart, missing-bucket, content-type roundtrip. |
+| `api/internal/image/handler_test.go` | Modify | Add `manifest_required`, `bad_multipart`, `file_count_mismatch`, content-type-roundtrip orphan tests. |
+| `api/internal/image/service_test.go` | Modify (or create) | Add fingerprint-mismatch precedence, decode-format-vs-declared mismatch, max-bytes-exact-boundary tests. |
+| `api/internal/httpapi/privacy_matrix_test.go` | Modify | Fill matrix gaps (anon GET on private 404, PATCH-of-other-user 404, DELETE-of-other-user 404). |
+| `api/internal/httpapi/error_codes_test.go` | Create | One test per Shape-A and Shape-B error code listed in spec §3 — asserts status + body. |
+| `api/internal/httpapi/devseed_test.go` | Modify | Cover `AppEnv != "test"` 404 path and the 200-success path body shape. |
+| `api/internal/db/pool_test.go` | Modify | Add bad-DSN error path. |
+| `api/internal/artwork/visibility_test.go` | Modify | Add storage-failure-during-flip, DB-tx-failure rollback, RollbackLog firing tests. |
+| `api/internal/image/idprovider.go` | Create | `IDProvider` interface + `uuidIDProvider` default + `CounterIDProvider` for tests. |
+| `api/internal/image/service.go` | Modify | Replace `uuid.NewString()` at line 84 with `s.ids.NewID()`. |
+| `api/internal/auth/handlers.go` | Modify | Replace `randState()` body with `RandReader.Read` injection (default `crypto/rand.Reader`). |
+| `api/internal/auth/randreader.go` | Create | `RandReader` interface + default + deterministic test impl. |
+| `api/internal/httpapi/contract/matrix_test.go` | Create | Cartesian-product HTTP contract suite. |
+| `api/internal/httpapi/contract/forbidden_status_test.go` | Create | Meta-test: scans `golden/*.json` for forbidden statuses (403, translated 409). |
+| `api/internal/httpapi/contract/golden/` | Create | Per-test JSON snapshot files. Empty until PR 0.8. |
+| `api/Makefile` | Modify | Add `test-contract`, `test-cover`, `test-cover-slices` targets. |
+| `.github/workflows/contract.yml` (or equivalent) | Create | CI job `contract_suite`. Skipped initially (PR 0.1), required after PR 0.8. |
+| `CODEOWNERS` (root) | Modify | Protect `api/internal/httpapi/contract/golden/`. |
+
+---
+
+## Conventions for every PR in this plan
+
+- **Branch naming:** `phase0/0.N-<short-name>` (e.g. `phase0/0.1-test-harness`).
+- **Commit message format (per `~/.claude/rules/git-conventions.md`):** every commit subject starts with `[<branch-name-without-prefix>]`. Examples:
+  - `[0.1-test-harness] feat: add testcontainers MinIO module`
+  - `[0.2-user] test: cover slug-exhaustion error path`
+- **Frequent commits:** commit after every passing test or every couple of related tests, not just at end of PR.
+- **No co-author / Claude attribution footer** (per the project's git rules).
+- **Bug-fix policy (spec §5.6):** if a Phase 0 test surfaces a real bug, **stop**, ship the fix as a separate `phase-0-behavior-change` PR with reviewer signoff, then resume.
+- **Coverage check command per slice (Phase 0 layout):**
+  ```bash
+  go test -cover ./internal/<slice>/...
+  ```
+
+---
+
+## PR 0.1 — Test-harness scaffolding
+
+**Branch:** `phase0/0.1-test-harness`
+
+**Goal:** Extend `internal/dbtest/` so PR 0.7 can boot the full API in-process with deterministic sources and capture byte-strict goldens. Wire a `contract_suite` CI job that is skipped today and gets activated in PR 0.8.
+
+**Acceptance criteria:**
+- All current tests still pass (`make test` green).
+- New `dbtest.StartMinio(t)` boots a MinIO container and returns endpoint/access keys.
+- New `dbtest.BootApp(t, opts)` returns an `*http.Server` that the contract suite can call.
+- New `dbtest.AssertGolden(t, name, resp)` exists, with `GOLDEN_UPDATE=1` write mode.
+- New `dbtest.Normalize(body, headers)` rewrites dynamic bytes per spec §5.3.2.
+- A self-test in `dbtest/bootapp_test.go` boots the API and asserts `GET /healthz` returns 200.
+- CI workflow `contract.yml` exists with the `contract_suite` job; it currently does nothing more than `echo "skipped until PR 0.8"`.
+
+### Task 1.1 — Add MinIO testcontainers harness
+
+**Files:**
+- Create: `api/internal/dbtest/minio.go`
+
+- [ ] **Step 1: Add the testcontainers MinIO module dependency.**
+
+```bash
+cd /Users/todd.lam/WORK/_TestScripts/art-web/api
+go get github.com/testcontainers/testcontainers-go/modules/minio@latest
+go mod tidy
+```
+
+- [ ] **Step 2: Create the harness file.**
+
+Write `api/internal/dbtest/minio.go`:
+
+```go
+// api/internal/dbtest/minio.go
+package dbtest
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
+)
+
+type MinioInfo struct {
+	Endpoint  string // host:port, no scheme
+	AccessKey string
+	SecretKey string
+	Bucket    string
+}
+
+var (
+	minioOnce sync.Once
+	minioInfo MinioInfo
+	minioErr  error
+)
+
+// StartMinio boots a single MinIO container shared across all tests in the run
+// (sync.Once mirrors StartPostgres). Tests must not run in parallel with other
+// tests that mutate buckets.
+func StartMinio(t testing.TB) MinioInfo {
+	t.Helper()
+	minioOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		container, err := tcminio.Run(ctx, "minio/minio:latest",
+			tcminio.WithUsername("minioadmin"),
+			tcminio.WithPassword("minioadmin"),
+		)
+		if err != nil {
+			minioErr = err
+			return
+		}
+		endpoint, err := container.ConnectionString(ctx)
+		if err != nil {
+			minioErr = err
+			return
+		}
+		minioInfo = MinioInfo{
+			Endpoint:  endpoint,
+			AccessKey: "minioadmin",
+			SecretKey: "minioadmin",
+			Bucket:    "artweb-test",
+		}
+	})
+	if minioErr != nil {
+		t.Fatalf("minio harness: %v", minioErr)
+	}
+	return minioInfo
+}
+```
+
+- [ ] **Step 3: Add a smoke test for the harness.**
+
+Write `api/internal/dbtest/minio_test.go`:
+
+```go
+package dbtest_test
+
+import (
+	"testing"
+
+	"local/art-web/api/internal/dbtest"
+)
+
+func TestStartMinio_ReturnsEndpoint(t *testing.T) {
+	info := dbtest.StartMinio(t)
+	if info.Endpoint == "" {
+		t.Fatal("StartMinio returned empty endpoint")
+	}
+	if info.Bucket == "" {
+		t.Fatal("StartMinio returned empty bucket")
+	}
+}
+```
+
+- [ ] **Step 4: Run the smoke test.**
+
+Run: `go test ./internal/dbtest/... -run TestStartMinio_ReturnsEndpoint -v`
+Expected: PASS (container boots in ~10–30 s on cold cache).
+
+- [ ] **Step 5: Commit.**
+
+```bash
+git add api/internal/dbtest/minio.go api/internal/dbtest/minio_test.go api/go.mod api/go.sum
+git commit -m "[0.1-test-harness] feat: add testcontainers MinIO harness"
+```
+
+### Task 1.2 — Add the dynamic-byte normalizer
+
+**Files:**
+- Create: `api/internal/dbtest/normalize.go`
+- Create: `api/internal/dbtest/normalize_test.go`
+
+- [ ] **Step 1: Write the failing test.**
+
+Write `api/internal/dbtest/normalize_test.go`:
+
+```go
+package dbtest_test
+
+import (
+	"net/http"
+	"strings"
+	"testing"
+
+	"local/art-web/api/internal/dbtest"
+)
+
+func TestNormalize_ReplacesUUIDs(t *testing.T) {
+	body := `{"id":"550e8400-e29b-41d4-a716-446655440000"}`
+	got := dbtest.NormalizeBody([]byte(body))
+	want := `{"id":"<UUID>"}`
+	if string(got) != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestNormalize_ReplacesRFC3339Timestamps(t *testing.T) {
+	body := `{"created_at":"2026-05-04T10:11:12Z"}`
+	got := dbtest.NormalizeBody([]byte(body))
+	want := `{"created_at":"<TIMESTAMP>"}`
+	if string(got) != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestNormalize_ReplacesRFC3339NanoTimestamps(t *testing.T) {
+	body := `{"created_at":"2026-05-04T10:11:12.123456789Z"}`
+	got := dbtest.NormalizeBody([]byte(body))
+	want := `{"created_at":"<TIMESTAMP>"}`
+	if string(got) != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestNormalize_ReplacesHMACSignedURLSuffix(t *testing.T) {
+	body := `{"url":"https://x/y.jpg?sig=deadbeefcafe1234&exp=1714823472"}`
+	got := dbtest.NormalizeBody([]byte(body))
+	want := `{"url":"https://x/y.jpg?sig=<SIG>&exp=<EXP>"}`
+	if string(got) != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestNormalize_ReplacesBase64Cursor(t *testing.T) {
+	body := `{"next_cursor":"<CURSOR>"}`
+	got := dbtest.NormalizeBody([]byte(body))
+	if string(got) != body {
+		t.Fatalf("normalize must be idempotent on already-normalized cursor; got %q", got)
+	}
+}
+
+func TestNormalizeHeader_ReplacesAuthCookie(t *testing.T) {
+	h := http.Header{}
+	h.Add("Set-Cookie", "auth=abc.def.ghi; Path=/; HttpOnly; SameSite=Lax")
+	dbtest.NormalizeHeaders(h)
+	got := h.Get("Set-Cookie")
+	if !strings.Contains(got, "auth=<JWT>") {
+		t.Fatalf("expected auth=<JWT>, got %q", got)
+	}
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail with "package not found".**
+
+Run: `go test ./internal/dbtest/... -run TestNormalize -v`
+Expected: FAIL — `dbtest.NormalizeBody` and `dbtest.NormalizeHeaders` are undefined.
+
+- [ ] **Step 3: Implement the normalizer.**
+
+Write `api/internal/dbtest/normalize.go`:
+
+```go
+// api/internal/dbtest/normalize.go
+package dbtest
+
+import (
+	"net/http"
+	"regexp"
+)
+
+// Patterns are documented in spec §5.3.2. Order matters: signed-URL substitution
+// runs before generic timestamp substitution because the URL also contains an
+// `exp=` epoch-second integer that would otherwise be left as a bare digit run.
+var (
+	uuidRe       = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	rfc3339Re    = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z`)
+	signedURLRe  = regexp.MustCompile(`\?sig=[0-9a-f]+&exp=\d+`)
+	cookieAuthRe = regexp.MustCompile(`auth=[^;]+`)
+	jwtBearerRe  = regexp.MustCompile(`Bearer [A-Za-z0-9_\-\.]+`)
+)
+
+// NormalizeBody rewrites every non-deterministic byte sequence in body to a
+// stable placeholder so post-normalization snapshots compare equal.
+func NormalizeBody(body []byte) []byte {
+	body = signedURLRe.ReplaceAll(body, []byte(`?sig=<SIG>&exp=<EXP>`))
+	body = rfc3339Re.ReplaceAll(body, []byte(`<TIMESTAMP>`))
+	body = uuidRe.ReplaceAll(body, []byte(`<UUID>`))
+	return body
+}
+
+// NormalizeHeaders rewrites Set-Cookie and Authorization headers in place.
+func NormalizeHeaders(h http.Header) {
+	if vals, ok := h["Set-Cookie"]; ok {
+		for i, v := range vals {
+			vals[i] = cookieAuthRe.ReplaceAllString(v, "auth=<JWT>")
+		}
+	}
+	if vals, ok := h["Authorization"]; ok {
+		for i, v := range vals {
+			vals[i] = jwtBearerRe.ReplaceAllString(v, "Bearer <JWT>")
+		}
+	}
+}
+```
+
+- [ ] **Step 4: Run the tests to verify pass.**
+
+Run: `go test ./internal/dbtest/... -run TestNormalize -v`
+Expected: PASS for all six subtests.
+
+- [ ] **Step 5: Commit.**
+
+```bash
+git add api/internal/dbtest/normalize.go api/internal/dbtest/normalize_test.go
+git commit -m "[0.1-test-harness] feat: add dynamic-byte normalizer for snapshots"
+```
+
+### Task 1.3 — Add the golden-file helper
+
+**Files:**
+- Create: `api/internal/dbtest/golden.go`
+- Create: `api/internal/dbtest/golden_test.go`
+
+- [ ] **Step 1: Write the failing test.**
+
+Write `api/internal/dbtest/golden_test.go`:
+
+```go
+package dbtest_test
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"local/art-web/api/internal/dbtest"
+)
+
+func TestAssertGolden_WriteMode_CreatesFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GOLDEN_UPDATE", "1")
+	t.Setenv("GOLDEN_DIR", dir)
+
+	rec := httptest.NewRecorder()
+	rec.Code = 200
+	rec.Header().Set("Content-Type", "application/json; charset=utf-8")
+	rec.Body.WriteString(`{"id":"550e8400-e29b-41d4-a716-446655440000"}`)
+	resp := rec.Result()
+
+	dbtest.AssertGolden(t, "sample", resp)
+
+	bs, err := os.ReadFile(filepath.Join(dir, "sample.json"))
+	if err != nil {
+		t.Fatalf("expected golden file written: %v", err)
+	}
+	want := `{"id":"<UUID>"}`
+	if string(bs) == "" || !contains(string(bs), want) {
+		t.Fatalf("golden file missing normalized body; got %q", bs)
+	}
+}
+
+func TestAssertGolden_CompareMode_PassesWhenEqual(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "sample.json"),
+		[]byte(`{"status":200,"body":"{\"ok\":true}"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOLDEN_DIR", dir)
+
+	rec := httptest.NewRecorder()
+	rec.Code = 200
+	rec.Body.WriteString(`{"ok":true}`)
+	dbtest.AssertGolden(t, "sample", rec.Result())
+}
+
+func contains(haystack, needle string) bool {
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
+}
+```
+
+- [ ] **Step 2: Run to confirm failure.**
+
+Run: `go test ./internal/dbtest/... -run TestAssertGolden -v`
+Expected: FAIL — `dbtest.AssertGolden` undefined.
+
+- [ ] **Step 3: Implement the helper.**
+
+Write `api/internal/dbtest/golden.go`:
+
+```go
+// api/internal/dbtest/golden.go
+package dbtest
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"testing"
+)
+
+// goldenEnvelope is the on-disk shape of a snapshot. JSON keys are alphabetical
+// so commit diffs stay reviewable.
+type goldenEnvelope struct {
+	Body    string              `json:"body"`
+	Headers map[string][]string `json:"headers"`
+	Status  int                 `json:"status"`
+}
+
+// AssertGolden compares resp (post-normalization) against a checked-in golden
+// file. With GOLDEN_UPDATE=1 the file is (re)written instead of compared.
+//
+// Default golden directory: ./golden relative to the test file's package.
+// Override via GOLDEN_DIR for unit tests of the helper itself.
+func AssertGolden(t *testing.T, name string, resp *http.Response) {
+	t.Helper()
+
+	NormalizeHeaders(resp.Header)
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	bodyBytes = NormalizeBody(bodyBytes)
+
+	envelope := goldenEnvelope{
+		Status:  resp.StatusCode,
+		Headers: pickHeaders(resp.Header),
+		Body:    string(bodyBytes),
+	}
+	got, err := json.MarshalIndent(envelope, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal envelope: %v", err)
+	}
+
+	dir := os.Getenv("GOLDEN_DIR")
+	if dir == "" {
+		dir = "golden"
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", dir, err)
+	}
+	path := filepath.Join(dir, name+".json")
+
+	if os.Getenv("GOLDEN_UPDATE") == "1" {
+		if err := os.WriteFile(path, got, 0o644); err != nil {
+			t.Fatalf("write golden %s: %v", path, err)
+		}
+		return
+	}
+
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read golden %s: %v (rerun with GOLDEN_UPDATE=1 to create)", path, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("golden %s mismatch.\n--- got ---\n%s\n--- want ---\n%s\n", path, got, want)
+	}
+}
+
+// pickHeaders selects only the headers the contract is anchored to: status-
+// equivalent metadata (Content-Type, Cache-Control) and Set-Cookie. Returning
+// a sorted map keeps the on-disk envelope deterministic.
+var snapshotHeaders = map[string]bool{
+	"Content-Type":  true,
+	"Cache-Control": true,
+	"Set-Cookie":    true,
+	"Location":      true,
+}
+
+func pickHeaders(h http.Header) map[string][]string {
+	out := map[string][]string{}
+	for k, vs := range h {
+		if !snapshotHeaders[http.CanonicalHeaderKey(k)] {
+			continue
+		}
+		out[k] = append([]string(nil), vs...)
+	}
+	// Sort header values within each key so multi-value headers don't drift.
+	for _, vs := range out {
+		sort.Strings(vs)
+	}
+	return out
+}
+```
+
+- [ ] **Step 4: Run tests to verify pass.**
+
+Run: `go test ./internal/dbtest/... -run TestAssertGolden -v`
+Expected: PASS for both subtests.
+
+- [ ] **Step 5: Commit.**
+
+```bash
+git add api/internal/dbtest/golden.go api/internal/dbtest/golden_test.go
+git commit -m "[0.1-test-harness] feat: add golden-file assert helper"
+```
+
+### Task 1.4 — Add the in-process API booter
+
+**Files:**
+- Create: `api/internal/dbtest/bootapp.go`
+- Create: `api/internal/dbtest/bootapp_test.go`
+
+- [ ] **Step 1: Write the booter.**
+
+The booter accepts injectable test fakes (clock, RNG, IDs). PR 0.7 adds the actual `IDProvider`/`RandReader` types — for now, BootApp accepts `time.Time` clocks only and falls back to current behavior for IDs. This task lays the structure so PR 0.7 adds two parameters cleanly.
+
+Write `api/internal/dbtest/bootapp.go`:
+
+```go
+// api/internal/dbtest/bootapp.go
+package dbtest
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"local/art-web/api/internal/artwork"
+	"local/art-web/api/internal/auth"
+	"local/art-web/api/internal/db"
+	"local/art-web/api/internal/httpapi"
+	"local/art-web/api/internal/image"
+	"local/art-web/api/internal/storage"
+	"local/art-web/api/internal/user"
+)
+
+// BootOpts injects deterministic sources for the contract suite. Any zero
+// field falls back to the current production default.
+type BootOpts struct {
+	// FixedNow, when non-zero, replaces every JWT/URL clock with a constant.
+	FixedNow time.Time
+
+	// AppEnv defaults to "test" so the dev seed route is registered.
+	AppEnv string
+
+	// Frontend defaults to "http://localhost:3000/".
+	Frontend string
+
+	// AllowedOrigin defaults to "http://localhost:3000".
+	AllowedOrigin string
+
+	// JWTKey / SignKey default to fixed 32-byte test keys.
+	JWTKey  []byte
+	SignKey []byte
+}
+
+// BootApp returns an *httptest.Server backed by the real httpapi.Deps stack
+// against a fresh testcontainers Postgres + a local-filesystem store under
+// t.TempDir(). It mirrors httpapi/testutil_test.go's setup but is exported so
+// the contract suite can use it.
+func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
+	t.Helper()
+
+	if opts.AppEnv == "" {
+		opts.AppEnv = "test"
+	}
+	if opts.Frontend == "" {
+		opts.Frontend = "http://localhost:3000/"
+	}
+	if opts.AllowedOrigin == "" {
+		opts.AllowedOrigin = "http://localhost:3000"
+	}
+	if len(opts.JWTKey) == 0 {
+		opts.JWTKey = []byte("test-jwt-key-pad-to-32-bytes!!!!")
+	}
+	if len(opts.SignKey) == 0 {
+		opts.SignKey = []byte("test-sign-key-pad-to-32-bytes!!!")
+	}
+
+	dsn := StartPostgres(t)
+	pool, err := db.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("db.New: %v", err)
+	}
+	t.Cleanup(func() { pool.Close() })
+	TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
+		_, err := pool.Exec(ctx, sql)
+		return err
+	})
+
+	store := storage.NewLocalFS(t.TempDir())
+	clock := time.Now
+	if !opts.FixedNow.IsZero() {
+		clock = func() time.Time { return opts.FixedNow }
+	}
+	jwts := auth.NewJWT(opts.JWTKey, clock)
+	urls := auth.NewURLBuilder("http://localhost:8787", opts.SignKey, clock)
+	arts := artwork.NewRepo(pool)
+	images := image.NewRepo(pool)
+	imgSvc := image.NewService(store, images, arts)
+	upload := image.NewHandler(imgSvc, arts, urls)
+	vis := artwork.NewVisibilityService(arts, store)
+
+	router := httpapi.New(&httpapi.Deps{
+		AppEnv:        opts.AppEnv,
+		JWT:           jwts,
+		URL:           urls,
+		Providers:     map[string]auth.Provider{},
+		Users:         user.NewRepo(pool),
+		Artworks:      arts,
+		Tags:          artwork.NewTagsRepo(pool),
+		Images:        images,
+		Store:         store,
+		Upload:        upload,
+		Vis:           vis,
+		Frontend:      opts.Frontend,
+		AllowedOrigin: opts.AllowedOrigin,
+		CookieOpts:    auth.CookieOpts{Secure: false},
+	})
+
+	srv := httptest.NewServer(router)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// StatusOf is a convenience for callers that only need the status code.
+func StatusOf(resp *http.Response) int {
+	if resp == nil {
+		return 0
+	}
+	return resp.StatusCode
+}
+```
+
+- [ ] **Step 2: Write the smoke test.**
+
+Write `api/internal/dbtest/bootapp_test.go`:
+
+```go
+package dbtest_test
+
+import (
+	"net/http"
+	"testing"
+
+	"local/art-web/api/internal/dbtest"
+)
+
+func TestBootApp_HealthzReturns200(t *testing.T) {
+	srv := dbtest.BootApp(t, dbtest.BootOpts{})
+
+	resp, err := http.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d want 200", resp.StatusCode)
+	}
+}
+```
+
+- [ ] **Step 3: Run.**
+
+Run: `go test ./internal/dbtest/... -run TestBootApp_HealthzReturns200 -v`
+Expected: PASS.
+
+- [ ] **Step 4: Commit.**
+
+```bash
+git add api/internal/dbtest/bootapp.go api/internal/dbtest/bootapp_test.go
+git commit -m "[0.1-test-harness] feat: add BootApp helper for contract suite"
+```
+
+### Task 1.5 — Add Makefile targets and CI stub
+
+**Files:**
+- Modify: `api/Makefile`
+- Create: `.github/workflows/contract.yml` (or whatever workflow tool the repo uses — verify with `ls .github/workflows/`)
+
+- [ ] **Step 1: Confirm CI tooling.**
+
+```bash
+ls /Users/todd.lam/WORK/_TestScripts/art-web/.github/workflows/ 2>/dev/null || echo "no workflows yet"
+```
+
+If no workflows exist, defer the CI step to the team and note the manual fallback in the PR description: "Run `make test-contract` locally before merging until CI is added."
+
+- [ ] **Step 2: Extend the Makefile.**
+
+Replace the contents of `api/Makefile` with:
+
+```make
+.PHONY: tidy build test test-race lint test-contract test-cover test-cover-slices
+
+tidy:               ; go mod tidy
+build:              ; go build -o bin/api ./cmd/api
+test:               ; go test -coverprofile=/tmp/coverage.out ./...  && go tool cover --func=/tmp/coverage.out
+test-race:          ; go test -race ./...
+lint:               ; go vet ./... && go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
+# Phase 0 contract suite. Runs only the contract package; no goldens until PR 0.8.
+test-contract:      ; go test ./internal/httpapi/contract/... -v
+
+# Phase 0 coverage on the four business slices (gate: ≥ 80% statement coverage each).
+test-cover-slices:
+	@for pkg in auth user artwork image; do \
+	  echo "=== $$pkg ===" ; \
+	  go test -coverprofile=/tmp/cov-$$pkg.out ./internal/$$pkg/... ; \
+	  go tool cover -func=/tmp/cov-$$pkg.out | tail -1 ; \
+	done
+
+test-cover:
+	go test -coverprofile=/tmp/coverage.out ./...
+	go tool cover -func=/tmp/coverage.out | tail -20
+```
+
+- [ ] **Step 3: Run the new targets to confirm they work.**
+
+```bash
+cd /Users/todd.lam/WORK/_TestScripts/art-web/api
+make test-cover-slices 2>&1 | tail -10
+```
+
+Expected: four `total: (statements) NN.N%` lines printed (matching spec §3 baseline numbers ±1 %).
+
+- [ ] **Step 4: (If CI exists) add the contract-suite job stub.**
+
+If `.github/workflows/` exists, add a new file `.github/workflows/contract.yml`:
+
+```yaml
+name: contract
+
+on:
+  pull_request:
+    paths:
+      - 'api/**'
+  push:
+    branches: [master]
+
+jobs:
+  contract_suite:
+    runs-on: ubuntu-latest
+    if: false   # disabled until PR 0.8 captures goldens
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.22' }
+      - name: contract
+        run: cd api && make test-contract
+```
+
+- [ ] **Step 5: Commit.**
+
+```bash
+git add api/Makefile .github/workflows/contract.yml
+git commit -m "[0.1-test-harness] chore: add Makefile targets and disabled contract CI job"
+```
+
+### Task 1.6 — Open the PR
+
+- [ ] **Step 1: Push and open the PR.**
+
+```bash
+cd /Users/todd.lam/WORK/_TestScripts/art-web
+git push -u origin phase0/0.1-test-harness
+gh pr create --base master --title "[0.1-test-harness] Test harness scaffolding" --body "$(cat <<'EOF'
+## Summary
+- Add testcontainers MinIO module (`dbtest.StartMinio`).
+- Add dynamic-byte normalizer (UUID, RFC3339, signed-URL HMAC, JWT cookie).
+- Add `dbtest.AssertGolden` with `GOLDEN_UPDATE=1` write mode.
+- Add `dbtest.BootApp` so PR 0.7 can boot the API in-process.
+- Add Makefile targets: `test-contract`, `test-cover-slices`, `test-cover`.
+- Add disabled `contract_suite` CI job; activated in PR 0.8.
+
+## Test plan
+- [ ] `make test` green
+- [ ] `make test-cover-slices` prints baseline numbers
+- [ ] `make test-contract` no-op-passes (no goldens yet)
+
+Refs spec: docs/superpowers/specs/2026-05-04-go-backend-refactor-design.md §5.1
+EOF
+)"
+```
+
+---
+
+## PR 0.2 — `user` 63.8 → 80 %
+
+**Branch:** `phase0/0.2-user`
+
+**Goal:** Cover the actual surface area of `internal/user/repo.go`. Per spec §8.1, this means slugify edges, slug-collision retry path, slug-exhaustion error, OAuth-uniqueness re-read path, ErrNotFound mapping, GetBySlug pass-through, non-23505 Postgres pass-through. **Excludes:** profile-update tests (no PATCH route exists), soft-delete tests (no `deleted_at` column).
+
+**Acceptance criteria:**
+- `go test -cover ./internal/user/...` reports ≥ 80 % statement coverage.
+- All new tests use `dbtest.StartPostgres` (not their own container).
+
+### Task 2.1 — Cover slugify edge cases
+
+**Files:**
+- Modify: `api/internal/user/repo.go` (export `Slugify` for tests)
+- Create: `api/internal/user/slugify_test.go`
+
+- [ ] **Step 1: Export `slugify` to `Slugify`.**
+
+`slugify` is currently unexported (`api/internal/user/repo.go:31`). Renaming it to `Slugify` is a no-op refactor — there is no other call site (verified by `grep -r "user.slugify\|user\\.Slugify" api/`).
+
+Open `api/internal/user/repo.go` and:
+
+```
+- func slugify(s string) string {
++ func Slugify(s string) string {
+```
+
+Then update line 57 in the same file:
+
+```
+- base := slugify(displayName)
++ base := Slugify(displayName)
+```
+
+- [ ] **Step 2: Write the slugify table test.**
+
+Write `api/internal/user/slugify_test.go`:
+
+```go
+package user_test
+
+import (
+	"strings"
+	"testing"
+
+	"local/art-web/api/internal/user"
+)
+
+func TestSlugify(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty input", "", "user"},
+		{"whitespace only", "   ", "user"},
+		{"basic ASCII", "Alice Smith", "alice-smith"},
+		{"already lowercase", "bob", "bob"},
+		{"trailing punctuation", "Alice!!!", "alice"},
+		{"non-ASCII collapses", "Æl1ce 中", "l1ce"},
+		{"length-cap exact 32", strings.Repeat("a", 32), strings.Repeat("a", 32)},
+		{"length-cap truncates 33", strings.Repeat("a", 33), strings.Repeat("a", 32)},
+		{"length-cap truncates 100", strings.Repeat("a", 100), strings.Repeat("a", 32)},
+		{"only separators collapses", "---", "user"},
+		{"unicode-only collapses", "中文", "user"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := user.Slugify(tc.in)
+			if got != tc.want {
+				t.Fatalf("Slugify(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+```
+
+- [ ] **Step 3: Run.**
+
+Run: `go test ./internal/user/... -run TestSlugify -v`
+Expected: PASS for all subtests.
+
+- [ ] **Step 4: Commit.**
+
+```bash
+git add api/internal/user/repo.go api/internal/user/slugify_test.go
+git commit -m "[0.2-user] test: export Slugify and cover edge cases"
+```
+
+### Task 2.2 — Cover slug-exhaustion error
+
+**Files:**
+- Modify: `api/internal/user/repo_test.go`
+
+- [ ] **Step 1: Read the existing helper to see the available shape.**
+
+Already read in this session: `newRepo(t)` returns `*user.Repo`, plus three working tests use `r.UpsertOAuth`. Slug exhaustion is the loop at `repo.go:59-83` — after 50 conflicting slugs it returns `errors.New("slug exhausted")`.
+
+To trigger it without 50 hand-rolled rows, seed 50 users whose slugs collide with `Slugify("alice")` = `"alice"`, `"alice-2"`, ..., `"alice-50"`. The 51st upsert with the same display name must error with "slug exhausted".
+
+- [ ] **Step 2: Append the test to `api/internal/user/repo_test.go`:**
+
+```go
+func TestUpsertOAuth_SlugExhaustionAfter50Collisions(t *testing.T) {
+	r := newRepo(t)
+	// Seed 50 users that occupy the slug space "alice", "alice-2", ..., "alice-50".
+	for i := 0; i < 50; i++ {
+		subject := "S" + strings.Repeat("x", i+1) // unique oauth_subject per insertion
+		if _, err := r.UpsertOAuth(t.Context(), "google", subject, "x@x", "alice", ""); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+	// 51st upsert must run out of slug space and return the sentinel error.
+	_, err := r.UpsertOAuth(t.Context(), "google", "exhausted-subject", "x@x", "alice", "")
+	if err == nil {
+		t.Fatal("expected slug-exhaustion error")
+	}
+	if !strings.Contains(err.Error(), "slug exhausted") {
+		t.Fatalf("expected 'slug exhausted', got %v", err)
+	}
+}
+```
+
+- [ ] **Step 3: Run.**
+
+Run: `go test ./internal/user/... -run TestUpsertOAuth_SlugExhaustionAfter50Collisions -v`
+Expected: PASS.
+
+- [ ] **Step 4: Commit.**
+
+```bash
+git add api/internal/user/repo_test.go
+git commit -m "[0.2-user] test: cover slug-exhaustion error after 50 collisions"
+```
+
+### Task 2.3 — Cover ErrNotFound, GetBySlug pass-through, OAuth uniqueness re-read
+
+**Files:**
+- Modify: `api/internal/user/repo_test.go`
+
+- [ ] **Step 1: Append three more tests to `api/internal/user/repo_test.go`:**
+
+```go
+func TestGet_NotFound_ReturnsErrNotFound(t *testing.T) {
+	r := newRepo(t)
+	_, err := r.Get(t.Context(), "00000000-0000-0000-0000-000000000000")
+	if !errors.Is(err, user.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestGetBySlug_NotFound_PassesThroughError(t *testing.T) {
+	r := newRepo(t)
+	_, err := r.GetBySlug(t.Context(), "no-such-slug")
+	if err == nil {
+		t.Fatal("expected error for missing slug")
+	}
+	// Current behavior: GetBySlug does NOT translate to ErrNotFound — it returns
+	// the raw pgx.ErrNoRows. This test pins that behavior so it does not change
+	// silently.
+	if errors.Is(err, user.ErrNotFound) {
+		t.Fatalf("GetBySlug should not return ErrNotFound; got %v", err)
+	}
+}
+
+func TestUpsertOAuth_DuplicateOAuthKey_ReturnsExistingID(t *testing.T) {
+	r := newRepo(t)
+
+	first, err := r.UpsertOAuth(t.Context(), "google", "S-DUP", "a@b", "alice-dup", "")
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	// Re-upsert with the SAME provider+subject but different display name → must
+	// hit the lookupExistingOAuth fast path at repo.go:45-55 (UPDATE, no INSERT).
+	second, err := r.UpsertOAuth(t.Context(), "google", "S-DUP", "a@b", "different-name", "")
+	if err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	if first != second {
+		t.Fatalf("expected same id; got %s vs %s", first, second)
+	}
+}
+```
+
+Add `"errors"` to the imports if not already present.
+
+- [ ] **Step 2: Run.**
+
+Run: `go test ./internal/user/... -run 'TestGet_NotFound|TestGetBySlug_NotFound|TestUpsertOAuth_DuplicateOAuthKey' -v`
+Expected: PASS for all three.
+
+- [ ] **Step 3: Verify coverage threshold.**
+
+```bash
+go test -cover ./internal/user/...
+```
+
+Expected: a single line ending `coverage: NN.N% of statements` where `NN.N >= 80.0`. If less, identify the uncovered branch with `go test -coverprofile=/tmp/u.out ./internal/user/... && go tool cover -html=/tmp/u.out` and add a focused test before continuing.
+
+- [ ] **Step 4: Commit.**
+
+```bash
+git add api/internal/user/repo_test.go
+git commit -m "[0.2-user] test: cover ErrNotFound, GetBySlug, OAuth re-read paths"
+```
+
+### Task 2.4 — Open the PR
+
+- [ ] **Step 1: Push and open.**
+
+```bash
+git push -u origin phase0/0.2-user
+gh pr create --base master --title "[0.2-user] Lift user package coverage to ≥ 80%" --body "$(cat <<'EOF'
+## Summary
+- Export `slugify` → `Slugify`; cover edge cases (empty, length cap, non-ASCII).
+- Cover slug-exhaustion error after 50 collisions.
+- Cover `Get(404)→ErrNotFound`, `GetBySlug(404)` pass-through, OAuth-uniqueness re-read.
+
+## Test plan
+- [ ] `go test -cover ./internal/user/...` reports ≥ 80 %
+- [ ] All slugify subtests pass
+- [ ] No new dependencies
+
+Refs spec: §8.1 PR 0.2.
+EOF
+)"
+```
+
+---
+
+## PR 0.3 — `storage` 69.1 → 80 %
+
+**Branch:** `phase0/0.3-storage`
+
+**Goal:** Per spec §8.1: r2 multipart edge cases, localfs path-traversal guard, missing-bucket error, content-type round-trip.
+
+**Acceptance criteria:** `go test -cover ./internal/storage/...` ≥ 80 %.
+
+### Task 3.1 — Identify uncovered lines
+
+- [ ] **Step 1: Generate a coverage report.**
+
+```bash
+cd /Users/todd.lam/WORK/_TestScripts/art-web/api
+go test -coverprofile=/tmp/storage.out ./internal/storage/...
+go tool cover -func=/tmp/storage.out | grep -v "100.0%"
+```
+
+The non-100 % lines tell you exactly which branches need new tests. Confirm coverage of: `Move(missing-source)`, `SignedURL` round-trip, `r2.Put` for files larger than the multipart threshold, `Delete(missing-key)`.
+
+### Task 3.2 — Cover localfs edge cases
+
+**Files:**
+- Modify: `api/internal/storage/localfs_test.go`
+
+- [ ] **Step 1: Append the new tests:**
+
+```go
+func TestLocalFS_Move_MissingSource_ReturnsError(t *testing.T) {
+	s := storage.NewLocalFS(t.TempDir())
+	if err := s.Move(context.Background(), "no/such/key.jpg", "dst/key.jpg"); err == nil {
+		t.Fatal("expected error when moving a missing source")
+	}
+}
+
+func TestLocalFS_Delete_MissingKey_NoError(t *testing.T) {
+	s := storage.NewLocalFS(t.TempDir())
+	// localfs treats Delete-of-missing as a no-op so callers can call it
+	// idempotently as part of orphan cleanup. Pin that contract.
+	if err := s.Delete(context.Background(), "no/such/key.jpg"); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+
+func TestLocalFS_Exists_FalseForMissing(t *testing.T) {
+	s := storage.NewLocalFS(t.TempDir())
+	ok, err := s.Exists(context.Background(), "no/such/key")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if ok {
+		t.Fatal("expected false for missing key")
+	}
+}
+
+func TestLocalFS_SignedURL_Roundtrip(t *testing.T) {
+	s := storage.NewLocalFS(t.TempDir())
+	url, err := s.SignedURL(context.Background(), "abc/0.jpg", 5*time.Minute)
+	if err != nil {
+		t.Fatalf("signed url: %v", err)
+	}
+	if url == "" {
+		t.Fatal("empty signed url")
+	}
+}
+
+func TestLocalFS_RejectsTraversal_Variants(t *testing.T) {
+	s := storage.NewLocalFS(t.TempDir())
+	bad := []string{"../etc/passwd", "abc/../../etc/passwd", "abc/./../../etc/passwd"}
+	for _, k := range bad {
+		if err := s.Put(context.Background(), k, strings.NewReader("x"), "text/plain"); err == nil {
+			t.Fatalf("expected traversal rejection for %q", k)
+		}
+	}
+}
+```
+
+Add `"time"` to imports if not present.
+
+- [ ] **Step 2: Run.**
+
+Run: `go test ./internal/storage/... -run 'TestLocalFS_Move_MissingSource|TestLocalFS_Delete_MissingKey|TestLocalFS_Exists_False|TestLocalFS_SignedURL|TestLocalFS_RejectsTraversal_Variants' -v`
+Expected: PASS for all.
+
+- [ ] **Step 3: Commit.**
+
+```bash
+git add api/internal/storage/localfs_test.go
+git commit -m "[0.3-storage] test: cover localfs missing-source, signed-URL, traversal variants"
+```
+
+### Task 3.3 — Cover R2 paths
+
+**Files:**
+- Modify: `api/internal/storage/r2_test.go`
+
+- [ ] **Step 1: Read the existing R2 test to understand the pattern.**
+
+```bash
+sed -n '1,40p' /Users/todd.lam/WORK/_TestScripts/art-web/api/internal/storage/r2_test.go
+```
+
+Note the existing minio/testcontainers wiring. Your new tests reuse that helper.
+
+- [ ] **Step 2: Append tests for content-type round-trip and missing-bucket error.**
+
+The exact code depends on the existing helper signature; below is the template — adapt the helper-call line to match what's in the file.
+
+```go
+func TestR2_PutGet_ContentTypeRoundtrip(t *testing.T) {
+	s := newR2(t)            // existing helper — adapt name if different
+	ctx := context.Background()
+	body := bytes.NewReader([]byte("payload"))
+	if err := s.Put(ctx, "abc/0.jpg", body, "image/jpeg"); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	r, err := s.Get(ctx, "abc/0.jpg")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer r.Close()
+	got, _ := io.ReadAll(r)
+	if string(got) != "payload" {
+		t.Fatalf("got %q want payload", got)
+	}
+}
+
+func TestR2_Delete_MissingKey_NoError(t *testing.T) {
+	s := newR2(t)
+	if err := s.Delete(context.Background(), "no/such/key"); err != nil {
+		t.Fatalf("expected nil, got %v", err)
+	}
+}
+```
+
+If a "missing bucket" path exists in `r2.go` (read it: `cat api/internal/storage/r2.go`), add a test that constructs the adapter with a non-existent bucket name and asserts `Put` returns a typed error. If the adapter creates the bucket lazily, skip this test and note it in the PR description.
+
+- [ ] **Step 3: Run, then check the slice coverage.**
+
+```bash
+go test ./internal/storage/... -v
+go test -cover ./internal/storage/...
+```
+
+Expected: PASS, `coverage: NN.N% of statements` ≥ 80.0.
+
+- [ ] **Step 4: Commit.**
+
+```bash
+git add api/internal/storage/r2_test.go
+git commit -m "[0.3-storage] test: cover R2 content-type roundtrip + missing-key Delete"
+```
+
+### Task 3.4 — Open the PR
+
+- [ ] **Step 1: Push and open.**
+
+```bash
+git push -u origin phase0/0.3-storage
+gh pr create --base master --title "[0.3-storage] Lift storage package coverage to ≥ 80%" --body "$(cat <<'EOF'
+## Summary
+- Cover localfs missing-source Move, missing-key Delete idempotency, signed-URL roundtrip, traversal variants.
+- Cover R2 content-type roundtrip and missing-key Delete.
+
+## Test plan
+- [ ] `go test -cover ./internal/storage/...` reports ≥ 80 %
+
+Refs spec §8.1 PR 0.3.
+EOF
+)"
+```
+
+---
+
+## PR 0.4 — `image` 69.7 → 80 %
+
+**Branch:** `phase0/0.4-image`
+
+**Goal:** Per spec §8.1: orphan cleanup race, content-type mismatch, signed-URL expiry boundary, blurhash error path.
+
+**Acceptance criteria:** `go test -cover ./internal/image/...` ≥ 80 %.
+
+### Task 4.1 — Identify uncovered lines
+
+- [ ] **Step 1: Generate a coverage report.**
+
+```bash
+cd /Users/todd.lam/WORK/_TestScripts/art-web/api
+go test -coverprofile=/tmp/image.out ./internal/image/...
+go tool cover -func=/tmp/image.out | grep -v "100.0%"
+```
+
+The handler tests already cover most of the handler surface (per the existing `handler_test.go`). The gap is most likely in `service.go` (the fingerprint-mismatch order, the orphan-cleanup-on-Insert-failure branch at line 100, the idempotent-insert-but-row-not-found error at line 109–111, and the storage-Put-failure branch).
+
+### Task 4.2 — Cover the unhandled-error paths in `image/service.go`
+
+**Files:**
+- Create: `api/internal/image/service_test.go` (if it does not exist — check first with `ls /Users/todd.lam/WORK/_TestScripts/art-web/api/internal/image/`)
+- Modify: `api/internal/image/handler_test.go` (if `service_test.go` would duplicate scaffolding; preferred form is its own file)
+
+The current `handler_test.go` already covers fingerprint-mismatch, idempotent retry, content-type mismatch (422), position conflict + orphan cleanup, and partial-failure resume. The remaining branches in `service.go` not covered today:
+
+1. **Storage `Put` returns an error** (line 88) — needs `failingStore` returning err on Put #1.
+2. **`images.Insert` returns an error and orphan cleanup fires** (line 100) — needs an Insert that fails after a successful Put.
+3. **Idempotent insert says "Existed=true" but `FindByClientImageID` returns nil** (line 109–111) — race-window error path; mock the Repo.
+
+These need `Service`-level tests with a stubbed `*Repo` interface, but the current code uses concrete `*image.Repo`. Two options:
+
+- **Option A (preferred for Phase 0):** add a small interface in `service.go` (no behavior change) and inject the existing repo. **Counts as a `phase-0-behavior-change` PR** if it touches non-test code beyond test seams.
+- **Option B:** use a real Postgres but provoke the failure modes via SQL state corruption. Brittle. Avoid.
+
+Choose Option A. The interface is internal and only `*Repo` satisfies it today; production wiring is unchanged.
+
+- [ ] **Step 1: Add a minimal test seam to `image/service.go`.**
+
+Open `api/internal/image/service.go` and add **above** the `Service` struct:
+
+```go
+// imageRepo is a narrow seam for service-level tests. *Repo satisfies it; this
+// interface is not exported.
+type imageRepo interface {
+	FindByClientImageID(ctx context.Context, artworkID, clientImageID string) (*InsertedImage, error)
+	Insert(ctx context.Context, in InsertInput) (InsertResult, error)
+}
+```
+
+Then change the field type:
+
+```
+- type Service struct {
+- 	store    storage.Storage
+- 	images   *Repo
+- 	artworks *artwork.Repo
+- }
++ type Service struct {
++ 	store    storage.Storage
++ 	images   imageRepo
++ 	artworks *artwork.Repo
++ }
+```
+
+`NewService`'s signature stays the same — `*Repo` satisfies `imageRepo`.
+
+- [ ] **Step 2: Verify the build still passes.**
+
+```bash
+go build ./...
+go test ./internal/image/... -count=1
+```
+
+Expected: green. No callers change because `*Repo` satisfies the interface.
+
+- [ ] **Step 3: Add the focused service tests.**
+
+Write `api/internal/image/service_test.go`:
+
+```go
+package image
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"os"
+	"strings"
+	"testing"
+
+	"local/art-web/api/internal/artwork"
+)
+
+type stubRepo struct {
+	findFn   func(ctx context.Context, art, cid string) (*InsertedImage, error)
+	insertFn func(ctx context.Context, in InsertInput) (InsertResult, error)
+}
+
+func (s *stubRepo) FindByClientImageID(ctx context.Context, art, cid string) (*InsertedImage, error) {
+	return s.findFn(ctx, art, cid)
+}
+func (s *stubRepo) Insert(ctx context.Context, in InsertInput) (InsertResult, error) {
+	return s.insertFn(ctx, in)
+}
+
+type stubStore struct {
+	puts    []string
+	deletes []string
+	failPut bool
+}
+
+func (s *stubStore) Put(_ context.Context, k string, _ io.Reader, _ string) error {
+	if s.failPut {
+		return errors.New("storage Put failed")
+	}
+	s.puts = append(s.puts, k)
+	return nil
+}
+func (s *stubStore) Get(context.Context, string) (io.ReadCloser, error) {
+	return nil, errors.New("not implemented")
+}
+func (s *stubStore) Delete(_ context.Context, k string) error {
+	s.deletes = append(s.deletes, k)
+	return nil
+}
+func (s *stubStore) Move(context.Context, string, string) error { return nil }
+func (s *stubStore) Exists(context.Context, string) (bool, error) {
+	return false, nil
+}
+func (s *stubStore) SignedURL(context.Context, string, _ /* time.Duration */ any) (string, error) {
+	return "", nil
+}
+
+func loadJPEG(t *testing.T) []byte {
+	raw, err := os.ReadFile("testdata/sample.jpg")
+	if err != nil {
+		t.Fatalf("read sample.jpg: %v (cd into image/ to make testdata available)", err)
+	}
+	return raw
+}
+
+func TestUploadOne_StoragePutFailure_Surfaces(t *testing.T) {
+	repo := &stubRepo{
+		findFn:   func(_ context.Context, _, _ string) (*InsertedImage, error) { return nil, nil },
+		insertFn: func(_ context.Context, _ InsertInput) (InsertResult, error) { return InsertResult{}, nil },
+	}
+	store := &stubStore{failPut: true}
+	svc := &Service{store: store, images: repo, artworks: nil}
+	art := &artwork.Artwork{ID: "art1", Visibility: "private"}
+
+	_, err := svc.UploadOne(context.Background(), art, UploadOne{
+		Manifest: ManifestEntry{ClientImageID: "K", ContentType: "image/jpeg", Position: 0},
+		Body:     bytes.NewReader(loadJPEG(t)),
+	})
+	if err == nil {
+		t.Fatal("expected storage Put error to surface")
+	}
+	if !strings.Contains(err.Error(), "storage Put failed") {
+		t.Fatalf("expected wrapped storage error, got %v", err)
+	}
+	if len(store.deletes) != 0 {
+		t.Fatalf("Delete must NOT fire on Put failure (orphan only on Insert failure); got deletes=%v", store.deletes)
+	}
+}
+
+func TestUploadOne_InsertFails_OrphanIsDeleted(t *testing.T) {
+	repo := &stubRepo{
+		findFn: func(_ context.Context, _, _ string) (*InsertedImage, error) { return nil, nil },
+		insertFn: func(_ context.Context, _ InsertInput) (InsertResult, error) {
+			return InsertResult{}, errors.New("insert failure")
+		},
+	}
+	store := &stubStore{}
+	svc := &Service{store: store, images: repo, artworks: nil}
+	art := &artwork.Artwork{ID: "art1", Visibility: "private"}
+
+	_, err := svc.UploadOne(context.Background(), art, UploadOne{
+		Manifest: ManifestEntry{ClientImageID: "K", ContentType: "image/jpeg", Position: 0},
+		Body:     bytes.NewReader(loadJPEG(t)),
+	})
+	if err == nil {
+		t.Fatal("expected insert error to surface")
+	}
+	if len(store.deletes) != 1 || store.deletes[0] == "" {
+		t.Fatalf("expected one Delete for orphan cleanup, got deletes=%v", store.deletes)
+	}
+	if store.deletes[0] != store.puts[0] {
+		t.Fatalf("orphan Delete key %q must equal Put key %q", store.deletes[0], store.puts[0])
+	}
+}
+
+func TestUploadOne_IdempotentInsertButRowNotFound_ErrorsClearly(t *testing.T) {
+	calls := 0
+	repo := &stubRepo{
+		findFn: func(_ context.Context, _, _ string) (*InsertedImage, error) {
+			calls++
+			// First call (pre-Insert): no row → keep going.
+			// Second call (after idempotent Insert): also nil → triggers the error
+			// at service.go line 109-111.
+			return nil, nil
+		},
+		insertFn: func(_ context.Context, _ InsertInput) (InsertResult, error) {
+			return InsertResult{ID: "imgX", Existed: true}, nil
+		},
+	}
+	store := &stubStore{}
+	svc := &Service{store: store, images: repo, artworks: nil}
+	art := &artwork.Artwork{ID: "art1", Visibility: "private"}
+
+	_, err := svc.UploadOne(context.Background(), art, UploadOne{
+		Manifest: ManifestEntry{ClientImageID: "K", ContentType: "image/jpeg", Position: 0},
+		Body:     bytes.NewReader(loadJPEG(t)),
+	})
+	if err == nil || !strings.Contains(err.Error(), "idempotent insert") {
+		t.Fatalf("expected idempotent-insert sentinel error, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 FindByClientImageID calls, got %d", calls)
+	}
+}
+```
+
+> Note: `stubStore.SignedURL`'s third parameter is `time.Duration` in the real interface; the stub uses `any` to avoid a `time` import. If your linter complains, change to `time.Duration` and import `time`.
+
+- [ ] **Step 4: Run.**
+
+Run: `go test ./internal/image/... -run 'TestUploadOne_' -v`
+Expected: PASS.
+
+- [ ] **Step 5: Verify slice coverage.**
+
+```bash
+go test -cover ./internal/image/...
+```
+
+Expected: `coverage: NN.N% of statements` ≥ 80.0.
+
+- [ ] **Step 6: Commit.**
+
+```bash
+git add api/internal/image/service.go api/internal/image/service_test.go
+git commit -m "[0.4-image] test: cover Put failure, Insert failure orphan cleanup, idempotent-insert race"
+```
+
+### Task 4.3 — Open the PR
+
+- [ ] **Step 1: Push and open.**
+
+```bash
+git push -u origin phase0/0.4-image
+gh pr create --base master --title "[0.4-image] Lift image package coverage to ≥ 80%" --body "$(cat <<'EOF'
+## Summary
+- Add narrow `imageRepo` interface seam in service.go (no behavior change).
+- Cover storage Put failure (no spurious Delete), Insert failure (orphan cleanup fires), idempotent-insert-but-row-missing race-window error.
+
+## Test plan
+- [ ] `go test -cover ./internal/image/...` ≥ 80 %
+- [ ] All existing tests still pass
+
+Refs spec §8.1 PR 0.4.
+EOF
+)"
+```
+
+---
+
+## PR 0.5 — `httpapi` 69.2 → 80 %
+
+**Branch:** `phase0/0.5-httpapi`
+
+**Goal:** Cover the privacy matrix completeness, devseed gated routes (coverage only — `/dev/seed` is excluded from contract per spec §5.2.1), and one test per error code listed in spec §3 — including 412 / 415 / 422 / 502.
+
+**Acceptance criteria:** `go test -cover ./internal/httpapi/...` ≥ 80 %.
+
+### Task 5.1 — Identify uncovered lines
+
+- [ ] **Step 1: Generate a coverage report.**
+
+```bash
+cd /Users/todd.lam/WORK/_TestScripts/art-web/api
+go test -coverprofile=/tmp/httpapi.out ./internal/httpapi/...
+go tool cover -func=/tmp/httpapi.out | grep -v "100.0%"
+```
+
+Cross-reference the output with spec §3's error-code list. Any code that doesn't appear here in a hit ≥ 1 needs a focused test.
+
+### Task 5.2 — Cover the privacy-matrix gaps
+
+**Files:**
+- Modify: `api/internal/httpapi/privacy_matrix_test.go`
+
+- [ ] **Step 1: Read the existing matrix to find which (viewer × resource × action) cells are missing.**
+
+```bash
+grep -E '^func Test' /Users/todd.lam/WORK/_TestScripts/art-web/api/internal/httpapi/privacy_matrix_test.go
+```
+
+The complete matrix per spec §5.2 is:
+
+| Viewer | Resource | GET /artworks/{id} | PATCH /artworks/{id} | DELETE /artworks/{id} | POST /artworks/{id}/images |
+|---|---|---|---|---|---|
+| owner  | public  | 200 | 204 | 204 | 200/201 |
+| owner  | private | 200 | 204 | 204 | 200/201 |
+| other  | public  | 200 | 404 | 404 | 404 |
+| other  | private | 404 | 404 | 404 | 404 |
+| anon   | public  | 200 | 401 | 401 | 401 |
+| anon   | private | 404 | 401 | 401 | 401 |
+
+For each missing cell, add a `t.Run(...)` subtest using `env.request(...)` from `httpapi/testutil_test.go`.
+
+- [ ] **Step 2: Append the missing tests in a new function `TestPrivacyMatrix_Gaps`.**
+
+Add to `api/internal/httpapi/privacy_matrix_test.go`:
+
+```go
+func TestPrivacyMatrix_Gaps(t *testing.T) {
+	env := setupMatrixEnv(t)
+
+	cases := []struct {
+		name   string
+		viewer string
+		method string
+		path   string
+		want   int
+	}{
+		// other → private GET = 404 (not 403, per spec §5.2.0a)
+		{"other_get_private", "other", "GET", "/artworks/" + env.QID, 404},
+		// anon → private GET = 404
+		{"anon_get_private", "anon", "GET", "/artworks/" + env.QID, 404},
+		// other → public PATCH = 404
+		{"other_patch_public", "other", "PATCH", "/artworks/" + env.PID, 404},
+		// other → public DELETE = 404
+		{"other_delete_public", "other", "DELETE", "/artworks/" + env.PID, 404},
+		// anon → public PATCH = 401
+		{"anon_patch_public", "anon", "PATCH", "/artworks/" + env.PID, 401},
+		// anon → public DELETE = 401
+		{"anon_delete_public", "anon", "DELETE", "/artworks/" + env.PID, 401},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, code := env.request(t, tc.viewer, tc.method, tc.path)
+			if code != tc.want {
+				t.Fatalf("status=%d want %d", code, tc.want)
+			}
+		})
+	}
+}
+```
+
+> The PATCH cases pass an empty body. The current handler reads the body via `json.NewDecoder` and returns `bad_json` (400) for empty input. To produce 401 / 404 we need to short-circuit before body parsing — verify by reading `httpapi/artworks.go:170-188`. Auth middleware fires before the handler, so anon → 401 is correct. The owner-check fires after JSON decode, so other → 404 requires a syntactically-valid PATCH body. **If a subtest fails because of bad-JSON 400, change the test to send a minimal valid body** (e.g., `{"title":"x"}`) using a new request helper variant. Add this:
+
+```go
+// requestWithJSONBody is the variant for PATCH cases.
+func (env *MatrixEnv) requestWithJSONBody(t *testing.T, viewer, method, path, body string) (string, int) {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	switch viewer {
+	case "owner":
+		req.AddCookie(&http.Cookie{Name: "auth", Value: env.ownerToken})
+	case "other":
+		req.AddCookie(&http.Cookie{Name: "auth", Value: env.otherToken})
+	}
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+	b, _ := io.ReadAll(rec.Body)
+	return string(b), rec.Code
+}
+```
+
+(Add `"strings"` import if not present.)
+
+Then PATCH subtests use:
+```go
+_, code := env.requestWithJSONBody(t, tc.viewer, tc.method, tc.path, `{"title":"x"}`)
+```
+
+- [ ] **Step 3: Run.**
+
+Run: `go test ./internal/httpapi/... -run TestPrivacyMatrix_Gaps -v`
+Expected: PASS for all subtests.
+
+- [ ] **Step 4: Commit.**
+
+```bash
+git add api/internal/httpapi/privacy_matrix_test.go api/internal/httpapi/testutil_test.go
+git commit -m "[0.5-httpapi] test: fill privacy-matrix gaps (other/anon × public/private × verbs)"
+```
+
+### Task 5.3 — Cover every Shape-A and Shape-B error code
+
+**Files:**
+- Create: `api/internal/httpapi/error_codes_test.go`
+
+- [ ] **Step 1: Write one test per code listed in spec §3.**
+
+The tests are deliberately small and assert the exact JSON shape so PR 0.7 / 0.8 can lock the bytes.
+
+Write `api/internal/httpapi/error_codes_test.go`:
+
+```go
+package httpapi_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
+
+// errorBody is the universal Shape-A/B decoder.
+type errorBody struct {
+	Error   string `json:"error"`
+	Message string `json:"message,omitempty"`
+}
+
+func decodeError(t *testing.T, body io.Reader) errorBody {
+	t.Helper()
+	var b errorBody
+	if err := json.NewDecoder(body).Decode(&b); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return b
+}
+
+// ---- /artworks ----
+
+func TestErrors_ArtworksList_BadCursor(t *testing.T) {
+	env := setupMatrixEnv(t)
+	body, code := env.request(t, "anon", "GET", "/artworks?cursor=not-base64!!")
+	if code != 400 {
+		t.Fatalf("status=%d want 400; body=%s", code, body)
+	}
+	got := decodeError(t, strings.NewReader(body))
+	if got.Error != "bad_cursor" {
+		t.Fatalf("error=%q want bad_cursor", got.Error)
+	}
+	if got.Message == "" {
+		t.Fatal("Shape B requires non-empty message")
+	}
+}
+
+func TestErrors_ArtworkPatch_BadJSON(t *testing.T) {
+	env := setupMatrixEnv(t)
+	_, code := env.requestWithJSONBody(t, "owner", "PATCH", "/artworks/"+env.PID, "not valid json")
+	if code != 400 {
+		t.Fatalf("status=%d want 400", code)
+	}
+}
+
+func TestErrors_ArtworkPatch_BadVisibility(t *testing.T) {
+	env := setupMatrixEnv(t)
+	_, code := env.requestWithJSONBody(t, "owner", "PATCH", "/artworks/"+env.PID, `{"visibility":"draft"}`)
+	if code != 400 {
+		t.Fatalf("status=%d want 400", code)
+	}
+}
+
+func TestErrors_ArtworkPatch_BadCoverPosition(t *testing.T) {
+	env := setupMatrixEnv(t)
+	_, code := env.requestWithJSONBody(t, "owner", "PATCH", "/artworks/"+env.PID, `{"cover_position":-1}`)
+	if code != 400 {
+		t.Fatalf("status=%d want 400", code)
+	}
+}
+
+func TestErrors_ArtworkCreate_BadVisibility(t *testing.T) {
+	env := setupMatrixEnv(t)
+	body, code := env.requestWithJSONBody(t, "owner", "POST", "/artworks", `{"title":"x","visibility":"draft"}`)
+	if code != 400 {
+		t.Fatalf("status=%d want 400", code)
+	}
+	got := decodeError(t, strings.NewReader(body))
+	if got.Error != "bad_visibility" {
+		t.Fatalf("error=%q want bad_visibility", got.Error)
+	}
+}
+
+// ---- /auth ----
+
+func TestErrors_Auth_UnknownProvider(t *testing.T) {
+	env := setupMatrixEnv(t)
+	body, code := env.request(t, "anon", "GET", "/auth/notreal/start")
+	if code != 404 {
+		t.Fatalf("status=%d want 404", code)
+	}
+	if !strings.Contains(body, "unknown_provider") {
+		t.Fatalf("expected unknown_provider, got %s", body)
+	}
+}
+
+// ---- POST /artworks/{id}/images — 415, 412, 422 ----
+
+func TestErrors_ImageUpload_415_NonMultipart(t *testing.T) {
+	env := setupMatrixEnv(t)
+
+	req := httptest.NewRequest("POST", "/artworks/"+env.PID+"/images", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "auth", Value: env.ownerToken})
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+
+	if rec.Code != 415 {
+		t.Fatalf("status=%d want 415", rec.Code)
+	}
+	got := decodeError(t, rec.Body)
+	if got.Error != "unsupported_media_type" {
+		t.Fatalf("error=%q want unsupported_media_type", got.Error)
+	}
+}
+
+func TestErrors_ImageUpload_400_ManifestRequired(t *testing.T) {
+	env := setupMatrixEnv(t)
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	// no manifest field, just an empty multipart envelope
+	mw.Close()
+
+	req := httptest.NewRequest("POST", "/artworks/"+env.PID+"/images", body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.AddCookie(&http.Cookie{Name: "auth", Value: env.ownerToken})
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+
+	if rec.Code != 400 {
+		t.Fatalf("status=%d want 400", rec.Code)
+	}
+	got := decodeError(t, rec.Body)
+	if got.Error != "manifest_required" {
+		t.Fatalf("error=%q want manifest_required", got.Error)
+	}
+}
+
+func TestErrors_ImageUpload_400_FileCountMismatch(t *testing.T) {
+	env := setupMatrixEnv(t)
+
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	_ = mw.WriteField("manifest", `[{"client_image_id":"K1","position":0,"content_type":"image/jpeg"}]`)
+	// no `files` field — count mismatch (manifest=1, files=0)
+	mw.Close()
+
+	req := httptest.NewRequest("POST", "/artworks/"+env.PID+"/images", body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.AddCookie(&http.Cookie{Name: "auth", Value: env.ownerToken})
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+
+	if rec.Code != 400 {
+		t.Fatalf("status=%d want 400", rec.Code)
+	}
+	got := decodeError(t, rec.Body)
+	if got.Error != "file_count_mismatch" {
+		t.Fatalf("error=%q want file_count_mismatch", got.Error)
+	}
+}
+
+// 412 / 415 / 422 image-upload paths are already covered by
+// internal/image/handler_test.go. The privacy-matrix and these tests cover the
+// remaining httpapi-package surface for those statuses; no new image tests
+// belong here.
+```
+
+- [ ] **Step 2: Run.**
+
+Run: `go test ./internal/httpapi/... -run 'TestErrors_' -v`
+Expected: PASS for all.
+
+- [ ] **Step 3: Commit.**
+
+```bash
+git add api/internal/httpapi/error_codes_test.go
+git commit -m "[0.5-httpapi] test: assert exact body shape for every Shape-A/B error code"
+```
+
+### Task 5.4 — Cover the devseed gating
+
+**Files:**
+- Modify: `api/internal/httpapi/devseed_test.go`
+
+- [ ] **Step 1: Read the existing devseed test to see what's already covered.**
+
+```bash
+sed -n '1,50p' /Users/todd.lam/WORK/_TestScripts/art-web/api/internal/httpapi/devseed_test.go
+```
+
+- [ ] **Step 2: If the `AppEnv != "test"` 404 case is missing, append:**
+
+```go
+func TestDevSeed_NotMounted_When_AppEnv_NotTest(t *testing.T) {
+	deps := testDeps(t, "production")        // helper from testutil_test.go
+	r := httpapi.New(deps)
+
+	req := httptest.NewRequest("POST", "/dev/seed", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != 404 {
+		t.Fatalf("expected /dev/seed to be unmounted in non-test env; status=%d", rec.Code)
+	}
+}
+```
+
+- [ ] **Step 3: Run, then verify slice coverage.**
+
+```bash
+go test ./internal/httpapi/... -run TestDevSeed_NotMounted -v
+go test -cover ./internal/httpapi/...
+```
+
+Expected: PASS, `coverage: NN.N% of statements` ≥ 80.0. If not, generate an HTML coverage report (`go tool cover -html=/tmp/httpapi.out`) and add a focused test for the highlighted branch.
+
+- [ ] **Step 4: Commit.**
+
+```bash
+git add api/internal/httpapi/devseed_test.go
+git commit -m "[0.5-httpapi] test: assert /dev/seed 404s outside AppEnv=test"
+```
+
+### Task 5.5 — Open the PR
+
+- [ ] **Step 1: Push and open.**
+
+```bash
+git push -u origin phase0/0.5-httpapi
+gh pr create --base master --title "[0.5-httpapi] Lift httpapi package coverage to ≥ 80%" --body "$(cat <<'EOF'
+## Summary
+- Fill privacy-matrix gaps (other/anon × public/private × {GET,PATCH,DELETE}).
+- Add one test per Shape-A and Shape-B error code from spec §3.
+- Assert /dev/seed 404 in non-test env.
+
+## Test plan
+- [ ] `go test -cover ./internal/httpapi/...` ≥ 80 %
+- [ ] No new behavior; pure test additions
+
+Refs spec §8.1 PR 0.5.
+EOF
+)"
+```
+
+---
+
+## PR 0.6 — `db` + `artwork` top-up
+
+**Branch:** `phase0/0.6-db-artwork-topup`
+
+**Goal:** `artwork` 78.3 → 80 (visibility transition edge cases — required for slice gate). `db` 75 → 80 best-effort (excluded from the gate per spec §5.4 but worth doing while harness work is fresh).
+
+**Acceptance criteria:**
+- `go test -cover ./internal/artwork/...` ≥ 80 %.
+- `go test -cover ./internal/db/...` ≥ 75 % (no regression).
+
+### Task 6.1 — Cover the artwork visibility-flip edge cases
+
+**Files:**
+- Modify: `api/internal/artwork/visibility_test.go`
+
+- [ ] **Step 1: Identify the uncovered branches in `visibility.go`.**
+
+The flip flow has these failure modes that need explicit tests (verified against `visibility.go`):
+
+1. `target` is neither `"public"` nor `"private"` → `errBadTarget`. (Likely already covered.)
+2. `Pool().Query` fails. (Hard to provoke; skip unless coverage demands.)
+3. **`storage.Move` fails on the forward direction → `rollbackMoves` on completed prefix.** (Likely missing.)
+4. **`storage.Move` fails on the reverse direction → `RollbackLog` fires.** (Likely missing.)
+5. **Tx Begin / Exec / Commit failure → forward moves are rolled back.** (Likely missing for at least one of the three.)
+
+- [ ] **Step 2: Read the existing test to find which gaps are real.**
+
+```bash
+grep -E '^func Test' /Users/todd.lam/WORK/_TestScripts/art-web/api/internal/artwork/visibility_test.go
+```
+
+- [ ] **Step 3: Add the missing tests.**
+
+The store can be substituted with a test double because `*VisibilityService` accepts the `storage.Storage` interface. Append:
+
+```go
+type seqStore struct {
+	storage.Storage
+	moveOrder []string
+	failOnDst string // when Move(src,dst) sees this dst, return error
+}
+
+func (s *seqStore) Move(ctx context.Context, src, dst string) error {
+	s.moveOrder = append(s.moveOrder, dst)
+	if dst == s.failOnDst {
+		return fmt.Errorf("simulated move failure to %s", dst)
+	}
+	return s.Storage.Move(ctx, src, dst)
+}
+
+func TestFlip_StorageMoveFailure_RollsBackForwardMoves(t *testing.T) {
+	pool := newPool(t)             // existing helper in this file
+	defer pool.Close()
+	repo := artwork.NewRepo(pool)
+
+	// Seed: artwork with 3 images at private/{art}/{i}.jpg.
+	uid := seedUser(t, pool)
+	aid := seedArtworkWithImages(t, pool, uid, "private", 3)
+
+	store := &seqStore{Storage: storage.NewLocalFS(t.TempDir())}
+	// Make all three private files exist.
+	for i := 0; i < 3; i++ {
+		_ = store.Storage.Put(t.Context(), fmt.Sprintf("private/%s/%d.jpg", aid, i),
+			strings.NewReader("x"), "image/jpeg")
+	}
+	// Fail on the SECOND forward move (public/<aid>/1.jpg).
+	store.failOnDst = "public/" + aid + "/1.jpg"
+
+	svc := artwork.NewVisibilityService(repo, store)
+	err := svc.Flip(t.Context(), aid, "public")
+	if err == nil {
+		t.Fatal("expected flip to fail when storage.Move fails on the second image")
+	}
+	// First completed forward move should have been rolled back: the file
+	// should NOT exist at public/.../0.jpg, and SHOULD exist at private/.../0.jpg.
+	pubExists, _ := store.Storage.Exists(t.Context(), fmt.Sprintf("public/%s/0.jpg", aid))
+	privExists, _ := store.Storage.Exists(t.Context(), fmt.Sprintf("private/%s/0.jpg", aid))
+	if pubExists {
+		t.Fatal("public/0.jpg should not exist after rollback")
+	}
+	if !privExists {
+		t.Fatal("private/0.jpg should exist after rollback")
+	}
+}
+
+func TestFlip_RollbackLogFires_WhenUndoMoveFails(t *testing.T) {
+	pool := newPool(t)
+	defer pool.Close()
+	repo := artwork.NewRepo(pool)
+
+	uid := seedUser(t, pool)
+	aid := seedArtworkWithImages(t, pool, uid, "private", 2)
+
+	// Two-direction failing store: forward succeeds, reverse fails. After the
+	// second forward Move triggers the simulated failure path, the reverse
+	// rollback for the first forward move will also fail → RollbackLog fires.
+	base := storage.NewLocalFS(t.TempDir())
+	for i := 0; i < 2; i++ {
+		_ = base.Put(t.Context(), fmt.Sprintf("private/%s/%d.jpg", aid, i),
+			strings.NewReader("x"), "image/jpeg")
+	}
+	store := &reversingFailStore{Storage: base, aid: aid, failPathDst: "public/" + aid + "/1.jpg"}
+
+	var rollbackCalls int
+	prev := artwork.RollbackLog
+	artwork.RollbackLog = func(err error) { rollbackCalls++ }
+	defer func() { artwork.RollbackLog = prev }()
+
+	svc := artwork.NewVisibilityService(repo, store)
+	if err := svc.Flip(t.Context(), aid, "public"); err == nil {
+		t.Fatal("expected flip to fail")
+	}
+	if rollbackCalls == 0 {
+		t.Fatal("expected RollbackLog to fire when undo move fails")
+	}
+}
+
+// reversingFailStore succeeds on forward moves (private→public) and fails on
+// reverse moves (public→private), simulating a one-way storage outage.
+type reversingFailStore struct {
+	storage.Storage
+	aid         string
+	failPathDst string
+}
+
+func (s *reversingFailStore) Move(ctx context.Context, src, dst string) error {
+	// Treat the "trigger" forward move as the failure that initiates rollback.
+	if dst == s.failPathDst {
+		return fmt.Errorf("trigger forward move failed: %s→%s", src, dst)
+	}
+	// Reverse direction (public→private): fail.
+	if strings.HasPrefix(src, "public/"+s.aid+"/") && strings.HasPrefix(dst, "private/"+s.aid+"/") {
+		return fmt.Errorf("simulated reverse-move failure: %s→%s", src, dst)
+	}
+	return s.Storage.Move(ctx, src, dst)
+}
+```
+
+> The helpers `newPool`, `seedUser`, and `seedArtworkWithImages` may not exist yet. Read the file to confirm. If `newPool` is called something else (e.g., `setupRepo`), adapt accordingly. If `seedArtworkWithImages` doesn't exist, write a small helper at the top of the file that calls `repo.Create` then runs `pool.Exec(ctx, INSERT INTO artwork_images ...)` directly N times.
+
+- [ ] **Step 4: Run.**
+
+Run: `go test ./internal/artwork/... -run 'TestFlip_StorageMoveFailure|TestFlip_RollbackLogFires' -v`
+Expected: PASS.
+
+- [ ] **Step 5: Verify slice coverage.**
+
+```bash
+go test -cover ./internal/artwork/...
+```
+
+Expected: `coverage: NN.N% of statements` ≥ 80.0.
+
+- [ ] **Step 6: Commit.**
+
+```bash
+git add api/internal/artwork/visibility_test.go
+git commit -m "[0.6-db-artwork-topup] test: cover visibility-flip rollback paths"
+```
+
+### Task 6.2 — Best-effort `db` top-up
+
+**Files:**
+- Modify: `api/internal/db/pool_test.go`
+
+- [ ] **Step 1: Find uncovered branches.**
+
+```bash
+go test -coverprofile=/tmp/db.out ./internal/db/...
+go tool cover -func=/tmp/db.out | grep -v "100.0%"
+```
+
+- [ ] **Step 2: Add a focused bad-DSN test.**
+
+Append to `api/internal/db/pool_test.go`:
+
+```go
+func TestNew_BadDSN_ReturnsError(t *testing.T) {
+	_, err := db.New(context.Background(), "this-is-not-a-valid-dsn")
+	if err == nil {
+		t.Fatal("expected error for malformed DSN")
+	}
+}
+```
+
+- [ ] **Step 3: Run, then check coverage.**
+
+```bash
+go test ./internal/db/... -run TestNew_BadDSN -v
+go test -cover ./internal/db/...
+```
+
+If coverage is still below 80 %, the remaining uncovered code is likely the long-running pool-Close path; document the gap in the PR description rather than forcing a flaky test.
+
+- [ ] **Step 4: Commit.**
+
+```bash
+git add api/internal/db/pool_test.go
+git commit -m "[0.6-db-artwork-topup] test: cover db.New bad-DSN error path"
+```
+
+### Task 6.3 — Open the PR
+
+- [ ] **Step 1: Push and open.**
+
+```bash
+git push -u origin phase0/0.6-db-artwork-topup
+gh pr create --base master --title "[0.6-db-artwork-topup] artwork to ≥ 80% + db top-up" --body "$(cat <<'EOF'
+## Summary
+- Cover visibility-flip storage-Move rollback (forward failure rolls back completed prefix).
+- Cover RollbackLog firing when the undo move itself fails.
+- Best-effort: cover db.New bad-DSN.
+
+## Test plan
+- [ ] `go test -cover ./internal/artwork/...` ≥ 80 %
+- [ ] `go test -cover ./internal/db/...` no regression
+
+Refs spec §8.1 PR 0.6.
+EOF
+)"
+```
+
+---
+
+## PR 0.7 — Build the HTTP contract matrix + deterministic injection
+
+**Branch:** `phase0/0.7-contract-matrix`
+
+**Goal:** Per spec §8.1: add the cartesian-matrix test file, switch the two Go-side dynamic sources to injectable interfaces (no behavior change), wire the normalizer, and write the meta-test that scans goldens for forbidden statuses. **No goldens yet** — tests are expected to fail until PR 0.8 captures them.
+
+**Acceptance criteria:**
+- `IDProvider` interface added; production passes `uuid.NewString()`; `image/service.go:84` uses it.
+- `RandReader` interface added; production passes `crypto/rand.Reader`; `auth/handlers.go:randState` uses it.
+- Cartesian matrix file exists under `internal/httpapi/contract/` and enumerates every (auth × resource × shape) cell from spec §5.2.
+- Forbidden-status meta-test file exists.
+- `go build ./...` passes; existing tests unchanged.
+
+### Task 7.1 — Add `IDProvider` (no-op refactor)
+
+**Files:**
+- Create: `api/internal/image/idprovider.go`
+- Modify: `api/internal/image/service.go`
+- Modify: `api/internal/image/handler_test.go` (smoke check that production wiring still works — adjust `newHandler` if needed)
+
+- [ ] **Step 1: Create the interface and default implementation.**
+
+Write `api/internal/image/idprovider.go`:
+
+```go
+// api/internal/image/idprovider.go
+package image
+
+import (
+	"fmt"
+
+	"github.com/google/uuid"
+)
+
+// IDProvider yields per-row IDs for image uploads. Production uses uuidIDProvider
+// (a thin wrapper over uuid.NewString); tests inject a deterministic counter via
+// CounterIDProvider so snapshot bytes are stable.
+type IDProvider interface {
+	NewID() string
+}
+
+type uuidIDProvider struct{}
+
+func (uuidIDProvider) NewID() string { return uuid.NewString() }
+
+// NewUUIDProvider returns the production IDProvider.
+func NewUUIDProvider() IDProvider { return uuidIDProvider{} }
+
+// CounterIDProvider is a deterministic IDProvider for tests. The Nth call
+// returns "00000000-0000-0000-0000-NNNNNNNNNNNN" (12-digit zero-padded N).
+type CounterIDProvider struct {
+	N int
+}
+
+func (c *CounterIDProvider) NewID() string {
+	c.N++
+	return fmt.Sprintf("00000000-0000-0000-0000-%012d", c.N)
+}
+```
+
+- [ ] **Step 2: Wire it into `Service`.**
+
+Edit `api/internal/image/service.go`:
+
+Add the field:
+```
+type Service struct {
+    store    storage.Storage
+    images   imageRepo
+    artworks *artwork.Repo
++   ids      IDProvider
+}
+```
+
+Update `NewService`:
+```
+- func NewService(s storage.Storage, im *Repo, a *artwork.Repo) *Service {
+- 	return &Service{store: s, images: im, artworks: a}
+- }
++ func NewService(s storage.Storage, im *Repo, a *artwork.Repo) *Service {
++ 	return &Service{store: s, images: im, artworks: a, ids: NewUUIDProvider()}
++ }
++
++ // NewServiceWithIDs is the test-mode constructor that lets the contract suite
++ // inject a deterministic IDProvider. Production callers use NewService.
++ func NewServiceWithIDs(s storage.Storage, im *Repo, a *artwork.Repo, ids IDProvider) *Service {
++ 	return &Service{store: s, images: im, artworks: a, ids: ids}
++ }
+```
+
+Replace line 84 in `service.go`:
+```
+- 	imgID := uuid.NewString()
++ 	imgID := s.ids.NewID()
+```
+
+- [ ] **Step 3: Build & run all existing image tests.**
+
+```bash
+go build ./...
+go test ./internal/image/... -count=1
+```
+
+Expected: PASS. The change is a pure rename of the call site; production wiring (NewService) is unchanged.
+
+- [ ] **Step 4: Commit.**
+
+```bash
+git add api/internal/image/idprovider.go api/internal/image/service.go
+git commit -m "[0.7-contract-matrix] feat: add IDProvider interface for deterministic test IDs"
+```
+
+### Task 7.2 — Add `RandReader` (no-op refactor)
+
+**Files:**
+- Create: `api/internal/auth/randreader.go`
+- Modify: `api/internal/auth/handlers.go`
+
+- [ ] **Step 1: Create the interface.**
+
+Write `api/internal/auth/randreader.go`:
+
+```go
+// api/internal/auth/randreader.go
+package auth
+
+import (
+	"crypto/rand"
+	"io"
+)
+
+// RandReader yields the random source for OAuth state. Production uses
+// crypto/rand.Reader; tests inject a deterministic source so snapshot bytes
+// are stable.
+type RandReader interface {
+	Read(p []byte) (n int, err error)
+}
+
+// defaultRand wraps crypto/rand.Reader so we don't expose the *os.File-typed
+// reader directly to callers who expect an interface.
+var defaultRand RandReader = randAdapter{}
+
+type randAdapter struct{}
+
+func (randAdapter) Read(p []byte) (int, error) { return rand.Read(p) }
+
+// stateRand is package-level so test code can swap it under sync. Production
+// startup never mutates it.
+var stateRand RandReader = defaultRand
+
+// SetStateRandForTest is exported only for use under -tags=integration to swap
+// in a deterministic reader for snapshot capture. Restore the previous value
+// in t.Cleanup.
+func SetStateRandForTest(r RandReader) (restore func()) {
+	prev := stateRand
+	stateRand = r
+	return func() { stateRand = prev }
+}
+
+// readState is the internal seam for randState; tests override stateRand.
+func readState(p []byte) (int, error) {
+	return stateRand.Read(p)
+}
+
+// Keep io.Reader symbol used so the import stays warm under refactors.
+var _ io.Reader = (*randAdapter)(nil)
+```
+
+- [ ] **Step 2: Edit `randState` to use the seam.**
+
+In `api/internal/auth/handlers.go`, replace the body of `randState`:
+
+```
+- func randState() string {
+- 	b := make([]byte, 16)
+- 	_, _ = rand.Read(b)
+- 	return hex.EncodeToString(b)
+- }
++ func randState() string {
++ 	b := make([]byte, 16)
++ 	_, _ = readState(b)
++ 	return hex.EncodeToString(b)
++ }
+```
+
+You can now drop the unused `crypto/rand` import from `handlers.go` (`go vet` will tell you).
+
+- [ ] **Step 3: Build & run.**
+
+```bash
+go build ./...
+go test ./internal/auth/... -count=1
+```
+
+Expected: PASS.
+
+- [ ] **Step 4: Commit.**
+
+```bash
+git add api/internal/auth/handlers.go api/internal/auth/randreader.go
+git commit -m "[0.7-contract-matrix] feat: add RandReader seam for deterministic OAuth state"
+```
+
+### Task 7.3 — Wire injection options into `BootApp`
+
+**Files:**
+- Modify: `api/internal/dbtest/bootapp.go`
+
+- [ ] **Step 1: Extend `BootOpts`.**
+
+Add to the struct (alphabetical order in the type declaration is not enforced; add at the end):
+
+```go
+type BootOpts struct {
+	// ... existing fields ...
+
+	// IDProvider injects a deterministic image-ID source. nil → production default.
+	IDProvider image.IDProvider
+
+	// RandReader injects a deterministic random source for OAuth state. nil →
+	// crypto/rand.Reader.
+	RandReader auth.RandReader
+}
+```
+
+- [ ] **Step 2: Use the injected providers in `BootApp`.**
+
+Replace the `imgSvc := image.NewService(...)` line with:
+
+```go
+ids := opts.IDProvider
+if ids == nil {
+	ids = image.NewUUIDProvider()
+}
+imgSvc := image.NewServiceWithIDs(store, images, arts, ids)
+
+if opts.RandReader != nil {
+	t.Cleanup(auth.SetStateRandForTest(opts.RandReader))
+}
+```
+
+(The auth seam is package-global; tests must restore in cleanup. The `t.Cleanup(...)` registration in BootApp ensures parallel-safe behavior is not promised — match the existing `dbtest.StartPostgres` sync.Once invariant.)
+
+- [ ] **Step 3: Build.**
+
+```bash
+go build ./...
+```
+
+Expected: green.
+
+- [ ] **Step 4: Commit.**
+
+```bash
+git add api/internal/dbtest/bootapp.go
+git commit -m "[0.7-contract-matrix] feat: wire ID and Rand injection into BootApp"
+```
+
+### Task 7.4 — Write the cartesian contract matrix
+
+**Files:**
+- Create: `api/internal/httpapi/contract/matrix_test.go`
+
+- [ ] **Step 1: Write the matrix file.**
+
+The matrix enumerates one entry per cell of (auth × resource × request shape) per the table in spec §5.2. The test loops over the matrix and calls `dbtest.AssertGolden`. Because no goldens exist yet, every assertion fails — that is expected. PR 0.8 turns those failures into committed snapshots.
+
+Write `api/internal/httpapi/contract/matrix_test.go`:
+
+```go
+package contract_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"net/http"
+	"testing"
+	"time"
+
+	"local/art-web/api/internal/dbtest"
+	"local/art-web/api/internal/image"
+)
+
+// fixedNow is the deterministic clock for every contract test.
+var fixedNow = time.Date(2026, 5, 4, 12, 0, 0, 0, time.UTC)
+
+// fixedRand returns a deterministic 16-byte source for OAuth state.
+type fixedRand struct{}
+
+func (fixedRand) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = byte(i + 1) // 0x01, 0x02, 0x03, ...
+	}
+	return len(p), nil
+}
+
+type contractCase struct {
+	name   string
+	method string
+	path   string
+	viewer string // "anon", "owner", "other"
+	body   string // JSON or empty
+	ctype  string // Content-Type override; empty → application/json when body != ""
+}
+
+// seedResponse mirrors the /dev/seed response shape (httpapi/devseed.go:57-64).
+// Only the fields the contract suite needs are decoded.
+type seedResponse struct {
+	AliceCookie string `json:"aliceCookie"`
+	BobCookie   string `json:"bobCookie"`
+	PID         string `json:"pId"` // public artwork
+	QID         string `json:"qId"` // private artwork
+}
+
+func bootContract(t *testing.T) (string, func(c contractCase) *http.Response) {
+	srv := dbtest.BootApp(t, dbtest.BootOpts{
+		FixedNow:   fixedNow,
+		IDProvider: &image.CounterIDProvider{},
+		RandReader: fixedRand{},
+	})
+
+	// Seed Alice (owner) and Bob (other) once. /dev/seed is mounted because
+	// BootOpts.AppEnv defaults to "test".
+	resp, err := http.Post(srv.URL+"/dev/seed", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /dev/seed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("seed status=%d want 200", resp.StatusCode)
+	}
+	var seed seedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&seed); err != nil {
+		t.Fatalf("decode seed: %v", err)
+	}
+
+	send := func(c contractCase) *http.Response {
+		var bodyReader *bytes.Reader
+		if c.body != "" {
+			bodyReader = bytes.NewReader([]byte(c.body))
+		} else {
+			bodyReader = bytes.NewReader(nil)
+		}
+		req, _ := http.NewRequest(c.method, srv.URL+c.path, bodyReader)
+		switch {
+		case c.ctype != "":
+			req.Header.Set("Content-Type", c.ctype)
+		case c.body != "":
+			req.Header.Set("Content-Type", "application/json")
+		}
+		switch c.viewer {
+		case "owner":
+			req.AddCookie(&http.Cookie{Name: "auth", Value: seed.AliceCookie})
+		case "other":
+			req.AddCookie(&http.Cookie{Name: "auth", Value: seed.BobCookie})
+		case "anon":
+			// no cookie
+		default:
+			t.Fatalf("unknown viewer %q", c.viewer)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do %s %s: %v", c.method, c.path, err)
+		}
+		return resp
+	}
+
+	return srv.URL, send
+}
+
+// PR 0.8 extends matrix_test.go to reference seed.PID / seed.QID in
+// viewer-aware GET/PATCH/DELETE cells.
+
+// TestContractMatrix enumerates every (auth × resource × shape) cell. Each cell
+// is asserted against a checked-in golden. Until PR 0.8 these all fail.
+func TestContractMatrix(t *testing.T) {
+	if testing.Short() {
+		t.Skip("contract suite is slow; run without -short")
+	}
+	_, send := bootContract(t)
+
+	cases := []contractCase{
+		// --- /healthz ---
+		{name: "healthz_anon", method: "GET", path: "/healthz", viewer: "anon"},
+
+		// --- GET /artworks (feed) ---
+		{name: "feed_anon_empty", method: "GET", path: "/artworks", viewer: "anon"},
+		{name: "feed_anon_bad_cursor", method: "GET", path: "/artworks?cursor=not-base64!!", viewer: "anon"},
+		{name: "feed_anon_limit_oob", method: "GET", path: "/artworks?limit=9999", viewer: "anon"},
+
+		// --- POST /artworks ---
+		{name: "create_anon_401", method: "POST", path: "/artworks", viewer: "anon", body: `{"title":"x"}`},
+		{name: "create_owner_minimal", method: "POST", path: "/artworks", viewer: "owner", body: `{"title":"x"}`},
+		{name: "create_owner_bad_visibility", method: "POST", path: "/artworks", viewer: "owner", body: `{"title":"x","visibility":"draft"}`},
+		{name: "create_owner_bad_json", method: "POST", path: "/artworks", viewer: "owner", body: `not json`},
+
+		// --- GET /artworks/{id} ---
+		// owner_get_public, other_get_public, anon_get_public, owner_get_private,
+		// other_get_private, anon_get_private — six cells. Only the IDs differ; the
+		// PR 0.8 capture step seeds two artworks (P public, Q private) via dev/seed
+		// and replays the matching cells.
+		{name: "get_artwork_anon_missing", method: "GET", path: "/artworks/00000000-0000-0000-0000-000000000000", viewer: "anon"},
+
+		// --- PATCH /artworks/{id} ---
+		{name: "patch_anon_401", method: "PATCH", path: "/artworks/00000000-0000-0000-0000-000000000000", viewer: "anon", body: `{"title":"x"}`},
+
+		// --- DELETE /artworks/{id} ---
+		{name: "delete_anon_401", method: "DELETE", path: "/artworks/00000000-0000-0000-0000-000000000000", viewer: "anon"},
+
+		// --- POST /artworks/{id}/images ---
+		{name: "upload_anon_401", method: "POST", path: "/artworks/00000000-0000-0000-0000-000000000000/images", viewer: "anon", ctype: "multipart/form-data; boundary=fake"},
+
+		// --- /me ---
+		{name: "me_anon_401", method: "GET", path: "/me", viewer: "anon"},
+
+		// --- /users/{slug} ---
+		{name: "user_profile_missing_slug", method: "GET", path: "/users/no-such-slug", viewer: "anon"},
+
+		// --- /tags/{name} ---
+		{name: "tag_missing", method: "GET", path: "/tags/no-such-tag", viewer: "anon"},
+
+		// --- /auth/{provider}/start ---
+		{name: "auth_unknown_provider", method: "GET", path: "/auth/notreal/start", viewer: "anon"},
+		{name: "auth_callback_bad_state", method: "GET", path: "/auth/google/callback?state=mismatch", viewer: "anon"},
+
+		// --- /auth/logout ---
+		{name: "logout_anon", method: "POST", path: "/auth/logout", viewer: "anon"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resp := send(c)
+			defer resp.Body.Close()
+			dbtest.AssertGolden(t, c.name, resp)
+		})
+	}
+}
+```
+
+> Remaining viewer-aware cells (owner/other × public/private artwork variants, plus the full image-upload happy path) require seeding artworks before each request. PR 0.8's capture step extends `bootContract` to seed via the existing `/dev/seed` handler before each viewer-aware run. For PR 0.7, the framework + the anon cells above are enough — reviewers focus on whether the matrix covers each axis from spec §5.2.
+
+- [ ] **Step 2: Run.**
+
+Run: `go test ./internal/httpapi/contract/... -v`
+Expected: every subtest fails with "rerun with GOLDEN_UPDATE=1 to create" — that is the intended state until PR 0.8.
+
+- [ ] **Step 3: Commit.**
+
+```bash
+git add api/internal/httpapi/contract/matrix_test.go
+git commit -m "[0.7-contract-matrix] feat: enumerate cartesian HTTP contract cells (no goldens yet)"
+```
+
+### Task 7.5 — Write the forbidden-status meta-test
+
+**Files:**
+- Create: `api/internal/httpapi/contract/forbidden_status_test.go`
+
+- [ ] **Step 1: Write the meta-test.**
+
+Per spec §5.2.0a, this test scans every captured `golden/*.json` file and fails if any forbidden status (403, translated 409, etc.) appears.
+
+Write `api/internal/httpapi/contract/forbidden_status_test.go`:
+
+```go
+package contract_test
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// Forbidden statuses per spec §5.2.0a: the current API never emits 403,
+// non-owner access on private resources collapses to 404. 410/451/511 are
+// not emitted by any current handler; introducing them would be a contract
+// change. 409 from translated domain errors (e.g., ErrAlreadyPublished) is
+// forbidden; the only legitimate 409 is image fingerprint_mismatch, asserted
+// by name below.
+var forbiddenStatuses = map[int]string{
+	403: "non-owner access must collapse to 404 (spec §7.2.1)",
+	410: "no current handler emits 410",
+	451: "no current handler emits 451",
+	511: "no current handler emits 511",
+}
+
+type goldenEnvelope struct {
+	Body    string              `json:"body"`
+	Headers map[string][]string `json:"headers"`
+	Status  int                 `json:"status"`
+}
+
+func TestForbiddenStatuses_AbsentFromAllGoldens(t *testing.T) {
+	matches, err := filepath.Glob(filepath.Join("golden", "*.json"))
+	if err != nil {
+		t.Fatalf("glob goldens: %v", err)
+	}
+	if len(matches) == 0 {
+		t.Skip("no goldens captured yet (PR 0.8 is what populates this)")
+	}
+
+	for _, m := range matches {
+		bs, err := os.ReadFile(m)
+		if err != nil {
+			t.Fatalf("read %s: %v", m, err)
+		}
+		var env goldenEnvelope
+		if err := json.Unmarshal(bs, &env); err != nil {
+			t.Fatalf("parse %s: %v", m, err)
+		}
+		if reason, bad := forbiddenStatuses[env.Status]; bad {
+			t.Errorf("golden %s emits forbidden status %d: %s", m, env.Status, reason)
+		}
+		// 409 with a body NOT containing "fingerprint_mismatch" is a translated
+		// domain error and must be absent.
+		if env.Status == 409 && !contains409Allowed(env.Body) {
+			t.Errorf("golden %s emits 409 without fingerprint_mismatch; "+
+				"likely a translated domain error (spec §7.2.1)", m)
+		}
+	}
+}
+
+func contains409Allowed(body string) bool {
+	// The only legitimate 409 in the current API is image fingerprint_mismatch.
+	// The body must contain exactly that error code.
+	const expected = `"error":"fingerprint_mismatch"`
+	for i := 0; i+len(expected) <= len(body); i++ {
+		if body[i:i+len(expected)] == expected {
+			return true
+		}
+	}
+	return false
+}
+```
+
+- [ ] **Step 2: Run — should pass-with-skip until goldens exist.**
+
+Run: `go test ./internal/httpapi/contract/... -run TestForbiddenStatuses_AbsentFromAllGoldens -v`
+Expected: `--- SKIP` (no goldens captured yet).
+
+- [ ] **Step 3: Commit.**
+
+```bash
+git add api/internal/httpapi/contract/forbidden_status_test.go
+git commit -m "[0.7-contract-matrix] feat: meta-test forbids 403 and translated 409 in goldens"
+```
+
+### Task 7.6 — Open the PR
+
+- [ ] **Step 1: Push and open.**
+
+```bash
+git push -u origin phase0/0.7-contract-matrix
+gh pr create --base master --title "[0.7-contract-matrix] HTTP contract matrix + deterministic injection" --body "$(cat <<'EOF'
+## Summary
+- Add `image.IDProvider` interface (production: `uuid.NewString`; tests: `CounterIDProvider`); switch the only Go-side image-ID call site to use it.
+- Add `auth.RandReader` interface; switch `randState` to use it.
+- Wire both into `dbtest.BootApp`.
+- Write the cartesian contract matrix (no goldens yet — fails as expected; PR 0.8 captures).
+- Write the forbidden-status meta-test (skips until goldens exist).
+
+## Test plan
+- [ ] All existing tests still pass (the IDProvider/RandReader switches are no-op refactors)
+- [ ] `go test ./internal/httpapi/contract/...` fails with golden-not-found errors (intended)
+- [ ] `go vet ./...` clean
+
+Refs spec §5.3.2 (dynamic-byte injection), §5.2.0a (forbidden statuses).
+EOF
+)"
+```
+
+---
+
+## PR 0.8 — Lock the snapshots
+
+**Branch:** `phase0/0.8-snapshot-lock`
+
+**Goal:** Capture every contract cell as a checked-in golden file, activate the `contract_suite` CI job as required, add CODEOWNERS protection on `golden/`, and confirm `/dev/seed` is excluded.
+
+**Acceptance criteria:**
+- `golden/` is non-empty and committed.
+- `make test-contract` is green at HEAD without `GOLDEN_UPDATE=1`.
+- `contract_suite` CI job is required on all PRs.
+- CODEOWNERS protects `api/internal/httpapi/contract/golden/`.
+- The forbidden-status meta-test passes (no longer skips).
+- `/dev/seed` has no golden file.
+
+### Task 8.1 — Capture the snapshots
+
+**Files:**
+- Create: `api/internal/httpapi/contract/golden/*.json` (one per case in `matrix_test.go`)
+
+- [ ] **Step 1: Run with GOLDEN_UPDATE=1.**
+
+```bash
+cd /Users/todd.lam/WORK/_TestScripts/art-web/api
+GOLDEN_UPDATE=1 go test ./internal/httpapi/contract/... -v
+```
+
+Expected: every subtest passes (write mode never compares). The `golden/` directory is created with one `<case-name>.json` per case.
+
+- [ ] **Step 2: Inspect a few snapshots to confirm normalization is correct.**
+
+```bash
+cat /Users/todd.lam/WORK/_TestScripts/art-web/api/internal/httpapi/contract/golden/feed_anon_empty.json | head -20
+cat /Users/todd.lam/WORK/_TestScripts/art-web/api/internal/httpapi/contract/golden/auth_unknown_provider.json | head -20
+```
+
+UUIDs should appear as `<UUID>`; timestamps as `<TIMESTAMP>`. JWT cookie values (Set-Cookie auth=...) should appear as `<JWT>`.
+
+- [ ] **Step 3: Confirm `/dev/seed` is NOT snapshotted.**
+
+```bash
+ls /Users/todd.lam/WORK/_TestScripts/art-web/api/internal/httpapi/contract/golden/ | grep -i seed && echo "FAIL: dev/seed should be absent" || echo "OK: no dev/seed snapshot"
+```
+
+If a `seed_*` file appears, remove the corresponding case from `matrix_test.go` and re-capture.
+
+- [ ] **Step 4: Re-run without `GOLDEN_UPDATE` to confirm replay passes byte-strict.**
+
+```bash
+go test ./internal/httpapi/contract/... -v
+```
+
+Expected: every subtest passes. The forbidden-status meta-test now does NOT skip.
+
+- [ ] **Step 5: Commit the snapshots.**
+
+```bash
+git add api/internal/httpapi/contract/golden/
+git commit -m "[0.8-snapshot-lock] feat: capture HTTP contract goldens"
+```
+
+### Task 8.2 — Activate the CI job
+
+**Files:**
+- Modify: `.github/workflows/contract.yml` (or its equivalent)
+
+- [ ] **Step 1: Remove the `if: false` gate.**
+
+Open `.github/workflows/contract.yml` and delete this line:
+
+```
+    if: false   # disabled until PR 0.8 captures goldens
+```
+
+The job now runs on every PR.
+
+- [ ] **Step 2: Add it to required checks.**
+
+Mark `contract_suite` as required via the GitHub UI: **Settings → Branches → Branch protection rule → master → Require status checks → contract_suite**. The PR description should include a screenshot or note confirming the team has done this.
+
+- [ ] **Step 3: Commit.**
+
+```bash
+git add .github/workflows/contract.yml
+git commit -m "[0.8-snapshot-lock] chore: activate contract_suite CI job"
+```
+
+### Task 8.3 — Add CODEOWNERS protection on `golden/`
+
+**Files:**
+- Modify: `CODEOWNERS` (root or `.github/CODEOWNERS` — verify with `ls /Users/todd.lam/WORK/_TestScripts/art-web/.github/`)
+
+- [ ] **Step 1: Add the protection line.**
+
+Append to the CODEOWNERS file:
+
+```
+# Contract snapshots — changes require backend lead review.
+api/internal/httpapi/contract/golden/   @backend-leads
+```
+
+> Replace `@backend-leads` with the GitHub team or username the team agreed on (spec §13 open question 2). If the team or user does not exist yet, leave a TODO comment and ship the line as `@todd-l-am` (the current backend committer per `git log --format='%an' | sort -u`) so the protection is real.
+
+- [ ] **Step 2: Commit.**
+
+```bash
+git add CODEOWNERS
+git commit -m "[0.8-snapshot-lock] chore: protect contract goldens via CODEOWNERS"
+```
+
+### Task 8.4 — Build the validator-translator table reference
+
+**Files:**
+- Create: `api/internal/httpapi/contract/error_codes_observed.md`
+
+- [ ] **Step 1: Extract the unique `error` codes from the captured snapshots.**
+
+```bash
+cd /Users/todd.lam/WORK/_TestScripts/art-web/api
+grep -hoE '"error":"[^"]+"' internal/httpapi/contract/golden/*.json | sort -u
+```
+
+- [ ] **Step 2: Write the reference table that PR 0.8 hands off to Phase 1's plan author.**
+
+Write `api/internal/httpapi/contract/error_codes_observed.md`:
+
+```markdown
+# Observed error codes (Phase 0 snapshot)
+
+This table is the canonical input to Phase 1's `WriteError` switch (spec §7.4)
+and validator translator (§7.5). Every code listed here is byte-locked into a
+golden file. Phase 1 must emit exactly these codes for these statuses.
+
+| Status | Error code               | Shape | Source endpoint(s) |
+|--------|--------------------------|-------|--------------------|
+| <fill in by reading goldens; one row per unique (status, error code) pair> |  |  |  |
+
+> Generation step: `grep -hoE '"error":"[^"]+"' golden/*.json | sort -u`
+```
+
+Fill the rows by inspecting the goldens. Examples for the cells captured in PR 0.7:
+- `(401, "unauthorized", A, /me, POST/PATCH/DELETE artworks)`
+- `(404, "not_found", A, GET/PATCH/DELETE artwork by id, GET user, GET tag)`
+- `(404, "unknown_provider", A, /auth/{provider}/{start,callback})`
+- `(400, "bad_cursor", B, GET /artworks)`
+- ...
+
+- [ ] **Step 3: Commit.**
+
+```bash
+git add api/internal/httpapi/contract/error_codes_observed.md
+git commit -m "[0.8-snapshot-lock] docs: snapshot-derived error-code table for Phase 1"
+```
+
+### Task 8.5 — Open the PR
+
+- [ ] **Step 1: Push and open.**
+
+```bash
+git push -u origin phase0/0.8-snapshot-lock
+gh pr create --base master --title "[0.8-snapshot-lock] Lock HTTP contract snapshots" --body "$(cat <<'EOF'
+## Summary
+- Capture every contract cell as a committed golden file.
+- Activate `contract_suite` CI as a required check.
+- Add CODEOWNERS protection on `api/internal/httpapi/contract/golden/`.
+- Confirm `/dev/seed` is excluded.
+- Add reference table of every observed error code as input to Phase 1.
+
+## Test plan
+- [ ] `make test-contract` green
+- [ ] `golden/` has the expected count of files, none with `seed_*` prefix
+- [ ] forbidden-status meta-test passes (no longer skips)
+- [ ] CODEOWNERS team confirmed before merge
+
+Refs spec §5.1, §5.2.0a, §5.2.1, §8.1 PR 0.8.
+
+> 🛑 After this PR merges, Phase 0 is complete. Phase 1 gets its own plan,
+> written from `error_codes_observed.md` and the captured goldens.
+EOF
+)"
+```
+
+---
+
+## Phase 0 hard gates (block Phase 1 from starting)
+
+Per spec §8.3, before the Phase 1 branch is created, all of the following must be true:
+
+- [ ] PR 0.8 merged to master.
+- [ ] `make test-cover-slices` shows all four business slices ≥ 80 % on the old package paths.
+- [ ] `contract_suite` CI job exists, is required, and is currently green on master.
+- [ ] `api/internal/httpapi/contract/golden/` exists, is non-empty, has CODEOWNERS protection.
+- [ ] No frontend changes are planned during Phase 1's branch lifetime, OR a coordination owner is identified.
+- [ ] Branch protection on master forbids force-push.
+
+When all six gates are checked, the team is ready to write the Phase 1 plan.
+
+---
+
+## What happens after Phase 0
+
+**Phase 1 gets its own plan**, written after PR 0.8 lands. The reason is mechanical, not procedural: spec §7.4 and §7.5 say the validator-translator table and the full error-code mapping are *built from* PR 0.8's captured snapshots. Writing those before the snapshots exist would mean placeholders.
+
+The Phase 1 plan will be saved to `docs/superpowers/plans/2026-XX-XX-go-backend-refactor-phase1.md` and will reference:
+- `api/internal/httpapi/contract/error_codes_observed.md` for the canonical error-code list.
+- The committed goldens as the byte-strict target.
+- Spec §6 (Wire DI graph), §7 (domain & error-handling conventions), §9 (commit-ordering constraints), §10 (merge gates).
+
+The Phase 1 plan author should re-invoke `superpowers:writing-plans` with the spec + the contract artifacts in hand.
