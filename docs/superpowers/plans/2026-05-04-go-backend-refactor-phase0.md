@@ -27,7 +27,7 @@ The Phase 0 layout is the **current** flat layout — no slice-internal director
 | `api/internal/dbtest/golden.go` | Create | `assertGolden(t, name, resp)` helper with `GOLDEN_UPDATE=1` write-mode. |
 | `api/internal/user/repo_test.go` | Modify | Add slugify, slug-collision, slug-exhaustion, ErrNotFound, lookupExistingOAuth tests. |
 | `api/internal/user/slugify_test.go` | Create | Pure-function tests for `slugify` (currently unexported — see PR 0.2). |
-| `api/internal/storage/localfs_test.go` | Modify | Add path-traversal-edge cases, missing-source for Move, signed-URL roundtrip. |
+| `api/internal/storage/localfs_test.go` | Modify | Add path-traversal-edge cases, missing-source for Move, **pin** `SignedURL` returns "unsupported" error. |
 | `api/internal/storage/r2_test.go` | Modify | Add multipart, missing-bucket, content-type roundtrip. |
 | `api/internal/image/handler_test.go` | Modify | Add `manifest_required`, `bad_multipart`, `file_count_mismatch`, content-type-roundtrip orphan tests. |
 | `api/internal/image/service_test.go` | Modify (or create) | Add fingerprint-mismatch precedence, decode-format-vs-declared mismatch, max-bytes-exact-boundary tests. |
@@ -36,10 +36,11 @@ The Phase 0 layout is the **current** flat layout — no slice-internal director
 | `api/internal/httpapi/devseed_test.go` | Modify | Cover `AppEnv != "test"` 404 path and the 200-success path body shape. |
 | `api/internal/db/pool_test.go` | Modify | Add bad-DSN error path. |
 | `api/internal/artwork/visibility_test.go` | Modify | Add storage-failure-during-flip, DB-tx-failure rollback, RollbackLog firing tests. |
-| `api/internal/image/idprovider.go` | Create | `IDProvider` interface + `uuidIDProvider` default + `CounterIDProvider` for tests. |
-| `api/internal/image/service.go` | Modify | Replace `uuid.NewString()` at line 84 with `s.ids.NewID()`. |
-| `api/internal/auth/handlers.go` | Modify | Replace `randState()` body with `RandReader.Read` injection (default `crypto/rand.Reader`). |
-| `api/internal/auth/randreader.go` | Create | `RandReader` interface + default + deterministic test impl. |
+| `api/internal/image/idprovider.go` | Create (PR 0.4) | `IDProvider` interface + `uuidIDProvider` default + `CounterIDProvider` for tests. |
+| `api/internal/image/service.go` | Modify (PR 0.4) | Add `imageRepo` seam, `ids IDProvider` field, `NewServiceWithIDs`; replace `uuid.NewString()` at line 84 with `s.ids.NewID()`. |
+| `api/internal/auth/handlers.go` | Modify (PR 0.7) | Replace `randState()` body with `RandReader.Read` injection (default `crypto/rand.Reader`). |
+| `api/internal/auth/randreader.go` | Create (PR 0.7) | `RandReader` interface + default + deterministic test impl. |
+| `api/internal/httpapi/devseed.go` | Modify (PR 0.7) | Accept optional `?suffix=` query param so contract suite gets deterministic slug suffixes. |
 | `api/internal/httpapi/contract/doc.go` | Create | Empty package created in PR 0.1 so `make test-contract` compiles before PR 0.7. |
 | `api/internal/httpapi/contract/placeholder_test.go` | Create | Trivial test in PR 0.1; replaced by matrix_test.go in PR 0.7. |
 | `api/internal/httpapi/contract/matrix_test.go` | Create | Cartesian-product HTTP contract suite (PR 0.7 — replaces placeholder). |
@@ -211,6 +212,7 @@ Write `api/internal/dbtest/normalize_test.go`:
 package dbtest_test
 
 import (
+	"encoding/base64"
 	"net/http"
 	"strings"
 	"testing"
@@ -255,10 +257,33 @@ func TestNormalize_ReplacesHMACSignedURLSuffix(t *testing.T) {
 }
 
 func TestNormalize_ReplacesBase64Cursor(t *testing.T) {
+	// httpapi/artworks.go:54 builds cursors as base64.RawURLEncoding(timestamp|uuid).
+	// Reproduce the actual encoding so the test matches what the real handler emits.
+	rawCursor := base64.RawURLEncoding.EncodeToString(
+		[]byte("2026-05-04T12:00:00.000000000Z|550e8400-e29b-41d4-a716-446655440000"))
+	body := `{"next_cursor":"` + rawCursor + `","items":[]}`
+	got := dbtest.NormalizeBody([]byte(body))
+	want := `{"next_cursor":"<CURSOR>","items":[]}`
+	if string(got) != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
+func TestNormalize_CursorIdempotent(t *testing.T) {
 	body := `{"next_cursor":"<CURSOR>"}`
 	got := dbtest.NormalizeBody([]byte(body))
 	if string(got) != body {
 		t.Fatalf("normalize must be idempotent on already-normalized cursor; got %q", got)
+	}
+}
+
+func TestNormalize_NullCursor_Untouched(t *testing.T) {
+	// When pagination is exhausted the handler emits next_cursor=null (not a
+	// string). The cursor regex must not match null.
+	body := `{"next_cursor":null,"items":[]}`
+	got := dbtest.NormalizeBody([]byte(body))
+	if string(got) != body {
+		t.Fatalf("null cursor must be preserved; got %q", got)
 	}
 }
 
@@ -291,10 +316,14 @@ import (
 	"regexp"
 )
 
-// Patterns are documented in spec §5.3.2. Order matters: signed-URL substitution
-// runs before generic timestamp substitution because the URL also contains an
-// `exp=` epoch-second integer that would otherwise be left as a bare digit run.
+// Patterns are documented in spec §5.3.2. Order matters; see NormalizeBody.
 var (
+	// nextCursorRe matches the JSON field `"next_cursor":"<base64-RawURL>"`
+	// and rewrites the value to <CURSOR>. The base64.RawURLEncoding alphabet
+	// is [A-Za-z0-9_-] (no padding). The regex is anchored to the field name so
+	// arbitrary base64-looking strings elsewhere in the body are NOT replaced.
+	// `null` cursors are not matched (the regex requires a quoted string).
+	nextCursorRe = regexp.MustCompile(`"next_cursor":"[A-Za-z0-9_\-]+"`)
 	uuidRe       = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 	rfc3339Re    = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z`)
 	signedURLRe  = regexp.MustCompile(`\?sig=[0-9a-f]+&exp=\d+`)
@@ -304,7 +333,16 @@ var (
 
 // NormalizeBody rewrites every non-deterministic byte sequence in body to a
 // stable placeholder so post-normalization snapshots compare equal.
+//
+// Order matters:
+//   1. nextCursorRe runs first so the opaque base64 cursor is collapsed before
+//      any later rule could match digits or hyphens inside it.
+//   2. signedURLRe runs before rfc3339Re because the signed-URL `exp=` integer
+//      would otherwise be left as a bare digit run.
+//   3. rfc3339Re runs before uuidRe because timestamps' digit groups don't
+//      overlap with the UUID pattern, but explicit ordering documents intent.
 func NormalizeBody(body []byte) []byte {
+	body = nextCursorRe.ReplaceAll(body, []byte(`"next_cursor":"<CURSOR>"`))
 	body = signedURLRe.ReplaceAll(body, []byte(`?sig=<SIG>&exp=<EXP>`))
 	body = rfc3339Re.ReplaceAll(body, []byte(`<TIMESTAMP>`))
 	body = uuidRe.ReplaceAll(body, []byte(`<UUID>`))
@@ -356,57 +394,53 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"local/art-web/api/internal/dbtest"
 )
 
-func TestAssertGolden_WriteMode_CreatesFile(t *testing.T) {
+// makeResp returns a fresh *http.Response so a single envelope can be both
+// written (write mode) and compared (compare mode) in the same test.
+func makeResp(status int, body string) *http.Response {
+	rec := httptest.NewRecorder()
+	rec.Code = status
+	rec.Header().Set("Content-Type", "application/json; charset=utf-8")
+	rec.Body.WriteString(body)
+	return rec.Result()
+}
+
+func TestAssertGolden_WriteThenCompare_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("GOLDEN_UPDATE", "1")
 	t.Setenv("GOLDEN_DIR", dir)
 
-	rec := httptest.NewRecorder()
-	rec.Code = 200
-	rec.Header().Set("Content-Type", "application/json; charset=utf-8")
-	rec.Body.WriteString(`{"id":"550e8400-e29b-41d4-a716-446655440000"}`)
-	resp := rec.Result()
-
-	dbtest.AssertGolden(t, "sample", resp)
+	// 1) Write mode: AssertGolden writes the indented envelope to disk.
+	t.Setenv("GOLDEN_UPDATE", "1")
+	dbtest.AssertGolden(t, "sample",
+		makeResp(200, `{"id":"550e8400-e29b-41d4-a716-446655440000"}`))
 
 	bs, err := os.ReadFile(filepath.Join(dir, "sample.json"))
 	if err != nil {
 		t.Fatalf("expected golden file written: %v", err)
 	}
-	want := `{"id":"<UUID>"}`
-	if string(bs) == "" || !contains(string(bs), want) {
-		t.Fatalf("golden file missing normalized body; got %q", bs)
+	if !strings.Contains(string(bs), `<UUID>`) {
+		t.Fatalf("golden file missing normalized UUID; got %s", bs)
 	}
+	if !strings.Contains(string(bs), `"body":`) ||
+		!strings.Contains(string(bs), `"status":`) ||
+		!strings.Contains(string(bs), `"headers":`) {
+		t.Fatalf("envelope missing one of body/status/headers; got %s", bs)
+	}
+
+	// 2) Compare mode against the same input: must pass byte-strict.
+	t.Setenv("GOLDEN_UPDATE", "")
+	dbtest.AssertGolden(t, "sample",
+		makeResp(200, `{"id":"550e8400-e29b-41d4-a716-446655440000"}`))
 }
 
-func TestAssertGolden_CompareMode_PassesWhenEqual(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "sample.json"),
-		[]byte(`{"status":200,"body":"{\"ok\":true}"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("GOLDEN_DIR", dir)
-
-	rec := httptest.NewRecorder()
-	rec.Code = 200
-	rec.Body.WriteString(`{"ok":true}`)
-	dbtest.AssertGolden(t, "sample", rec.Result())
-}
-
-func contains(haystack, needle string) bool {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
-	}
-	return false
-}
 ```
+
+> The failure-path branch (compare-mode mismatch → t.Fatalf) is not unit-tested. Catching `t.Fatalf` requires a custom test interface that adds noise to the helper signature; the failure path is exercised organically in PR 0.8 (intentional snapshot mismatches surface immediately) and afterwards by Phase 1 review. If a regression in the failure path is a concern, add a separate `*_failure_test.go` later that uses `runtime.Goexit` capture, but defer for now.
 
 - [ ] **Step 2: Run to confirm failure.**
 
@@ -1156,14 +1190,21 @@ func TestLocalFS_Exists_FalseForMissing(t *testing.T) {
 	}
 }
 
-func TestLocalFS_SignedURL_Roundtrip(t *testing.T) {
+func TestLocalFS_SignedURL_ReturnsUnsupported(t *testing.T) {
+	// Pin the current contract: localfs does NOT implement SignedURL — it
+	// returns ("", error). Verified against api/internal/storage/localfs.go:
+	//   return "", errors.New("localfs does not support signed URLs")
+	// HTTP-level signed URLs come from auth.URLBuilder, not the storage adapter.
 	s := storage.NewLocalFS(t.TempDir())
 	url, err := s.SignedURL(context.Background(), "abc/0.jpg", 5*time.Minute)
-	if err != nil {
-		t.Fatalf("signed url: %v", err)
+	if err == nil {
+		t.Fatal("expected localfs.SignedURL to return an error")
 	}
-	if url == "" {
-		t.Fatal("empty signed url")
+	if url != "" {
+		t.Fatalf("expected empty URL on error, got %q", url)
+	}
+	if !strings.Contains(err.Error(), "does not support") {
+		t.Fatalf("expected unsupported message, got %v", err)
 	}
 }
 
@@ -1314,7 +1355,9 @@ These need `Service`-level tests with a stubbed `*Repo` interface, but the curre
 
 Choose Option A. The interface is internal and only `*Repo` satisfies it today; production wiring is unchanged.
 
-- [ ] **Step 1: Add a minimal test seam to `image/service.go`.**
+> **Sequencing note (round-2 Finding 3):** PR 0.7 will swap `uuid.NewString()` at `service.go:84` for an injected `IDProvider`. If `IDProvider` is introduced only then, the service test literals added below in PR 0.4 would set `ids = nil` and panic when PR 0.7 lands. To avoid that temporal coupling, **PR 0.4 introduces both `imageRepo` and `IDProvider` together** and the service tests set `ids: image.NewUUIDProvider()` (or a `*CounterIDProvider`) on every literal. PR 0.7 then has only one job: wire the providers into `BootApp`.
+
+- [ ] **Step 1a: Add the `imageRepo` test seam to `image/service.go`.**
 
 Open `api/internal/image/service.go` and add **above** the `Service` struct:
 
@@ -1330,6 +1373,81 @@ type imageRepo interface {
 	Insert(ctx context.Context, in InsertInput) (*InsertResult, error)
 }
 ```
+
+- [ ] **Step 1b: Add the `IDProvider` interface and providers in `api/internal/image/idprovider.go`.**
+
+Write `api/internal/image/idprovider.go`:
+
+```go
+// api/internal/image/idprovider.go
+package image
+
+import (
+	"fmt"
+
+	"github.com/google/uuid"
+)
+
+// IDProvider yields per-row IDs for image uploads. Production uses
+// uuidIDProvider (a thin wrapper over uuid.NewString); the contract suite
+// injects CounterIDProvider so snapshot bytes are stable.
+type IDProvider interface {
+	NewID() string
+}
+
+type uuidIDProvider struct{}
+
+func (uuidIDProvider) NewID() string { return uuid.NewString() }
+
+// NewUUIDProvider returns the production IDProvider.
+func NewUUIDProvider() IDProvider { return uuidIDProvider{} }
+
+// CounterIDProvider is a deterministic IDProvider for tests. The Nth call
+// returns "00000000-0000-0000-0000-NNNNNNNNNNNN" (12-digit zero-padded N).
+type CounterIDProvider struct {
+	N int
+}
+
+func (c *CounterIDProvider) NewID() string {
+	c.N++
+	return fmt.Sprintf("00000000-0000-0000-0000-%012d", c.N)
+}
+```
+
+- [ ] **Step 1c: Wire `ids` into `Service`.**
+
+Edit `api/internal/image/service.go` to add the field, default it in `NewService`, expose a test constructor, and use it at the upload site:
+
+```
+type Service struct {
+    store    storage.Storage
+    images   imageRepo
+    artworks *artwork.Repo
++   ids      IDProvider
+}
+
+- func NewService(s storage.Storage, im *Repo, a *artwork.Repo) *Service {
+- 	return &Service{store: s, images: im, artworks: a}
+- }
++ func NewService(s storage.Storage, im *Repo, a *artwork.Repo) *Service {
++ 	return &Service{store: s, images: im, artworks: a, ids: NewUUIDProvider()}
++ }
++
++ // NewServiceWithIDs is the test-mode constructor. The contract suite passes a
++ // deterministic *CounterIDProvider here. Production uses NewService.
++ func NewServiceWithIDs(s storage.Storage, im *Repo, a *artwork.Repo, ids IDProvider) *Service {
++ 	return &Service{store: s, images: im, artworks: a, ids: ids}
++ }
+```
+
+In the same file at line 84, replace:
+
+```
+- 	imgID := uuid.NewString()
++ 	imgID := s.ids.NewID()
+```
+
+The `github.com/google/uuid` import in service.go can stay (still used by `idprovider.go` via the `image` package; `service.go` itself no longer references it). Run `go vet ./...` after — if vet flags the unused import in `service.go`, remove it.
 
 Then change the field type:
 
@@ -1348,14 +1466,15 @@ Then change the field type:
 
 `NewService`'s signature stays the same — `*Repo` satisfies `imageRepo`.
 
-- [ ] **Step 2: Verify the build still passes.**
+- [ ] **Step 2: Verify the build still passes and existing image tests still go green.**
 
 ```bash
+cd /Users/todd.lam/WORK/_TestScripts/art-web/api
 go build ./...
 go test ./internal/image/... -count=1
 ```
 
-Expected: green. No callers change because `*Repo` satisfies the interface.
+Expected: green. No callers change because `*Repo` satisfies the new `imageRepo` interface, and `NewService` defaults `ids` so existing tests are untouched.
 
 - [ ] **Step 3: Add the focused service tests.**
 
@@ -1431,7 +1550,11 @@ func TestUploadOne_StoragePutFailure_Surfaces(t *testing.T) {
 		insertFn: func(_ context.Context, _ InsertInput) (*InsertResult, error) { return &InsertResult{}, nil },
 	}
 	store := &stubStore{failPut: true}
-	svc := &Service{store: store, images: repo, artworks: nil}
+	// ids must be non-nil — UploadOne calls s.ids.NewID() at line 84 even
+	// when Put fails before reaching the insert (the call sequence is decode,
+	// then ids.NewID, then Put). NewUUIDProvider is fine because the failing
+	// Put short-circuits before we'd otherwise compare IDs across runs.
+	svc := &Service{store: store, images: repo, artworks: nil, ids: NewUUIDProvider()}
 	art := &artwork.Artwork{ID: "art1", Visibility: "private"}
 
 	_, err := svc.UploadOne(context.Background(), art, UploadOne{
@@ -1457,7 +1580,7 @@ func TestUploadOne_InsertFails_OrphanIsDeleted(t *testing.T) {
 		},
 	}
 	store := &stubStore{}
-	svc := &Service{store: store, images: repo, artworks: nil}
+	svc := &Service{store: store, images: repo, artworks: nil, ids: NewUUIDProvider()}
 	art := &artwork.Artwork{ID: "art1", Visibility: "private"}
 
 	_, err := svc.UploadOne(context.Background(), art, UploadOne{
@@ -1490,7 +1613,7 @@ func TestUploadOne_IdempotentInsertButRowNotFound_ErrorsClearly(t *testing.T) {
 		},
 	}
 	store := &stubStore{}
-	svc := &Service{store: store, images: repo, artworks: nil}
+	svc := &Service{store: store, images: repo, artworks: nil, ids: NewUUIDProvider()}
 	art := &artwork.Artwork{ID: "art1", Visibility: "private"}
 
 	_, err := svc.UploadOne(context.Background(), art, UploadOne{
@@ -1522,8 +1645,8 @@ Expected: `coverage: NN.N% of statements` ≥ 80.0.
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add api/internal/image/service.go api/internal/image/service_test.go
-git commit -m "[0.4-image] test: cover Put failure, Insert failure orphan cleanup, idempotent-insert race"
+git add api/internal/image/service.go api/internal/image/idprovider.go api/internal/image/service_test.go
+git commit -m "[0.4-image] feat: add IDProvider + imageRepo seam; cover failure paths"
 ```
 
 ### Task 4.3 — Open the PR
@@ -1535,6 +1658,7 @@ git push -u origin phase0/0.4-image
 gh pr create --base master --title "[0.4-image] Lift image package coverage to ≥ 80%" --body "$(cat <<'EOF'
 ## Summary
 - Add narrow `imageRepo` interface seam in service.go (no behavior change).
+- Add `IDProvider` interface + `NewUUIDProvider` (production) + `CounterIDProvider` (deterministic for contract suite). Switch `service.go:84` from `uuid.NewString()` to `s.ids.NewID()`. PR 0.7 then wires `CounterIDProvider` into `BootApp`.
 - Cover storage Put failure (no spurious Delete), Insert failure (orphan cleanup fires), idempotent-insert-but-row-missing race-window error.
 
 ## Test plan
@@ -2359,110 +2483,27 @@ EOF
 **Goal:** Per spec §8.1: add the cartesian-matrix test file, switch the two Go-side dynamic sources to injectable interfaces (no behavior change), wire the normalizer, and write the meta-test that scans goldens for forbidden statuses. **No goldens yet** — tests are expected to fail until PR 0.8 captures them.
 
 **Acceptance criteria:**
-- `IDProvider` interface added; production passes `uuid.NewString()`; `image/service.go:84` uses it.
+- `IDProvider` was already introduced in PR 0.4; PR 0.7 only wires it into BootApp.
 - `RandReader` interface added; production passes `crypto/rand.Reader`; `auth/handlers.go:randState` uses it.
-- Cartesian matrix file exists under `internal/httpapi/contract/` and enumerates every (auth × resource × shape) cell from spec §5.2.
+- `/dev/seed` accepts a `?suffix=` query parameter for deterministic slug suffixes.
+- Cartesian matrix file exists under `internal/httpapi/contract/` and enumerates every (auth × resource × shape) cell from spec §5.2 — including the auth-callback 302 (success) and 502 (exchange_failed) branches.
 - Forbidden-status meta-test file exists.
 - `go build ./...` passes; existing tests unchanged.
 
-### Task 7.1 — Add `IDProvider` (no-op refactor)
+### Task 7.1 — `IDProvider` already exists from PR 0.4
 
-**Files:**
-- Create: `api/internal/image/idprovider.go`
-- Modify: `api/internal/image/service.go`
-- Modify: `api/internal/image/handler_test.go` (smoke check that production wiring still works — adjust `newHandler` if needed)
+`IDProvider`, `NewUUIDProvider`, `CounterIDProvider`, and `NewServiceWithIDs` were introduced in PR 0.4 (Task 4.2 Step 1b/1c) so the new service tests could initialize `ids` correctly. PR 0.7 has no work to do here beyond using these in `BootApp` (Task 7.3) and the matrix (Task 7.4). **No code changes in this task.**
 
-- [ ] **Step 1: Create the interface and default implementation.**
-
-Write `api/internal/image/idprovider.go`:
-
-```go
-// api/internal/image/idprovider.go
-package image
-
-import (
-	"fmt"
-
-	"github.com/google/uuid"
-)
-
-// IDProvider yields per-row IDs for image uploads. Production uses uuidIDProvider
-// (a thin wrapper over uuid.NewString); tests inject a deterministic counter via
-// CounterIDProvider so snapshot bytes are stable.
-type IDProvider interface {
-	NewID() string
-}
-
-type uuidIDProvider struct{}
-
-func (uuidIDProvider) NewID() string { return uuid.NewString() }
-
-// NewUUIDProvider returns the production IDProvider.
-func NewUUIDProvider() IDProvider { return uuidIDProvider{} }
-
-// CounterIDProvider is a deterministic IDProvider for tests. The Nth call
-// returns "00000000-0000-0000-0000-NNNNNNNNNNNN" (12-digit zero-padded N).
-type CounterIDProvider struct {
-	N int
-}
-
-func (c *CounterIDProvider) NewID() string {
-	c.N++
-	return fmt.Sprintf("00000000-0000-0000-0000-%012d", c.N)
-}
-```
-
-- [ ] **Step 2: Wire it into `Service`.**
-
-Edit `api/internal/image/service.go`:
-
-Add the field:
-```
-type Service struct {
-    store    storage.Storage
-    images   imageRepo
-    artworks *artwork.Repo
-+   ids      IDProvider
-}
-```
-
-Update `NewService`:
-```
-- func NewService(s storage.Storage, im *Repo, a *artwork.Repo) *Service {
-- 	return &Service{store: s, images: im, artworks: a}
-- }
-+ func NewService(s storage.Storage, im *Repo, a *artwork.Repo) *Service {
-+ 	return &Service{store: s, images: im, artworks: a, ids: NewUUIDProvider()}
-+ }
-+
-+ // NewServiceWithIDs is the test-mode constructor that lets the contract suite
-+ // inject a deterministic IDProvider. Production callers use NewService.
-+ func NewServiceWithIDs(s storage.Storage, im *Repo, a *artwork.Repo, ids IDProvider) *Service {
-+ 	return &Service{store: s, images: im, artworks: a, ids: ids}
-+ }
-```
-
-Replace line 84 in `service.go`:
-```
-- 	imgID := uuid.NewString()
-+ 	imgID := s.ids.NewID()
-```
-
-- [ ] **Step 3: Build & run all existing image tests.**
+- [ ] **Step 1: Confirm the providers are already on master.**
 
 ```bash
-go build ./...
-go test ./internal/image/... -count=1
+cd /Users/todd.lam/WORK/_TestScripts/art-web/api
+test -f internal/image/idprovider.go && echo OK || echo "missing — PR 0.4 didn't ship"
+grep -q "func NewServiceWithIDs" internal/image/service.go && echo OK || echo "missing"
+grep -q "s.ids.NewID()" internal/image/service.go && echo OK || echo "missing"
 ```
 
-Expected: PASS. The change is a pure rename of the call site; production wiring (NewService) is unchanged.
-
-- [ ] **Step 4: Commit.**
-
-```bash
-git add api/internal/image/idprovider.go api/internal/image/service.go
-git commit -m "[0.7-contract-matrix] feat: add IDProvider interface for deterministic test IDs"
-```
+Expected: three `OK` lines. If any is missing, stop — PR 0.4 didn't land cleanly and Phase 0 ordering was broken.
 
 ### Task 7.2 — Add `RandReader` (no-op refactor)
 
@@ -2553,6 +2594,73 @@ Expected: PASS.
 ```bash
 git add api/internal/auth/handlers.go api/internal/auth/randreader.go
 git commit -m "[0.7-contract-matrix] feat: add RandReader seam for deterministic OAuth state"
+```
+
+### Task 7.2b — Add `?suffix=` query param to `/dev/seed`
+
+**Files:**
+- Modify: `api/internal/httpapi/devseed.go`
+
+**Why:** The contract suite seeds Alice and Bob via `/dev/seed`, but the current handler generates a random hex suffix at line 73 (`devRandHex(4)`). The suffix appears in the user slug, which appears in `/users/{slug}` response bodies — the normalizer doesn't catch arbitrary slugs, so replays would diverge. Accepting an optional `?suffix=` makes the seed deterministic without changing default behavior.
+
+- [ ] **Step 1: Edit `devseed.go` to read `?suffix=`.**
+
+In `api/internal/httpapi/devseed.go`, replace:
+
+```
+- 	suffix := devRandHex(4)
++ 	suffix := r.URL.Query().Get("suffix")
++ 	if suffix == "" {
++ 		suffix = devRandHex(4)
++ 	}
+```
+
+(The replacement is on or near `devseed.go:73`. Verify by reading the surrounding lines.)
+
+- [ ] **Step 2: Add a test asserting deterministic suffix behavior.**
+
+Append to `api/internal/httpapi/devseed_test.go`:
+
+```go
+func TestDevSeed_FixedSuffix_ProducesDeterministicSlug(t *testing.T) {
+	deps := testDeps(t, "test")    // helper from testutil_test.go
+	r := httpapi.New(deps)
+
+	req := httptest.NewRequest("POST", "/dev/seed?suffix=fixed1234", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status=%d want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		AliceSlug string `json:"aliceSlug"`
+		BobSlug   string `json:"bobSlug"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.AliceSlug != "alice-fixed1234" {
+		t.Fatalf("alice slug=%q want alice-fixed1234", resp.AliceSlug)
+	}
+	if resp.BobSlug != "bob-fixed1234" {
+		t.Fatalf("bob slug=%q want bob-fixed1234", resp.BobSlug)
+	}
+}
+```
+
+(Add `"encoding/json"` to imports if not present.)
+
+- [ ] **Step 3: Run.**
+
+Run: `go test ./internal/httpapi/... -run TestDevSeed_FixedSuffix -v`
+Expected: PASS.
+
+- [ ] **Step 4: Commit.**
+
+```bash
+git add api/internal/httpapi/devseed.go api/internal/httpapi/devseed_test.go
+git commit -m "[0.7-contract-matrix] feat: accept ?suffix= on /dev/seed for deterministic seeding"
 ```
 
 ### Task 7.3 — Wire injection options into `BootApp`
@@ -2758,14 +2866,21 @@ type seedResponse struct {
 }
 
 type contractCase struct {
-	name    string
-	method  string
-	path    string
-	viewer  string // "anon", "owner", "other"
-	body    string // body bytes; empty allowed
-	ctype   string // Content-Type override; if empty and body != "" defaults to application/json
-	bodyMP  func(t *testing.T) (io.Reader, string) // optional: builds a multipart body & returns ctype
+	name     string
+	method   string
+	path     string
+	viewer   string // "anon", "owner", "other"
+	body     string // body bytes; empty allowed
+	ctype    string // Content-Type override; if empty and body != "" defaults to application/json
+	bodyMP   func(t *testing.T) (io.Reader, string) // optional: builds a multipart body & returns ctype
+	cookies  []*http.Cookie                          // optional: extra cookies (e.g. oauth_state for callback cells)
 }
+
+// fixedOAuthState is what randState() returns when stateRand is fixedRand{}.
+// fixedRand fills 16 bytes with 0x01..0x10; hex-encoded that's
+// "0102030405060708090a0b0c0d0e0f10". Cells targeting /auth/google/callback
+// pre-set this cookie so the handler's state-match check passes.
+const fixedOAuthState = "0102030405060708090a0b0c0d0e0f10"
 
 // noRedirectClient prevents auto-following 302s so we capture the redirect
 // as the actual response — auth/start and auth/callback both 302.
@@ -2783,8 +2898,9 @@ func bootContract(t *testing.T) (string, seedResponse, func(c contractCase) *htt
 		Providers:  contract.FakeProviders(),
 	})
 
-	// Seed once via /dev/seed (mounted because AppEnv defaults to "test").
-	r, err := noRedirectClient.Post(srv.URL+"/dev/seed", "application/json", nil)
+	// Seed once via /dev/seed?suffix=fixed1234 — deterministic suffix so the
+	// resulting AliceSlug/BobSlug are stable across runs (round-2 Finding 4).
+	r, err := noRedirectClient.Post(srv.URL+"/dev/seed?suffix=fixed1234", "application/json", nil)
 	if err != nil {
 		t.Fatalf("POST /dev/seed: %v", err)
 	}
@@ -2825,6 +2941,9 @@ func bootContract(t *testing.T) (string, seedResponse, func(c contractCase) *htt
 			// no cookie
 		default:
 			t.Fatalf("unknown viewer %q", c.viewer)
+		}
+		for _, ck := range c.cookies {
+			req.AddCookie(ck)
 		}
 		resp, err := noRedirectClient.Do(req)
 		if err != nil {
@@ -2963,13 +3082,28 @@ func TestContractMatrix(t *testing.T) {
 		{name: "auth_unknown_provider_404", method: "GET", path: "/auth/notreal/start", viewer: "anon"},
 
 		// === /auth/{provider}/callback ===
-		{name: "auth_callback_unknown_provider_404", method: "GET", path: "/auth/notreal/callback?state=x&code=y", viewer: "anon"},
-		{name: "auth_callback_bad_state_400", method: "GET", path: "/auth/google/callback?state=mismatch&code=y", viewer: "anon"},
-		// Exchange-failure path: code=fail in fake_provider triggers 502.
-		// state matching requires the state cookie, so this case only exercises
-		// the unknown-provider / bad-state branches reachable from anon. The full
-		// callback happy-path requires cookie pre-seeding; document and add in a
-		// follow-up if PR 0.8 capture finds the gap matters.
+		// fixedRand makes randState() deterministic; the state cookie value is
+		// known at compile time (fixedOAuthState). Cells that exercise the
+		// state-match branch pre-set the cookie.
+		{name: "auth_callback_unknown_provider_404", method: "GET",
+			path: "/auth/notreal/callback?state=" + fixedOAuthState + "&code=y", viewer: "anon"},
+		{name: "auth_callback_bad_state_400", method: "GET",
+			path:    "/auth/google/callback?state=mismatch&code=y",
+			viewer:  "anon",
+			cookies: []*http.Cookie{{Name: "oauth_state", Value: fixedOAuthState}},
+		},
+		// Happy path: state cookie matches query, fake provider returns success → 302 to Frontend.
+		{name: "auth_callback_success_302", method: "GET",
+			path:    "/auth/google/callback?state=" + fixedOAuthState + "&code=valid",
+			viewer:  "anon",
+			cookies: []*http.Cookie{{Name: "oauth_state", Value: fixedOAuthState}},
+		},
+		// Exchange failure: state matches, fake provider's Exchange returns error → 502 exchange_failed.
+		{name: "auth_callback_exchange_failed_502", method: "GET",
+			path:    "/auth/google/callback?state=" + fixedOAuthState + "&code=fail",
+			viewer:  "anon",
+			cookies: []*http.Cookie{{Name: "oauth_state", Value: fixedOAuthState}},
+		},
 
 		// === /auth/logout ===
 		{name: "logout_anon_204", method: "POST", path: "/auth/logout", viewer: "anon"},
@@ -3105,19 +3239,21 @@ git commit -m "[0.7-contract-matrix] feat: meta-test forbids 403 and translated 
 git push -u origin phase0/0.7-contract-matrix
 gh pr create --base master --title "[0.7-contract-matrix] HTTP contract matrix + deterministic injection" --body "$(cat <<'EOF'
 ## Summary
-- Add `image.IDProvider` interface (production: `uuid.NewString`; tests: `CounterIDProvider`); switch the only Go-side image-ID call site to use it.
-- Add `auth.RandReader` interface; switch `randState` to use it.
-- Wire both into `dbtest.BootApp` alongside fixed clock and fake auth provider.
-- Add `contract.FakeProviders()` so `/auth/google/start` produces a real 302 redirect (not 404 from `unknown_provider`).
-- Replace placeholder_test.go with the full cartesian contract matrix covering every (auth × resource × shape) cell from spec §5.2.
+- (Confirms `image.IDProvider` + `CounterIDProvider` already shipped in PR 0.4.)
+- Add `auth.RandReader` interface; switch `randState` to use it. With `fixedRand{}` injecting bytes 0x01..0x10, the OAuth state value is the constant \`0102030405060708090a0b0c0d0e0f10\`.
+- Add `?suffix=` query parameter to `/dev/seed` so the contract suite uses a fixed slug suffix (\`alice-fixed1234\`, \`bob-fixed1234\`).
+- Wire `IDProvider` + `RandReader` + `Providers` + fixed clock into `dbtest.BootApp`.
+- Add `contract.FakeProviders()` with deterministic 302/502/400 branches so `/auth/google/start` produces a real 302 and `/auth/google/callback` exercises every status.
+- Replace placeholder_test.go with the full cartesian contract matrix covering every (auth × resource × shape) cell from spec §5.2 — including auth-callback success (302) and exchange_failed (502) cells with pre-set \`oauth_state\` cookie.
 - Use `noRedirectClient` (`CheckRedirect: http.ErrUseLastResponse`) so 302s are captured as 302, not silently followed.
 - Write the forbidden-status meta-test (skips until goldens exist).
 
 ## Test plan
-- [ ] All existing tests still pass (the IDProvider/RandReader switches are no-op refactors)
+- [ ] All existing tests still pass (the RandReader switch is a no-op refactor; the devseed `?suffix=` change defaults to current behavior)
 - [ ] `go test ./internal/httpapi/contract/...` fails with golden-not-found errors for every cell (intended; PR 0.8 captures)
 - [ ] `go vet ./...` clean
 - [ ] `auth_google_start_anon_302` cell hits the fake provider's 302 (not the unknown_provider 404)
+- [ ] `auth_callback_success_302` and `auth_callback_exchange_failed_502` cells exercise both fake-provider branches
 
 Refs spec §5.2 (matrix), §5.2.0a (forbidden statuses), §5.3.2 (dynamic-byte injection).
 EOF
@@ -3242,9 +3378,45 @@ git commit -m "[0.8-snapshot-lock] chore: protect contract goldens via CODEOWNER
 
 - [ ] **Step 1: Extract the unique `error` codes from the captured snapshots.**
 
+The body is stored as a JSON-escaped string inside each envelope, so a raw `grep '"error":"…"'` won't match (escaped quotes break the pattern — round-2 Finding 7). Use `jq` to decode the envelope, parse `body` as JSON, and extract the `error` field:
+
 ```bash
 cd /Users/todd.lam/WORK/_TestScripts/art-web/api
-grep -hoE '"error":"[^"]+"' internal/httpapi/contract/golden/*.json | sort -u
+for f in internal/httpapi/contract/golden/*.json; do
+  jq -r '
+    {status: .status,
+     err:    (.body | try fromjson | .error // empty)}
+    | select(.err != "")
+    | "\(.status)\t\(.err)"
+  ' "$f"
+done | sort -u
+```
+
+Output is `<status>\t<code>` lines, one per unique pair. `try fromjson` skips non-JSON bodies (e.g., 302 redirects with empty body). Pipe through `column -t` for easier reading.
+
+If `jq` isn't installed, the equivalent Go one-liner is:
+
+```bash
+go run - <<'EOF'
+package main
+import (
+  "encoding/json"; "fmt"; "os"; "path/filepath"; "sort"
+)
+type env struct{ Status int; Body string }
+func main() {
+  paths, _ := filepath.Glob("internal/httpapi/contract/golden/*.json")
+  seen := map[string]bool{}
+  for _, p := range paths {
+    bs, _ := os.ReadFile(p); var e env; json.Unmarshal(bs, &e)
+    var b struct{ Error string `json:"error"` }
+    if json.Unmarshal([]byte(e.Body), &b) == nil && b.Error != "" {
+      seen[fmt.Sprintf("%d\t%s", e.Status, b.Error)] = true
+    }
+  }
+  out := make([]string, 0, len(seen)); for k := range seen { out = append(out, k) }
+  sort.Strings(out); for _, k := range out { fmt.Println(k) }
+}
+EOF
 ```
 
 - [ ] **Step 2: Write the reference table that PR 0.8 hands off to Phase 1's plan author.**
