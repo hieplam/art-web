@@ -7,7 +7,7 @@ type Props<T extends { id: string }> = {
   initialItems: T[];
   initialCursor: string | null;
   fetchMore: (cursor: string) => Promise<Page<T>>;
-  renderItem: (item: T) => React.ReactNode;
+  renderItem: (item: T, index: number) => React.ReactNode;
 };
 
 export function InfiniteFeed<T extends { id: string }>(props: Props<T>) {
@@ -41,9 +41,9 @@ export function InfiniteFeed<T extends { id: string }>(props: Props<T>) {
 
   return (
     <>
-      {items.map((item) => (
+      {items.map((item, index) => (
         <React.Fragment key={item.id}>
-          {props.renderItem(item)}
+          {props.renderItem(item, index)}
         </React.Fragment>
       ))}
       {cursor && <div ref={sentinelRef} aria-hidden className="feed-sentinel" />}
