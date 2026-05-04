@@ -5,6 +5,15 @@ export class ApiClientError extends Error {
   }
 }
 
+// 401 is the current /me contract for a missing/invalid JWT or a JWT subject
+// that no longer exists. We also accept 404 here so the app keeps rendering
+// against older API builds whose /me used to return not_found in the
+// stale-session case (the dev-up reseed scenario). Once the API rollout has
+// cleared everywhere, the 404 branch is dead code that costs nothing to keep.
+export function isUnauthenticatedError(err: unknown): boolean {
+  return err instanceof ApiClientError && (err.status === 401 || err.status === 404);
+}
+
 export type ApiArgs = {
   base: string;
   path: string;

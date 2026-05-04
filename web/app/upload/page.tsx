@@ -1,6 +1,6 @@
 // web/app/upload/page.tsx
 import { redirect } from "next/navigation";
-import { api, apiBase, ApiClientError, forwardCookie, hasAuthCookie, publicApiBase } from "@/lib/api";
+import { api, apiBase, forwardCookie, hasAuthCookie, isUnauthenticatedError, publicApiBase } from "@/lib/api";
 import { ArtworkUploader } from "@/components/ArtworkUploader";
 import type { User } from "@/lib/types";
 
@@ -15,7 +15,7 @@ export default async function UploadPage() {
   try {
     await api<User>({ base: serverBase, path: "/me", cookie: forwardCookie() });
   } catch (e) {
-    if (e instanceof ApiClientError && e.status === 401) {
+    if (isUnauthenticatedError(e)) {
       redirect(`${browserBase}/auth/google/start`);
     }
     throw e;

@@ -105,9 +105,17 @@ func CallbackHandler(
 	})
 }
 
+// ClearAuthCookie writes a Set-Cookie header that zero-ages the `auth` cookie
+// on the same Domain/Path the CallbackHandler uses to set it. Exported so
+// non-auth handlers (notably /me, when it discovers a JWT subject has been
+// deleted) can drop the bad cookie without re-implementing the attribute set.
+func ClearAuthCookie(w http.ResponseWriter, cookieOpts CookieOpts) {
+	setRawCookie(w, "auth", "", cookieOpts.Domain, "/", "Lax", -1, true, cookieOpts.Secure)
+}
+
 func LogoutHandler(cookieOpts CookieOpts) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		setRawCookie(w, "auth", "", cookieOpts.Domain, "/", "Lax", -1, true, cookieOpts.Secure)
+		ClearAuthCookie(w, cookieOpts)
 		w.WriteHeader(http.StatusNoContent)
 	})
 }

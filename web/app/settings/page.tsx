@@ -1,6 +1,6 @@
 // web/app/settings/page.tsx
 import { redirect } from "next/navigation";
-import { api, apiBase, ApiClientError, forwardCookie, hasAuthCookie, publicApiBase } from "@/lib/api";
+import { api, apiBase, forwardCookie, hasAuthCookie, isUnauthenticatedError, publicApiBase } from "@/lib/api";
 import { SettingsClient } from "@/components/SettingsClient";
 import type { User } from "@/lib/types";
 
@@ -15,7 +15,7 @@ export default async function Settings() {
   try {
     me = await api<User>({ base: serverBase, path: "/me", cookie: forwardCookie() });
   } catch (e) {
-    if (e instanceof ApiClientError && e.status === 401) {
+    if (isUnauthenticatedError(e)) {
       redirect(`${browserBase}/auth/google/start`);
     }
     throw e;

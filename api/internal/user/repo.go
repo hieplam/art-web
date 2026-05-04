@@ -17,6 +17,11 @@ type User struct {
 	ID, Slug, DisplayName, Email, AvatarURL string
 }
 
+// ErrNotFound is returned by Get when the requested user row does not exist.
+// It lets callers distinguish "JWT subject vanished" (return 401) from a
+// generic DB failure (return 500) without depending on pgx error sentinels.
+var ErrNotFound = errors.New("user not found")
+
 type Repo struct{ pool *pgxpool.Pool }
 
 func NewRepo(p *pgxpool.Pool) *Repo { return &Repo{pool: p} }
@@ -98,8 +103,11 @@ func (r *Repo) Get(ctx context.Context, id string) (*User, error) {
 	err := r.pool.QueryRow(ctx,
 		`SELECT id, slug, display_name, email, COALESCE(avatar_url,'') FROM users WHERE id=$1`,
 		id).Scan(&u.ID, &u.Slug, &u.DisplayName, &u.Email, &u.AvatarURL)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get user: %w", err)
 	}
 	return &u, nil
 }

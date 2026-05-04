@@ -1,6 +1,6 @@
 // web/components/Nav.tsx
 import Link from "next/link";
-import { api, apiBase, ApiClientError, forwardCookie, hasAuthCookie, publicApiBase } from "@/lib/api";
+import { api, apiBase, forwardCookie, hasAuthCookie, isUnauthenticatedError, publicApiBase } from "@/lib/api";
 import type { User } from "@/lib/types";
 
 export async function Nav() {
@@ -10,7 +10,7 @@ export async function Nav() {
   if (hasAuthCookie()) {
     try { me = await api<User>({ base: serverBase, path: "/me", cookie: forwardCookie() }); }
     catch (err) {
-      if (!(err instanceof ApiClientError && err.status === 401)) throw err;
+      if (!isUnauthenticatedError(err)) throw err;
     }
   }
   return (

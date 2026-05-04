@@ -64,8 +64,16 @@ func meHandler(d *Deps) http.Handler {
 			return
 		}
 		u, err := d.Users.Get(r.Context(), uid)
+		// A valid JWT pointing at a deleted user is functionally
+		// "unauthenticated" — drop the bad cookie so the browser stops
+		// re-presenting it on every request.
+		if errors.Is(err, user.ErrNotFound) {
+			auth.ClearAuthCookie(w, d.CookieOpts)
+			renderJSON(w, 401, map[string]string{"error": "unauthorized"})
+			return
+		}
 		if err != nil {
-			renderJSON(w, 404, map[string]string{"error": "not_found"})
+			renderJSON(w, 500, map[string]string{"error": "user_lookup_failed"})
 			return
 		}
 		renderJSON(w, 200, renderUser(u))
