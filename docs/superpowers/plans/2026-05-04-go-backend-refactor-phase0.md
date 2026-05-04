@@ -140,7 +140,9 @@ func StartMinio(t testing.TB) MinioInfo {
 	minioOnce.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		container, err := tcminio.Run(ctx, "minio/minio:latest",
+		// Pin to the same image tag as internal/storage/r2_test.go so CI doesn't
+		// silently drift across MinIO releases. Bump both files in lockstep.
+		container, err := tcminio.Run(ctx, "minio/minio:RELEASE.2024-12-18T13-15-44Z",
 			tcminio.WithUsername("minioadmin"),
 			tcminio.WithPassword("minioadmin"),
 		)
