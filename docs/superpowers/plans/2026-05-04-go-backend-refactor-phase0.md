@@ -545,10 +545,18 @@ func AssertGolden(t *testing.T, name string, resp *http.Response) {
 		Headers: pickHeaders(resp.Header),
 		Body:    string(bodyBytes),
 	}
-	got, err := json.MarshalIndent(envelope, "", "  ")
-	if err != nil {
+	// json.MarshalIndent escapes `<` and `>` to `<`/`>`, which would
+	// turn `<UUID>` placeholders into `<UUID>` in the golden files
+	// and break byte-strict replay. Use json.Encoder with SetEscapeHTML(false)
+	// then trim the trailing newline Encoder.Encode appends.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(envelope); err != nil {
 		t.Fatalf("marshal envelope: %v", err)
 	}
+	got := bytes.TrimRight(buf.Bytes(), "\n")
 
 	dir := os.Getenv("GOLDEN_DIR")
 	if dir == "" {
