@@ -39,18 +39,20 @@ func (s *stubStore) Put(_ context.Context, k string, _ io.Reader, _ string) erro
 	return nil
 }
 func (s *stubStore) Get(context.Context, string) (io.ReadCloser, error) {
-	return nil, errors.New("not implemented")
+	panic("stubStore.Get: not implemented for this test")
 }
 func (s *stubStore) Delete(_ context.Context, k string) error {
 	s.deletes = append(s.deletes, k)
 	return nil
 }
-func (s *stubStore) Move(context.Context, string, string) error { return nil }
+func (s *stubStore) Move(context.Context, string, string) error {
+	panic("stubStore.Move: not implemented for this test")
+}
 func (s *stubStore) Exists(context.Context, string) (bool, error) {
-	return false, nil
+	panic("stubStore.Exists: not implemented for this test")
 }
 func (s *stubStore) SignedURL(context.Context, string, time.Duration) (string, error) {
-	return "", nil
+	panic("stubStore.SignedURL: not implemented for this test")
 }
 
 func loadJPEG(t *testing.T) []byte {
@@ -156,23 +158,18 @@ func TestCounterIDProvider_DeterministicSequence(t *testing.T) {
 
 func TestNewServiceWithIDs_UsesProvidedIDProvider(t *testing.T) {
 	counter := &CounterIDProvider{}
+	store := &stubStore{}
 	repo := &stubRepo{
-		findFn:   func(_ context.Context, _, _ string) (*InsertedImage, error) { return nil, nil },
+		findFn: func(_ context.Context, _, _ string) (*InsertedImage, error) { return nil, nil },
 		insertFn: func(_ context.Context, in InsertInput) (*InsertResult, error) {
 			// Echo back the ID supplied by the service so we can verify it came from the counter.
 			return &InsertResult{ID: in.ID, Existed: false}, nil
 		},
 	}
-	store := &stubStore{}
-	svc := NewServiceWithIDs(nil, nil, nil, counter)
-	// Verify the ids field was wired.
-	if svc.ids != counter {
-		t.Fatal("NewServiceWithIDs did not wire the provided IDProvider")
-	}
-	// Exercise one upload so the counter advances.
-	svc.store = store
-	svc.images = repo
-	svc.artworks = nil
+	// With the imageRepo-typed constructor, the stub can be passed directly —
+	// no field-mutation gymnastics needed.
+	svc := NewServiceWithIDs(store, repo, nil, counter)
+
 	art := &artwork.Artwork{ID: "art1", Visibility: "private"}
 	res, err := svc.UploadOne(context.Background(), art, UploadOne{
 		Manifest: ManifestEntry{ClientImageID: "K", ContentType: "image/jpeg", Position: 0},

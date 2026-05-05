@@ -23,6 +23,10 @@ func NewUUIDProvider() IDProvider { return uuidIDProvider{} }
 
 // CounterIDProvider is a deterministic IDProvider for tests. The Nth call
 // returns "00000000-0000-0000-0000-NNNNNNNNNNNN" (12-digit zero-padded N).
+//
+// Not goroutine-safe — the contract suite runs tests serially. If a future
+// caller needs concurrent calls (e.g., t.Parallel() matrix cells), wrap N with
+// a sync.Mutex.
 type CounterIDProvider struct {
 	N int
 }

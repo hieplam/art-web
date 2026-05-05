@@ -42,8 +42,10 @@ func NewService(s storage.Storage, im *Repo, a *artwork.Repo) *Service {
 }
 
 // NewServiceWithIDs is the test-mode constructor. The contract suite passes a
-// deterministic *CounterIDProvider here. Production uses NewService.
-func NewServiceWithIDs(s storage.Storage, im *Repo, a *artwork.Repo, ids IDProvider) *Service {
+// deterministic *CounterIDProvider here. Production uses NewService (which
+// takes *Repo). This constructor accepts the imageRepo interface directly so
+// stub-based tests don't need to bypass it.
+func NewServiceWithIDs(s storage.Storage, im imageRepo, a *artwork.Repo, ids IDProvider) *Service {
 	return &Service{store: s, images: im, artworks: a, ids: ids}
 }
 
