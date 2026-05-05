@@ -60,3 +60,18 @@ test-all:
 	go test -race -coverprofile=/tmp/coverage.out ./...
 	@echo "---"
 	go tool cover -func=/tmp/coverage.out | tail -1
+
+.PHONY: wire wire-verify mocks
+
+# Regenerate cmd/api/wire_gen.go from wire.go.
+wire:
+	cd cmd/api && go run github.com/google/wire/cmd/wire@latest ./...
+
+# Fail if wire_gen.go is stale relative to wire.go (CI gate per spec §6.6).
+wire-verify:
+	cd cmd/api && go run github.com/google/wire/cmd/wire@latest ./...
+	git diff --exit-code cmd/api/wire_gen.go
+
+# Regenerate ports/<slice>/mocks via mockery v3.
+mocks:
+	go run github.com/vektra/mockery/v3@latest --config .mockery.yaml
