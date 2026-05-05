@@ -29,12 +29,15 @@ lint:               ; go vet ./... && go run honnef.co/go/tools/cmd/staticcheck@
 # internal/httpapi/contract/error_codes_observed.md for the locked codes.
 test-contract:      ; go test ./internal/httpapi/contract/... -v
 
-# Per-slice coverage on the four business slices. Phase 0 spec §8.3 hard gate
-# requires each ≥ 80% statement coverage before Phase 1 starts.
+# Per-slice coverage on the four business slices. Spec §10.1 merge gate
+# requires each ≥ 80% statement coverage. The -coverpkg flag instruments
+# every package in the slice tree so cross-sub-package execution (e.g., a
+# test in adapters/http/ exercising adapters/oauth/) is attributed to the
+# called package — required after Task 2's hexagonal split.
 test-cover-slices:
 	@for pkg in auth user artwork image; do \
 	  echo "=== $$pkg ===" ; \
-	  go test -coverprofile=/tmp/cov-$$pkg.out ./internal/$$pkg/... ; \
+	  go test -coverpkg=./internal/$$pkg/... -coverprofile=/tmp/cov-$$pkg.out ./internal/$$pkg/... ; \
 	  go tool cover -func=/tmp/cov-$$pkg.out | tail -1 ; \
 	done
 
