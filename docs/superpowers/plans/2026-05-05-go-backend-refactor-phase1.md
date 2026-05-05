@@ -1275,8 +1275,12 @@ type UserLookup interface {
 
 // JWTIssuer lets the auth service issue + verify tokens via service/jwt.go.
 // Implemented by auth/service/jwt.go (after this task wires it).
+//
+// (Plan revision: the original draft used `ttlSeconds int`; the implemented
+// signature uses `ttl time.Duration` because that's the canonical Go type for
+// time intervals and matches the existing concrete `auth/service.JWT` API.)
 type JWTIssuer interface {
-	Issue(userID string, ttlSeconds int) (string, error)
+	Issue(userID string, ttl time.Duration) (string, error)
 	Verify(token string) (string, error)
 }
 ```
@@ -2491,6 +2495,14 @@ git commit -m "[phase1-hex-arch] feat: extract /dev/seed to cmd/seeder; drop the
 - Empty or near-empty files left over from layout-move
 - Helper functions only used by code that's been replaced
 - Imports that become unused after Task 9's WriteError consolidation
+
+**Known carry-over items from earlier tasks (deferred here):**
+
+- **`artwork/ports.TagRepository` is a dead interface.** Defined in `artwork/ports/tag_repo.go` (Task 7) but no consumer routes through it; `artwork/adapters/http/Handler` still holds the concrete `*artworkpostgres.TagsRepo` and `artwork/providers.go` lacks the `wire.Bind(new(ports.TagRepository), new(*postgres.TagsRepo))` that Task 7's plan called for. The Task 7 follow-up tried to add both and triggered a 28-pp drop in artwork's `-coverpkg` profile — a quirky `go test` instrumentation interaction we couldn't root-cause in time. Re-attempt here with a fresh look; possible angles: (a) move TagsRepo construction earlier so test caching invalidates cleanly, (b) try `go test -count=1 -race` to see if it's a race-related coverage skew, (c) test on Go 1.26+ where coverage was rewritten. If still puzzling, delete the `TagRepository` interface entirely.
+- **Wire deferral:** `cmd/api/wire.go` only wires `config + logger + database`; the four slice ProviderSets exist (Task 7) but aren't yet in `wire.Build`. `cmd/api/main.go` does the manual wiring. Either complete the integration here (will require typed-string providers for `JWT_SIGNING_KEY`, `WORKER_SIGNING_KEY`, OAuth client config, frontend URL) or accept manual wiring as the production pattern and document why.
+- **Mockery v3:** Spec mentions `<slice>/ports/mocks/` but no `.mockery.yaml` exists yet. `make mocks` target exists but fails. Add `.mockery.yaml`, run `make mocks` to populate the directories, OR delete the `make mocks` target if mockery is being de-scoped.
+- **Pre-existing gofmt-dirty files** (Phase 0 inheritance + Task 2 import re-order): `infrastructure/server/{devseed_test.go, privacy_matrix_test.go}` and `infrastructure/testing/normalize.go` — run `gofmt -w` to clean.
+- **Makefile `@latest` version-pinning:** `wire@latest`, `staticcheck@latest`, `mockery/v3@latest` should pin to versions matching `go.mod` (currently `wire v0.7.0`) so CI is reproducible.
 
 - [ ] **Step 1: Find unused exports.**
 

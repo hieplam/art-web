@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	authhttp "local/art-web/api/internal/auth/adapters/http"
+	authdomain "local/art-web/api/internal/auth/domain"
 	authports "local/art-web/api/internal/auth/ports"
 	authservice "local/art-web/api/internal/auth/service"
 )
@@ -20,8 +21,8 @@ type fakeProvider struct{}
 
 func (fakeProvider) Name() string                { return "google" }
 func (fakeProvider) AuthURL(state string) string { return "https://goog/auth?state=" + state }
-func (fakeProvider) Exchange(_ context.Context, code string) (*authports.Profile, error) {
-	return &authports.Profile{Subject: "S-" + code, Email: "a@b", DisplayName: "Alice", AvatarURL: ""}, nil
+func (fakeProvider) Exchange(_ context.Context, code string) (*authdomain.Identity, error) {
+	return &authdomain.Identity{Subject: "S-" + code, Email: "a@b", DisplayName: "Alice", AvatarURL: ""}, nil
 }
 
 type fakeUserRepo struct{ stored map[string]string }

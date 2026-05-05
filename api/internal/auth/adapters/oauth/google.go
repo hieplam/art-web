@@ -11,6 +11,7 @@ import (
 
 	"golang.org/x/oauth2"
 
+	"local/art-web/api/internal/auth/domain"
 	"local/art-web/api/internal/auth/ports"
 )
 
@@ -50,7 +51,7 @@ func (g *googleProvider) AuthURL(state string) string {
 	return g.cfg.AuthCodeURL(state, oauth2.AccessTypeOnline)
 }
 
-func (g *googleProvider) Exchange(ctx context.Context, code string) (*ports.Profile, error) {
+func (g *googleProvider) Exchange(ctx context.Context, code string) (*domain.Identity, error) {
 	tok, err := g.cfg.Exchange(ctx, code)
 	if err != nil {
 		return nil, err
@@ -77,7 +78,7 @@ func (g *googleProvider) Exchange(ctx context.Context, code string) (*ports.Prof
 	if u.Sub == "" {
 		return nil, errors.New("userinfo: empty sub")
 	}
-	return &ports.Profile{
+	return &domain.Identity{
 		Subject: u.Sub, Email: u.Email,
 		DisplayName: strings.TrimSpace(u.Name),
 		AvatarURL:   u.Picture,

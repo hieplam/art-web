@@ -6,24 +6,17 @@ package ports
 import (
 	"context"
 	"time"
-)
 
-// Profile is the OAuth-provider-supplied profile after a successful Exchange.
-// Mirrors the historical auth.Profile struct.
-type Profile struct {
-	Subject     string
-	Email       string
-	DisplayName string
-	AvatarURL   string
-}
+	"local/art-web/api/internal/auth/domain"
+)
 
 // OAuthProvider is the abstraction over a single identity provider (e.g.
 // Google). Each implementation handles the authorize-URL build + the code-for-
-// profile exchange.
+// identity exchange. Returns the canonical domain.Identity from auth/domain.
 type OAuthProvider interface {
 	Name() string
 	AuthURL(state string) string
-	Exchange(ctx context.Context, code string) (*Profile, error)
+	Exchange(ctx context.Context, code string) (*domain.Identity, error)
 }
 
 // UserLookup lets the auth handlers consult the user slice without importing

@@ -4,6 +4,7 @@ package contract
 import (
 	"context"
 
+	authdomain "local/art-web/api/internal/auth/domain"
 	authports "local/art-web/api/internal/auth/ports"
 )
 
@@ -24,11 +25,11 @@ func (fakeGoogleProvider) AuthURL(state string) string {
 	return "https://example.com/oauth2/auth?state=" + state
 }
 
-func (fakeGoogleProvider) Exchange(_ context.Context, code string) (*authports.Profile, error) {
+func (fakeGoogleProvider) Exchange(_ context.Context, code string) (*authdomain.Identity, error) {
 	if code == "fail" {
 		return nil, errFakeExchange
 	}
-	return &authports.Profile{
+	return &authdomain.Identity{
 		Subject:     "fake-subject-1",
 		Email:       "fake@example.com",
 		DisplayName: "Fake User",
