@@ -130,3 +130,21 @@ func TestUpsertOAuth_DuplicateOAuthKey_ReturnsExistingID(t *testing.T) {
 		t.Fatalf("expected same id; got %s vs %s", first, second)
 	}
 }
+
+func TestGetBySlug_FoundReturnsUser(t *testing.T) {
+	r := newRepo(t)
+	uid, err := r.UpsertOAuth(t.Context(), "google", "S-FIND", "f@b", "findable", "")
+	if err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	got, err := r.GetBySlug(t.Context(), "findable")
+	if err != nil {
+		t.Fatalf("GetBySlug: %v", err)
+	}
+	if got.ID != uid {
+		t.Fatalf("got id %q want %q", got.ID, uid)
+	}
+	if got.Slug != "findable" {
+		t.Fatalf("got slug %q want %q", got.Slug, "findable")
+	}
+}
