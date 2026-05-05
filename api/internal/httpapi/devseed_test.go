@@ -123,3 +123,16 @@ func TestDevSeed_Many120_WritesAllItems(t *testing.T) {
 		t.Fatalf("expected at least 121 public artworks (120 bulk + 1 P), got %d — cap may still be too low", n)
 	}
 }
+
+func TestDevSeed_NotMounted_When_AppEnv_NotTest(t *testing.T) {
+	deps := testDeps(t, "production") // helper from testutil_test.go
+	r := httpapi.New(deps)
+
+	req := httptest.NewRequest("POST", "/dev/seed", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != 404 {
+		t.Fatalf("expected /dev/seed to be unmounted in non-test env; status=%d body=%s",
+			rec.Code, rec.Body.String())
+	}
+}
