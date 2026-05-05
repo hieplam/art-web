@@ -28,7 +28,7 @@ func NewRepo(p *pgxpool.Pool) *Repo { return &Repo{pool: p} }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9-]+`)
 
-func slugify(s string) string {
+func Slugify(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = slugRe.ReplaceAllString(s, "-")
 	s = strings.Trim(s, "-")
@@ -54,7 +54,7 @@ func (r *Repo) UpsertOAuth(ctx context.Context, provider, subject, email, displa
 		return id, nil
 	}
 
-	base := slugify(displayName)
+	base := Slugify(displayName)
 	slug := base
 	for i := 0; i < 50; i++ {
 		var id string
