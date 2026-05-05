@@ -1498,6 +1498,10 @@ func NewUUIDProvider() IDProvider { return uuidIDProvider{} }
 
 // CounterIDProvider is a deterministic IDProvider for tests. The Nth call
 // returns "00000000-0000-0000-0000-NNNNNNNNNNNN" (12-digit zero-padded N).
+//
+// Not goroutine-safe — the contract suite runs tests serially. If a future
+// caller needs concurrent calls (e.g., t.Parallel() matrix cells), wrap N with
+// a sync.Mutex.
 type CounterIDProvider struct {
 	N int
 }
@@ -1528,8 +1532,10 @@ type Service struct {
 + }
 +
 + // NewServiceWithIDs is the test-mode constructor. The contract suite passes a
-+ // deterministic *CounterIDProvider here. Production uses NewService.
-+ func NewServiceWithIDs(s storage.Storage, im *Repo, a *artwork.Repo, ids IDProvider) *Service {
++ // deterministic *CounterIDProvider here. Production uses NewService (which
++ // takes *Repo). This constructor accepts the imageRepo interface directly so
++ // stub-based tests don't need to bypass it.
++ func NewServiceWithIDs(s storage.Storage, im imageRepo, a *artwork.Repo, ids IDProvider) *Service {
 + 	return &Service{store: s, images: im, artworks: a, ids: ids}
 + }
 ```
