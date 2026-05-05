@@ -3,6 +3,7 @@ package user_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -87,5 +88,45 @@ func TestUpsertOAuth_SlugExhaustionAfter50Collisions(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "slug exhausted") {
 		t.Fatalf("expected 'slug exhausted', got %v", err)
+	}
+}
+
+func TestGet_NotFound_ReturnsErrNotFound(t *testing.T) {
+	r := newRepo(t)
+	_, err := r.Get(t.Context(), "00000000-0000-0000-0000-000000000000")
+	if !errors.Is(err, user.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestGetBySlug_NotFound_PassesThroughError(t *testing.T) {
+	r := newRepo(t)
+	_, err := r.GetBySlug(t.Context(), "no-such-slug")
+	if err == nil {
+		t.Fatal("expected error for missing slug")
+	}
+	// Current behavior: GetBySlug does NOT translate to ErrNotFound — it returns
+	// the raw pgx.ErrNoRows. This test pins that behavior so it does not change
+	// silently.
+	if errors.Is(err, user.ErrNotFound) {
+		t.Fatalf("GetBySlug should not return ErrNotFound; got %v", err)
+	}
+}
+
+func TestUpsertOAuth_DuplicateOAuthKey_ReturnsExistingID(t *testing.T) {
+	r := newRepo(t)
+
+	first, err := r.UpsertOAuth(t.Context(), "google", "S-DUP", "a@b", "alice-dup", "")
+	if err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	// Re-upsert with the SAME provider+subject but different display name → must
+	// hit the lookupExistingOAuth fast path at repo.go:45-55 (UPDATE, no INSERT).
+	second, err := r.UpsertOAuth(t.Context(), "google", "S-DUP", "a@b", "different-name", "")
+	if err != nil {
+		t.Fatalf("re-upsert: %v", err)
+	}
+	if first != second {
+		t.Fatalf("expected same id; got %s vs %s", first, second)
 	}
 }
