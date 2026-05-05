@@ -7,7 +7,7 @@ import (
 	authports "local/art-web/api/internal/auth/ports"
 )
 
-// fakeGoogleProvider is a deterministic authports.Provider for the contract suite.
+// fakeGoogleProvider is a deterministic authports.OAuthProvider for the contract suite.
 // Behavior chosen to exercise every auth response branch:
 //
 //	/auth/google/start                                    → 302 to a fixed AuthURL
@@ -47,6 +47,6 @@ func (*exchangeFailure) Error() string { return "fake exchange failure" }
 // FakeProviders returns the providers map the contract suite hands to BootApp.
 // Only "google" is wired today; if Phase 0 ever adds another OAuth provider
 // for testing, add it here with the same deterministic-success/failure shape.
-func FakeProviders() map[string]authports.Provider {
-	return map[string]authports.Provider{"google": fakeGoogleProvider{}}
+func FakeProviders() map[string]authports.OAuthProvider {
+	return map[string]authports.OAuthProvider{"google": fakeGoogleProvider{}}
 }

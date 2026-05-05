@@ -7,6 +7,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	imagedomain "local/art-web/api/internal/image/domain"
+	imageports "local/art-web/api/internal/image/ports"
 )
 
 func uniqueConstraint(err error) string {
@@ -20,20 +23,22 @@ func uniqueConstraint(err error) string {
 	return pgErr.ConstraintName
 }
 
+// Re-export the domain sentinels so existing handler call sites that match
+// imagepostgres.ErrPositionTaken / imagepostgres.ErrFingerprintMismatch keep
+// compiling. The canonical values live in the domain package.
 var (
-	ErrPositionTaken       = errors.New("position already taken by a different client_image_id")
-	ErrFingerprintMismatch = errors.New("client_image_id reused with a different file (sha256 mismatch)")
+	ErrPositionTaken       = imagedomain.ErrPositionTaken
+	ErrFingerprintMismatch = imagedomain.ErrFingerprintMismatch
 )
 
-type InsertInput struct {
-	ID, ArtworkID, ClientImageID, ContentType, StorageKey, Blurhash, SourceSHA256 string
-	Position, Width, Height, ByteSize                                             int
-}
-
-type InsertResult struct {
-	ID      string
-	Existed bool
-}
+// Aliases so existing call sites compile against either the postgres or ports
+// type names. The struct definitions live in ports (so ports doesn't import an
+// adapter), and the persistence shape is identical to imagedomain.Image.
+type (
+	InsertInput   = imageports.InsertInput
+	InsertResult  = imageports.InsertResult
+	InsertedImage = imagedomain.Image
+)
 
 type Repo struct{ pool *pgxpool.Pool }
 
@@ -141,9 +146,4 @@ func (r *Repo) ListByArtwork(ctx context.Context, artworkID string) ([]InsertedI
 		return nil, err
 	}
 	return out, nil
-}
-
-type InsertedImage struct {
-	ID, ArtworkID, ClientImageID, StorageKey, ContentType, Blurhash, SourceSHA256 string
-	Position, Width, Height, ByteSize                                             int
 }

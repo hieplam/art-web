@@ -9,8 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
-	"local/art-web/api/internal/infrastructure/server"
 )
 
 // /me must distinguish three cases for the cookie-staleness bug fix:
@@ -21,10 +19,9 @@ import (
 //   - valid JWT and live user -> 200 with the user payload.
 func TestMeHandler_NoCookie_Returns401(t *testing.T) {
 	d := testDeps(t, "test")
-	router := server.New(d)
 
 	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, httptest.NewRequest("GET", "/me", nil))
+	d.router.ServeHTTP(rec, httptest.NewRequest("GET", "/me", nil))
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())
@@ -36,7 +33,6 @@ func TestMeHandler_NoCookie_Returns401(t *testing.T) {
 
 func TestMeHandler_ValidJWTMissingUser_Returns401AndClearsCookie(t *testing.T) {
 	d := testDeps(t, "test")
-	router := server.New(d)
 
 	// Issue a valid JWT for a UUID that does not exist in the users table.
 	// Mirrors the dev-up reseed scenario: signature verifies (same key) but
@@ -50,7 +46,7 @@ func TestMeHandler_ValidJWTMissingUser_Returns401AndClearsCookie(t *testing.T) {
 	req := httptest.NewRequest("GET", "/me", nil)
 	req.AddCookie(&http.Cookie{Name: "auth", Value: tok})
 	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
+	d.router.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401; body=%s", rec.Code, rec.Body.String())

@@ -3,18 +3,20 @@ package postgres
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	artworkdomain "local/art-web/api/internal/artwork/domain"
+	"local/art-web/api/internal/artwork/ports"
 )
 
-type Artwork struct {
-	ID, UserID, Title, Visibility string
-	Description                   *string
-	PublishedAt, CreatedAt        *time.Time
-	CoverPosition                 int
-}
+// Artwork is the persistence-shape entity returned by Repo. It is an alias for
+// the domain entity so handlers can read fields directly without any mapping
+// step at the adapter boundary.
+type Artwork = artworkdomain.Artwork
 
 type Repo struct{ pool *pgxpool.Pool }
 
@@ -80,19 +82,13 @@ func (r *Repo) Delete(ctx context.Context, id string) error {
 	return err
 }
 
-// FeedCursor carries the full-precision timestamp of the last row on the
-// previous page. Stamp.IsZero() means "first page".
-type FeedCursor struct {
-	Stamp time.Time
-	ID    string
-}
-
-func (c FeedCursor) IsZero() bool { return c.Stamp.IsZero() && c.ID == "" }
-
-type FeedPage struct {
-	Items      []Artwork
-	NextCursor *FeedCursor
-}
+// FeedCursor and FeedPage are aliased to the ports types so callers may use
+// either name interchangeably; ports owns the canonical definition.
+type (
+	FeedCursor = ports.FeedCursor
+	FeedPage   = ports.FeedPage
+	FlipMove   = ports.FlipMove
+)
 
 func (r *Repo) PublicFeed(ctx context.Context, c FeedCursor, limit int) (*FeedPage, error) {
 	if limit <= 0 || limit > 100 {
@@ -202,4 +198,71 @@ func (r *Repo) ListByTag(ctx context.Context, tag string, c FeedCursor, limit in
 	}
 	defer rows.Close()
 	return scanFeedRows(rows, limit, false)
+}
+
+// PendingFlipMoves enumerates the storage-key transitions implied by flipping
+// an artwork from fromVis to toVis. Each row's existing storage_key must be
+// prefixed with fromVis+"/"; the destination key swaps that prefix to toVis.
+// Returns an error if any row's key fails the prefix invariant — that's a
+// data-shape inconsistency the caller should surface.
+func (r *Repo) PendingFlipMoves(ctx context.Context, artworkID, fromVis, toVis string) ([]FlipMove, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, storage_key FROM artwork_images WHERE artwork_id = $1`, artworkID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var moves []FlipMove
+	for rows.Next() {
+		var id, src string
+		if err := rows.Scan(&id, &src); err != nil {
+			return nil, err
+		}
+		if !strings.HasPrefix(src, fromVis+"/") {
+			return nil, &flipPrefixError{src: src, fromVis: fromVis}
+		}
+		dst := toVis + strings.TrimPrefix(src, fromVis)
+		moves = append(moves, FlipMove{ID: id, Src: src, Dst: dst})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return moves, nil
+}
+
+// FinalizeFlip updates artwork_images.storage_key to the new dst values for the
+// completed moves and flips artworks.visibility to target — both inside a
+// single transaction so a partial failure cannot leak files into the wrong
+// visibility prefix while the artwork row still claims the old visibility.
+func (r *Repo) FinalizeFlip(ctx context.Context, artworkID, target string, completed []FlipMove) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	for _, m := range completed {
+		if _, err := tx.Exec(ctx,
+			`UPDATE artwork_images SET storage_key=$2 WHERE id=$1`, m.ID, m.Dst); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE artworks SET
+		  visibility=$2,
+		  published_at = CASE WHEN $2='public' THEN COALESCE(published_at, now()) ELSE published_at END
+		WHERE id=$1`, artworkID, target); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// flipPrefixError lets the visibility service surface a precise error when an
+// image's storage_key isn't prefixed by the artwork's current visibility — a
+// data invariant that would silently corrupt the flip if ignored.
+type flipPrefixError struct {
+	src, fromVis string
+}
+
+func (e *flipPrefixError) Error() string {
+	return "storage_key " + e.src + " does not match artwork visibility " + e.fromVis
 }

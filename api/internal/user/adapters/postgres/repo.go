@@ -11,11 +11,14 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	userdomain "local/art-web/api/internal/user/domain"
 )
 
-type User struct {
-	ID, Slug, DisplayName, Email, AvatarURL string
-}
+// User is the persistence-shape entity returned by Repo. Aliased to the
+// domain entity so handlers can read fields directly without an explicit
+// mapping step.
+type User = userdomain.User
 
 // ErrNotFound is returned by Get when the requested user row does not exist.
 // It lets callers distinguish "JWT subject vanished" (return 401) from a

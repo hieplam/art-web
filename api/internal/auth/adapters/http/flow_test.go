@@ -64,7 +64,7 @@ func TestStart_RealProvider_IncludesClientIDInRedirect(t *testing.T) {
 		srv.URL+"/token",
 		srv.URL+"/userinfo",
 	)
-	h := authhttp.StartHandler(map[string]authports.Provider{"google": provider}, authhttp.CookieOpts{})
+	h := authhttp.StartHandler(map[string]authports.OAuthProvider{"google": provider}, authhttp.CookieOpts{})
 
 	req := withChiURLParam(httptest.NewRequest("GET", "/auth/google/start", nil), "provider", "google")
 	rec := httptest.NewRecorder()
@@ -111,7 +111,7 @@ func TestFullOAuthFlow_StartThenCallback(t *testing.T) {
 	repo := &fakeUserRepo{}
 	jwts := authservice.NewJWT(testKey, nil)
 	cookieOpts := authhttp.CookieOpts{Secure: false}
-	providers := map[string]authports.Provider{"google": provider}
+	providers := map[string]authports.OAuthProvider{"google": provider}
 
 	// --- Phase 1: GET /auth/google/start ---------------------------------
 	startH := authhttp.StartHandler(providers, cookieOpts)

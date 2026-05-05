@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 
+	artworkhttp "local/art-web/api/internal/artwork/adapters/http"
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	artworkservice "local/art-web/api/internal/artwork/service"
 	authhttp "local/art-web/api/internal/auth/adapters/http"
@@ -29,6 +30,7 @@ import (
 	"local/art-web/api/internal/infrastructure/server"
 	infrastorage "local/art-web/api/internal/infrastructure/storage"
 	infratest "local/art-web/api/internal/infrastructure/testing"
+	userhttp "local/art-web/api/internal/user/adapters/http"
 	userpostgres "local/art-web/api/internal/user/adapters/postgres"
 	"local/art-web/api/pkg/signing"
 )
@@ -128,24 +130,23 @@ func setupMatrixEnv(t *testing.T) *MatrixEnv {
 
 	imgSvc := imageservice.NewService(store, images, arts)
 	upload := imagehttp.NewHandler(imgSvc, arts, urls)
-	vis := artworkservice.NewVisibilityService(arts, store)
+	vis := artworkservice.NewVisibilityService(arts, store, nil)
 
-	router := server.New(&server.Deps{
-		AppEnv:        "test",
-		JWT:           jwts,
-		URL:           urls,
-		Providers:     map[string]authports.Provider{},
-		Users:         users,
-		Artworks:      arts,
-		Tags:          tags,
-		Images:        images,
-		Store:         store,
-		Upload:        upload,
-		Vis:           vis,
-		Frontend:      "http://localhost:3000/",
-		AllowedOrigin: "http://localhost:3000",
-		CookieOpts:    authhttp.CookieOpts{Secure: false},
-		Logger:        zerolog.Nop(),
+	router := buildTestRouter(buildOpts{
+		appEnv:        "test",
+		jwts:          jwts,
+		urls:          urls,
+		users:         users,
+		arts:          arts,
+		tags:          tags,
+		images:        images,
+		store:         store,
+		upload:        upload,
+		vis:           vis,
+		providers:     map[string]authports.OAuthProvider{},
+		frontend:      "http://localhost:3000/",
+		allowedOrigin: "http://localhost:3000",
+		cookieOpts:    authhttp.CookieOpts{Secure: false},
 	})
 
 	aliceTok, err := jwts.Issue(aliceID, time.Hour)
@@ -242,8 +243,70 @@ func randHexN(n int) string {
 	return hex.EncodeToString(b)
 }
 
+// buildOpts captures every collaborator the test router needs. testDeps and
+// setupMatrixEnv populate this struct then call buildTestRouter, which assembles
+// the slice routers + middleware exactly the way the production wire setup
+// would but without involving wire_gen.go.
+type buildOpts struct {
+	appEnv        string
+	jwts          *authservice.JWT
+	urls          *signing.URLBuilder
+	users         *userpostgres.Repo
+	arts          *artworkpostgres.Repo
+	tags          *artworkpostgres.TagsRepo
+	images        *imagepostgres.Repo
+	store         infrastorage.Storage
+	upload        *imagehttp.Handler
+	vis           *artworkservice.VisibilityService
+	providers     map[string]authports.OAuthProvider
+	frontend      string
+	allowedOrigin string
+	cookieOpts    authhttp.CookieOpts
+}
+
+// buildTestRouter constructs the slice routers + the composed chi.Mux. Mirrors
+// what cmd/api/wire.go produces in production but explicitly so the tests
+// don't depend on Wire's generated code.
+func buildTestRouter(o buildOpts) http.Handler {
+	authMW := authhttp.NewMiddleware(o.jwts)
+	authH := authhttp.NewHandler(authhttp.AuthDeps{
+		Providers:    o.providers,
+		Users:        o.users,
+		JWT:          o.jwts,
+		FrontendHome: authhttp.FrontendHome(o.frontend),
+		CookieOpts:   o.cookieOpts,
+	})
+	authR := authhttp.NewRouter(authH)
+
+	userH := userhttp.NewHandler(o.users, o.arts, o.images, o.urls)
+	userR := userhttp.NewRouter(userH)
+
+	artworkH := artworkhttp.NewHandler(o.arts, o.tags, o.users, o.images, o.vis, o.urls)
+	artworkR := artworkhttp.NewRouter(artworkH, authMW)
+
+	imageR := imagehttp.NewRouter(o.upload, authMW)
+
+	registrars := server.ProvideRouteRegistrars(authR, userR, artworkR, imageR)
+
+	devseed := &server.DevSeed{
+		AppEnv: o.appEnv, Users: o.users, Artworks: o.arts,
+		Tags: o.tags, Images: o.images, Store: o.store,
+		JWT: o.jwts, Cookie: o.cookieOpts,
+	}
+
+	return server.NewRouter(authMW, registrars, server.AllowedOrigin(o.allowedOrigin),
+		server.AppEnv(o.appEnv), devseed)
+}
+
 // testDeps creates a full Deps for use in unit tests with the given appEnv.
-func testDeps(t *testing.T, appEnv string) *server.Deps {
+// Returns both the constructed router and the bundle so tests that exercise
+// /me's no-cookie behavior can use d.JWT directly.
+type testBundle struct {
+	router http.Handler
+	JWT    *authservice.JWT
+}
+
+func testDeps(t *testing.T, appEnv string) testBundle {
 	t.Helper()
 	dsn := infratest.StartPostgres(t)
 	pool, err := database.New(context.Background(), dsn)
@@ -261,27 +324,30 @@ func testDeps(t *testing.T, appEnv string) *server.Deps {
 	jwts := authservice.NewJWT(testJWTKey, time.Now)
 	urls := signing.NewURLBuilder("http://localhost:8787", testSignKey, time.Now)
 
+	users := userpostgres.NewRepo(pool)
 	arts := artworkpostgres.NewRepo(pool)
+	tags := artworkpostgres.NewTagsRepo(pool)
 	images := imagepostgres.NewRepo(pool)
 	imgSvc := imageservice.NewService(store, images, arts)
 	upload := imagehttp.NewHandler(imgSvc, arts, urls)
-	vis := artworkservice.NewVisibilityService(arts, store)
+	vis := artworkservice.NewVisibilityService(arts, store, nil)
 
-	return &server.Deps{
-		AppEnv:        appEnv,
-		JWT:           jwts,
-		URL:           urls,
-		Providers:     map[string]authports.Provider{},
-		Users:         userpostgres.NewRepo(pool),
-		Artworks:      arts,
-		Tags:          artworkpostgres.NewTagsRepo(pool),
-		Images:        images,
-		Store:         store,
-		Upload:        upload,
-		Vis:           vis,
-		Frontend:      "http://localhost:3000/",
-		AllowedOrigin: "http://localhost:3000",
-		CookieOpts:    authhttp.CookieOpts{Secure: false},
-		Logger:        zerolog.Nop(),
-	}
+	router := buildTestRouter(buildOpts{
+		appEnv:        appEnv,
+		jwts:          jwts,
+		urls:          urls,
+		users:         users,
+		arts:          arts,
+		tags:          tags,
+		images:        images,
+		store:         store,
+		upload:        upload,
+		vis:           vis,
+		providers:     map[string]authports.OAuthProvider{},
+		frontend:      "http://localhost:3000/",
+		allowedOrigin: "http://localhost:3000",
+		cookieOpts:    authhttp.CookieOpts{Secure: false},
+	})
+	_ = zerolog.Nop()
+	return testBundle{router: router, JWT: jwts}
 }

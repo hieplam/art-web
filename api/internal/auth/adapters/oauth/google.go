@@ -19,7 +19,7 @@ type googleProvider struct {
 	userinfoURL string
 }
 
-func NewGoogleProvider(clientID, clientSecret, redirectURL string) ports.Provider {
+func NewGoogleProvider(clientID, clientSecret, redirectURL string) ports.OAuthProvider {
 	return &googleProvider{
 		cfg: &oauth2.Config{
 			ClientID: clientID, ClientSecret: clientSecret, RedirectURL: redirectURL,
@@ -33,7 +33,7 @@ func NewGoogleProvider(clientID, clientSecret, redirectURL string) ports.Provide
 	}
 }
 
-func NewGoogleProviderForTest(id, secret, redirect, authURL, tokenURL, userinfoURL string) ports.Provider {
+func NewGoogleProviderForTest(id, secret, redirect, authURL, tokenURL, userinfoURL string) ports.OAuthProvider {
 	return &googleProvider{
 		cfg: &oauth2.Config{
 			ClientID: id, ClientSecret: secret, RedirectURL: redirect,

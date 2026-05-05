@@ -27,6 +27,13 @@ func (s *stubRepo) Insert(ctx context.Context, in imagepostgres.InsertInput) (*i
 	return s.insertFn(ctx, in)
 }
 
+// ListByArtwork is unused by the upload test paths but required to satisfy the
+// ports.ImageRepository interface introduced in the ports + service-interface
+// swap. Returning nil keeps the stub minimal.
+func (s *stubRepo) ListByArtwork(_ context.Context, _ string) ([]imagepostgres.InsertedImage, error) {
+	return nil, nil
+}
+
 type stubStore struct {
 	puts    []string
 	deletes []string

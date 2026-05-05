@@ -90,7 +90,7 @@ func newHandler(t *testing.T, store infrastorage.Storage) (*chi.Mux, string, str
 	h := imagehttp.NewHandler(svc, arts, signing.NewURLBuilder("http://x", []byte("k"), nil))
 
 	r := chi.NewRouter()
-	r.Use(authhttp.Middleware(jwts))
+	r.Use(authhttp.ParseTokenMiddleware(jwts))
 	r.With(authhttp.RequireUser).Post("/artworks/{id}/images", h.Upload)
 	tok, _ := jwts.Issue(uid, 3600*time.Second)
 	return r, aid, tok

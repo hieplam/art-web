@@ -7,8 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/rs/zerolog"
-
+	artworkhttp "local/art-web/api/internal/artwork/adapters/http"
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	artworkservice "local/art-web/api/internal/artwork/service"
 	authhttp "local/art-web/api/internal/auth/adapters/http"
@@ -20,6 +19,7 @@ import (
 	"local/art-web/api/internal/infrastructure/database"
 	"local/art-web/api/internal/infrastructure/server"
 	infrastorage "local/art-web/api/internal/infrastructure/storage"
+	userhttp "local/art-web/api/internal/user/adapters/http"
 	userpostgres "local/art-web/api/internal/user/adapters/postgres"
 	"local/art-web/api/pkg/signing"
 )
@@ -43,11 +43,12 @@ type BootOpts struct {
 	JWTKey  []byte
 	SignKey []byte
 
-	// Providers, when non-nil, is the authports.Provider map handed to server.New.
-	// Tests inject a deterministic fake here so /auth/{provider}/start emits a
-	// real 302 redirect (default empty map → unknown_provider 404, which would
-	// lock the wrong contract bytes — see Finding 4 of the round-1 review).
-	Providers map[string]authports.Provider
+	// Providers, when non-nil, is the authports.OAuthProvider map handed to
+	// the auth handler. Tests inject a deterministic fake here so
+	// /auth/{provider}/start emits a real 302 redirect (default empty map →
+	// unknown_provider 404, which would lock the wrong contract bytes — see
+	// Finding 4 of the round-1 review).
+	Providers map[string]authports.OAuthProvider
 
 	// IDProvider injects a deterministic image-ID source. nil → production default.
 	IDProvider imageservice.IDProvider
@@ -57,10 +58,11 @@ type BootOpts struct {
 	RandReader authhttp.RandReader
 }
 
-// BootApp returns an *httptest.Server backed by the real server.Deps stack
-// against a fresh testcontainers Postgres + a local-filesystem store under
-// t.TempDir(). It mirrors infrastructure/server/testutil_test.go's setup but is exported so
-// the contract suite can use it.
+// BootApp returns an *httptest.Server backed by the slice routers + server
+// composition against a fresh testcontainers Postgres + a local-filesystem
+// store under t.TempDir(). It mirrors the production wire setup but builds
+// each piece explicitly so the contract suite can substitute deterministic
+// providers without going through wire_gen.go.
 func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 	t.Helper()
 
@@ -102,11 +104,10 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 		clock = func() time.Time { return opts.FixedNow }
 	}
 	jwts := authservice.NewJWT(opts.JWTKey, clock)
-	// Use a fixed URL base so image-ref URLs in responses are stable across
-	// runs; snapshots compare bytes, not actual reachability. The real
-	// httptest port is in srv.URL but never appears in response bodies.
 	urls := signing.NewURLBuilder("http://localhost:8787", opts.SignKey, clock)
+	users := userpostgres.NewRepo(pool)
 	arts := artworkpostgres.NewRepo(pool)
+	tags := artworkpostgres.NewTagsRepo(pool)
 	images := imagepostgres.NewRepo(pool)
 	if opts.RandReader != nil {
 		t.Cleanup(authhttp.SetStateRandForTest(opts.RandReader))
@@ -117,29 +118,41 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 	}
 	imgSvc := imageservice.NewServiceWithIDs(store, images, arts, ids)
 	upload := imagehttp.NewHandler(imgSvc, arts, urls)
-	vis := artworkservice.NewVisibilityService(arts, store)
+	vis := artworkservice.NewVisibilityService(arts, store, nil)
 
 	providers := opts.Providers
 	if providers == nil {
-		providers = map[string]authports.Provider{}
+		providers = map[string]authports.OAuthProvider{}
 	}
-	router := server.New(&server.Deps{
-		AppEnv:        opts.AppEnv,
-		JWT:           jwts,
-		URL:           urls,
-		Providers:     providers,
-		Users:         userpostgres.NewRepo(pool),
-		Artworks:      arts,
-		Tags:          artworkpostgres.NewTagsRepo(pool),
-		Images:        images,
-		Store:         store,
-		Upload:        upload,
-		Vis:           vis,
-		Frontend:      opts.Frontend,
-		AllowedOrigin: opts.AllowedOrigin,
-		CookieOpts:    authhttp.CookieOpts{Secure: false},
-		Logger:        zerolog.Nop(),
+
+	authMW := authhttp.NewMiddleware(jwts)
+	authH := authhttp.NewHandler(authhttp.AuthDeps{
+		Providers:    providers,
+		Users:        users,
+		JWT:          jwts,
+		FrontendHome: authhttp.FrontendHome(opts.Frontend),
+		CookieOpts:   authhttp.CookieOpts{Secure: false},
 	})
+	authR := authhttp.NewRouter(authH)
+
+	userH := userhttp.NewHandler(users, arts, images, urls)
+	userR := userhttp.NewRouter(userH)
+
+	artworkH := artworkhttp.NewHandler(arts, tags, users, images, vis, urls)
+	artworkR := artworkhttp.NewRouter(artworkH, authMW)
+
+	imageR := imagehttp.NewRouter(upload, authMW)
+
+	registrars := server.ProvideRouteRegistrars(authR, userR, artworkR, imageR)
+
+	devseed := &server.DevSeed{
+		AppEnv: opts.AppEnv, Users: users, Artworks: arts,
+		Tags: tags, Images: images, Store: store,
+		JWT: jwts, Cookie: authhttp.CookieOpts{Secure: false},
+	}
+
+	router := server.NewRouter(authMW, registrars, server.AllowedOrigin(opts.AllowedOrigin),
+		server.AppEnv(opts.AppEnv), devseed)
 
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)

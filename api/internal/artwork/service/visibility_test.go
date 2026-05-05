@@ -15,6 +15,16 @@ import (
 	userpostgres "local/art-web/api/internal/user/adapters/postgres"
 )
 
+// captureRollbackReporter implements ports.RollbackReporter for tests that need
+// to count or inspect rollback firings without touching package-global state.
+type captureRollbackReporter struct {
+	calls atomic.Int32
+}
+
+func (c *captureRollbackReporter) Report(_ context.Context, _ string, _ error) {
+	c.calls.Add(1)
+}
+
 func newVisCtx(t *testing.T) (*artworkpostgres.Repo, string) {
 	t.Helper()
 	pool, err := database.New(context.Background(), infratest.StartPostgres(t))
@@ -34,7 +44,7 @@ func newVisCtx(t *testing.T) (*artworkpostgres.Repo, string) {
 func TestFlip_PrivateToPublic_MovesObjectsAndUpdatesKeys(t *testing.T) {
 	repo, uid := newVisCtx(t)
 	store := infrastorage.NewLocalFS(t.TempDir())
-	svc := artworkservice.NewVisibilityService(repo, store)
+	svc := artworkservice.NewVisibilityService(repo, store, nil)
 
 	aid, _ := repo.Create(t.Context(), uid, "x", "", "private")
 	_ = store.Put(t.Context(), "private/"+aid+"/img1.jpg", strings.NewReader("bytes"), "image/jpeg")
@@ -71,7 +81,7 @@ func TestFlip_PartialFailure_RollsBackMoves(t *testing.T) {
 	repo, uid := newVisCtx(t)
 	base := infrastorage.NewLocalFS(t.TempDir())
 	store := &flakyMoveStore{Storage: base, failOn: 2}
-	svc := artworkservice.NewVisibilityService(repo, store)
+	svc := artworkservice.NewVisibilityService(repo, store, nil)
 
 	aid, _ := repo.Create(t.Context(), uid, "x", "", "private")
 	for i, k := range []string{"img1", "img2"} {
@@ -104,13 +114,13 @@ func TestFlip_PartialFailure_RollsBackMoves(t *testing.T) {
 	}
 }
 
-// TestFlip_SameVisibility_NoOp covers the early-return path at visibility.go:31-33.
-// Flipping public→public (or private→private) is a no-op: returns nil immediately
+// TestFlip_SameVisibility_NoOp covers the early-return path: flipping
+// public→public (or private→private) is a no-op that returns nil immediately
 // without touching storage or the DB.
 func TestFlip_SameVisibility_NoOp(t *testing.T) {
 	repo, uid := newVisCtx(t)
 	store := infrastorage.NewLocalFS(t.TempDir())
-	svc := artworkservice.NewVisibilityService(repo, store)
+	svc := artworkservice.NewVisibilityService(repo, store, nil)
 
 	aid, _ := repo.Create(t.Context(), uid, "x", "", "private")
 	// No images attached — the no-op path doesn't even read the images table.
@@ -123,13 +133,13 @@ func TestFlip_SameVisibility_NoOp(t *testing.T) {
 	}
 }
 
-// TestFlip_BadTarget_ReturnsError covers the validation at visibility.go:24-26.
-// Targets other than "public"/"private" must return errBadTarget without
-// touching storage or DB.
+// TestFlip_BadTarget_ReturnsError covers the target-validation guard. Targets
+// other than "public"/"private" must return errBadTarget without touching
+// storage or DB.
 func TestFlip_BadTarget_ReturnsError(t *testing.T) {
 	repo, uid := newVisCtx(t)
 	store := infrastorage.NewLocalFS(t.TempDir())
-	svc := artworkservice.NewVisibilityService(repo, store)
+	svc := artworkservice.NewVisibilityService(repo, store, nil)
 
 	aid, _ := repo.Create(t.Context(), uid, "x", "", "private")
 	if err := svc.Flip(t.Context(), aid, "draft"); err == nil {
@@ -138,12 +148,12 @@ func TestFlip_BadTarget_ReturnsError(t *testing.T) {
 }
 
 // reverseFailStore makes forward Moves succeed but reverse Moves fail. Used to
-// exercise the RollbackLog path: after the primary forward Move fails, the
-// undo (reverse Move) ALSO fails — RollbackLog reports the leak.
+// exercise the RollbackReporter path: after the primary forward Move fails, the
+// undo (reverse Move) ALSO fails — RollbackReporter.Report is called.
 type reverseFailStore struct {
 	infrastorage.Storage
 	forwardCalls  atomic.Int32
-	failForwardOn int32 // when forwardCalls reaches this, the FORWARD move fails (triggers rollback)
+	failForwardOn int32  // when forwardCalls reaches this, the FORWARD move fails (triggers rollback)
 	aid           string // artwork id for distinguishing forward vs reverse
 }
 
@@ -161,11 +171,11 @@ func (r *reverseFailStore) Move(ctx context.Context, src, dst string) error {
 	return errors.New("simulated reverse-move failure")
 }
 
-// TestFlip_RollbackLogFires_WhenUndoMoveFails covers the visibility.go:96-99
-// branch where rollbackMoves's reverse Move fails. After the primary forward
-// Move fails on the 2nd image, rollback tries to undo the 1st image's forward
-// move, which ALSO fails → RollbackLog.Report is called.
-func TestFlip_RollbackLogFires_WhenUndoMoveFails(t *testing.T) {
+// TestFlip_RollbackReporterFires_WhenUndoMoveFails covers the rollback-leak
+// branch. After the primary forward Move fails on the 2nd image, rollback
+// tries to undo the 1st image's forward move, which ALSO fails → the injected
+// RollbackReporter.Report is called.
+func TestFlip_RollbackReporterFires_WhenUndoMoveFails(t *testing.T) {
 	repo, uid := newVisCtx(t)
 	base := infrastorage.NewLocalFS(t.TempDir())
 
@@ -185,18 +195,13 @@ func TestFlip_RollbackLogFires_WhenUndoMoveFails(t *testing.T) {
 	}
 
 	store := &reverseFailStore{Storage: base, failForwardOn: 2, aid: aid}
-	svc := artworkservice.NewVisibilityService(repo, store)
-
-	// Capture RollbackLog firings.
-	var rollbackCalls atomic.Int32
-	prev := artworkservice.RollbackLog
-	artworkservice.RollbackLog = func(err error) { rollbackCalls.Add(1) }
-	defer func() { artworkservice.RollbackLog = prev }()
+	reporter := &captureRollbackReporter{}
+	svc := artworkservice.NewVisibilityService(repo, store, reporter)
 
 	if err := svc.Flip(t.Context(), aid, "public"); err == nil {
 		t.Fatal("expected flip to fail when forward move fails")
 	}
-	if rollbackCalls.Load() == 0 {
-		t.Fatal("expected RollbackLog to fire when undo move fails")
+	if reporter.calls.Load() == 0 {
+		t.Fatal("expected RollbackReporter to fire when undo move fails")
 	}
 }

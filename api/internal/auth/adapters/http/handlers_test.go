@@ -36,7 +36,7 @@ func (f *fakeUserRepo) UpsertOAuth(_ context.Context, prov, sub, email, name, av
 }
 
 func TestStart_RedirectsToProviderWithState(t *testing.T) {
-	h := authhttp.StartHandler(map[string]authports.Provider{"google": fakeProvider{}}, authhttp.CookieOpts{Secure: true})
+	h := authhttp.StartHandler(map[string]authports.OAuthProvider{"google": fakeProvider{}}, authhttp.CookieOpts{Secure: true})
 	rec := httptest.NewRecorder()
 	req := withChiURLParam(httptest.NewRequest("GET", "/auth/google/start", nil), "provider", "google")
 	h.ServeHTTP(rec, req)
@@ -56,7 +56,7 @@ func TestCallback_SetsAuthCookie(t *testing.T) {
 	repo := &fakeUserRepo{}
 	jwts := authservice.NewJWT(testKey, nil)
 	opts := authhttp.CookieOpts{Domain: ".example.com", Secure: true}
-	h := authhttp.CallbackHandler(map[string]authports.Provider{"google": fakeProvider{}}, repo, jwts, "https://app.example.com/", opts)
+	h := authhttp.CallbackHandler(map[string]authports.OAuthProvider{"google": fakeProvider{}}, repo, jwts, "https://app.example.com/", opts)
 	req := httptest.NewRequest("GET", "/auth/google/callback?code=C&state=S", nil)
 	req.AddCookie(&http.Cookie{Name: "oauth_state", Value: "S"})
 	req = withChiURLParam(req, "provider", "google")

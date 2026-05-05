@@ -8,11 +8,10 @@ import (
 
 	"local/art-web/api/internal/infrastructure/database"
 	infratest "local/art-web/api/internal/infrastructure/testing"
-	"local/art-web/api/internal/infrastructure/server"
 )
 
 func TestDevSeed_DisabledByDefault(t *testing.T) {
-	srv := httptest.NewServer(server.New(testDeps(t, "prod")))
+	srv := httptest.NewServer(testDeps(t, "prod").router)
 	defer srv.Close()
 	r, _ := srv.Client().Post(srv.URL+"/dev/seed", "", nil)
 	if r.StatusCode != 404 {
@@ -21,7 +20,7 @@ func TestDevSeed_DisabledByDefault(t *testing.T) {
 }
 
 func TestDevSeed_TestEnv_ReturnsFixture(t *testing.T) {
-	srv := httptest.NewServer(server.New(testDeps(t, "test")))
+	srv := httptest.NewServer(testDeps(t, "test").router)
 	defer srv.Close()
 
 	r, err := srv.Client().Post(srv.URL+"/dev/seed", "application/json", nil)
@@ -78,7 +77,7 @@ func TestDevSeed_TestEnv_ReturnsFixture(t *testing.T) {
 }
 
 func TestDevSeed_Many_BulkSeedsPublic(t *testing.T) {
-	srv := httptest.NewServer(server.New(testDeps(t, "test")))
+	srv := httptest.NewServer(testDeps(t, "test").router)
 	defer srv.Close()
 	r, _ := srv.Client().Post(srv.URL+"/dev/seed?many=5", "", nil)
 	if r.StatusCode != 200 {
@@ -100,8 +99,8 @@ func TestDevSeed_Many_BulkSeedsPublic(t *testing.T) {
 }
 
 func TestDevSeed_Many120_WritesAllItems(t *testing.T) {
-	httptest.NewServer(server.New(testDeps(t, "test"))) // ensures DB + schema are ready
-	srv := httptest.NewServer(server.New(testDeps(t, "test")))
+	httptest.NewServer(testDeps(t, "test").router) // ensures DB + schema are ready
+	srv := httptest.NewServer(testDeps(t, "test").router)
 	defer srv.Close()
 
 	r, _ := srv.Client().Post(srv.URL+"/dev/seed?many=120", "", nil)
@@ -126,11 +125,10 @@ func TestDevSeed_Many120_WritesAllItems(t *testing.T) {
 
 func TestDevSeed_NotMounted_When_AppEnv_NotTest(t *testing.T) {
 	deps := testDeps(t, "production") // helper from testutil_test.go
-	r := server.New(deps)
 
 	req := httptest.NewRequest("POST", "/dev/seed", nil)
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
+	deps.router.ServeHTTP(rec, req)
 	if rec.Code != 404 {
 		t.Fatalf("expected /dev/seed to be unmounted in non-test env; status=%d body=%s",
 			rec.Code, rec.Body.String())
@@ -139,11 +137,10 @@ func TestDevSeed_NotMounted_When_AppEnv_NotTest(t *testing.T) {
 
 func TestDevSeed_FixedSuffix_ProducesDeterministicSlug(t *testing.T) {
 	deps := testDeps(t, "test") // helper from testutil_test.go
-	r := server.New(deps)
 
 	req := httptest.NewRequest("POST", "/dev/seed?suffix=fixed1234", nil)
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
+	deps.router.ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("status=%d want 200; body=%s", rec.Code, rec.Body.String())
 	}

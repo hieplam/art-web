@@ -15,7 +15,7 @@ var testKey = []byte("0123456789abcdef0123456789abcdef")
 
 func TestMiddleware_NoCookie_StillCallsNext(t *testing.T) {
 	j := authservice.NewJWT(testKey, nil)
-	mw := authhttp.Middleware(j)
+	mw := authhttp.ParseTokenMiddleware(j)
 	called := false
 	h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if uid, ok := authhttp.UserIDFrom(r.Context()); ok {
@@ -33,7 +33,7 @@ func TestMiddleware_NoCookie_StillCallsNext(t *testing.T) {
 func TestMiddleware_ValidCookie_PopulatesContext(t *testing.T) {
 	j := authservice.NewJWT(testKey, nil)
 	tok, _ := j.Issue("uid-42", time.Hour)
-	mw := authhttp.Middleware(j)
+	mw := authhttp.ParseTokenMiddleware(j)
 	var got string
 	h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		uid, _ := authhttp.UserIDFrom(r.Context())

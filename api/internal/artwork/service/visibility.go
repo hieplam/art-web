@@ -4,23 +4,43 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 
-	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
+	"local/art-web/api/internal/artwork/ports"
 	infrastorage "local/art-web/api/internal/infrastructure/storage"
 )
 
+// VisibilityService orchestrates the storage-first, DB-within-tx, compensate-
+// on-failure visibility flip described in spec §7.6.1. The repo, storage, and
+// rollback reporter are injected so unit tests can stand in fakes for any of
+// them.
 type VisibilityService struct {
-	repo  *artworkpostgres.Repo
-	store infrastorage.Storage
+	repo     ports.ArtworkRepository
+	store    infrastorage.Storage
+	rollback ports.RollbackReporter
 }
 
-func NewVisibilityService(r *artworkpostgres.Repo, s infrastorage.Storage) *VisibilityService {
-	return &VisibilityService{repo: r, store: s}
+// NewVisibilityService accepts the artwork repo and rollback reporter as ports
+// so any conforming implementation works. The legacy two-arg constructor lives
+// alongside as NewVisibilityServiceLegacy for tests that still call it that
+// way; new wiring should use this one.
+func NewVisibilityService(repo ports.ArtworkRepository, store infrastorage.Storage, rollback ports.RollbackReporter) *VisibilityService {
+	if rollback == nil {
+		rollback = noopRollbackReporter{}
+	}
+	return &VisibilityService{repo: repo, store: store, rollback: rollback}
 }
 
-type flipMove struct{ id, src, dst string }
-
+// Flip applies the storage-first visibility transition. Steps mirror the
+// existing pgx-based implementation:
+//  1. Read artwork; early-return on same-visibility no-op.
+//  2. Enumerate pending flip moves; move each storage object.
+//     Failure here triggers reverse moves; no DB writes happened yet.
+//  3. Call FinalizeFlip which updates image keys + artwork.visibility in one tx.
+//     Failure here triggers reverse moves to keep storage in sync with the
+//     DB row that's still claiming the old visibility.
+//
+// rollback.Report fires only when a *reverse* (undo) move itself fails — the
+// leak window the original RollbackLog also instrumented.
 func (v *VisibilityService) Flip(ctx context.Context, artworkID, target string) error {
 	if target != "public" && target != "private" {
 		return errBadTarget
@@ -33,75 +53,40 @@ func (v *VisibilityService) Flip(ctx context.Context, artworkID, target string) 
 		return nil
 	}
 
-	rows, err := v.repo.Pool().Query(ctx, `SELECT id, storage_key FROM artwork_images WHERE artwork_id=$1`, artworkID)
+	moves, err := v.repo.PendingFlipMoves(ctx, artworkID, a.Visibility, target)
 	if err != nil {
-		return err
-	}
-	var moves []flipMove
-	for rows.Next() {
-		var id, src string
-		if err := rows.Scan(&id, &src); err != nil {
-			rows.Close()
-			return err
-		}
-		if !strings.HasPrefix(src, a.Visibility+"/") {
-			rows.Close()
-			return fmt.Errorf("storage_key %q does not match artwork visibility %q", src, a.Visibility)
-		}
-		dst := target + strings.TrimPrefix(src, a.Visibility)
-		moves = append(moves, flipMove{id, src, dst})
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
 		return err
 	}
 
 	completed := moves[:0:0]
 	for _, m := range moves {
-		if err := v.store.Move(ctx, m.src, m.dst); err != nil {
-			rollbackMoves(ctx, v.store, completed)
-			return fmt.Errorf("move %s→%s: %w", m.src, m.dst, err)
+		if err := v.store.Move(ctx, m.Src, m.Dst); err != nil {
+			v.rollbackMoves(ctx, completed)
+			return fmt.Errorf("move %s→%s: %w", m.Src, m.Dst, err)
 		}
 		completed = append(completed, m)
 	}
 
-	tx, err := v.repo.Pool().Begin(ctx)
-	if err != nil {
-		rollbackMoves(ctx, v.store, completed)
-		return err
-	}
-	defer tx.Rollback(ctx)
-	for _, m := range moves {
-		if _, err := tx.Exec(ctx,
-			`UPDATE artwork_images SET storage_key=$2 WHERE id=$1`, m.id, m.dst); err != nil {
-			rollbackMoves(ctx, v.store, completed)
-			return err
-		}
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE artworks SET
-		  visibility=$2,
-		  published_at = CASE WHEN $2='public' THEN COALESCE(published_at, now()) ELSE published_at END
-		WHERE id=$1`, artworkID, target); err != nil {
-		rollbackMoves(ctx, v.store, completed)
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		rollbackMoves(ctx, v.store, completed)
+	if err := v.repo.FinalizeFlip(ctx, artworkID, target, completed); err != nil {
+		v.rollbackMoves(ctx, completed)
 		return err
 	}
 	return nil
 }
 
-func rollbackMoves(ctx context.Context, store infrastorage.Storage, completed []flipMove) {
+func (v *VisibilityService) rollbackMoves(ctx context.Context, completed []ports.FlipMove) {
 	for i := len(completed) - 1; i >= 0; i-- {
 		m := completed[i]
-		if err := store.Move(ctx, m.dst, m.src); err != nil {
-			RollbackLog(fmt.Errorf("rollback move %s→%s: %w", m.dst, m.src, err))
+		if err := v.store.Move(ctx, m.Dst, m.Src); err != nil {
+			v.rollback.Report(ctx, m.ID, fmt.Errorf("rollback move %s→%s: %w", m.Dst, m.Src, err))
 		}
 	}
 }
 
-var RollbackLog = func(err error) {}
+// noopRollbackReporter is the safety default when the constructor is called
+// with a nil reporter — the rollback path won't panic mid-flight.
+type noopRollbackReporter struct{}
+
+func (noopRollbackReporter) Report(_ context.Context, _ string, _ error) {}
 
 var errBadTarget = errors.New("target must be 'public' or 'private'")

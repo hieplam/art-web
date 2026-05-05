@@ -11,6 +11,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/rs/zerolog/log"
 
+	artworkhttp "local/art-web/api/internal/artwork/adapters/http"
+	artworklog "local/art-web/api/internal/artwork/adapters/log"
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	artworkservice "local/art-web/api/internal/artwork/service"
 	authhttp "local/art-web/api/internal/auth/adapters/http"
@@ -25,6 +27,7 @@ import (
 	infralogger "local/art-web/api/internal/infrastructure/logger"
 	"local/art-web/api/internal/infrastructure/server"
 	infrastorage "local/art-web/api/internal/infrastructure/storage"
+	userhttp "local/art-web/api/internal/user/adapters/http"
 	userpostgres "local/art-web/api/internal/user/adapters/postgres"
 	"local/art-web/api/pkg/signing"
 )
@@ -80,26 +83,44 @@ func main() {
 	images := imagepostgres.NewRepo(pool)
 	imgSvc := imageservice.NewService(store, images, arts)
 	upload := imagehttp.NewHandler(imgSvc, arts, urls)
-	vis := artworkservice.NewVisibilityService(arts, store)
+	rollbackReporter := artworklog.NewZerologReporter(logger)
+	vis := artworkservice.NewVisibilityService(arts, store, rollbackReporter)
 
-	artworkservice.RollbackLog = func(err error) { log.Error().Err(err).Msg("flip rollback") }
-
-	r := server.New(&server.Deps{
-		AppEnv: cfg.AppEnv,
-		JWT:    jwts, URL: urls,
-		Providers: map[string]authports.Provider{
-			"google": authoauth.NewGoogleProvider(cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.GoogleRedirectURL),
-		},
-		Users: users, Artworks: arts, Tags: tags, Images: images, Store: store,
-		Upload: upload, Vis: vis,
-		Frontend:      cfg.FrontendURL,
-		AllowedOrigin: cfg.AllowedOrigin,
-		CookieOpts: authhttp.CookieOpts{
-			Domain: cfg.CookieDomain,
-			Secure: secureCookieForEnv(cfg.AppEnv),
-		},
-		Logger: logger,
+	cookieOpts := authhttp.CookieOpts{
+		Domain: cfg.CookieDomain,
+		Secure: secureCookieForEnv(cfg.AppEnv),
+	}
+	authMW := authhttp.NewMiddleware(jwts)
+	providers := map[string]authports.OAuthProvider{
+		"google": authoauth.NewGoogleProvider(cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.GoogleRedirectURL),
+	}
+	authH := authhttp.NewHandler(authhttp.AuthDeps{
+		Providers:    providers,
+		Users:        users,
+		JWT:          jwts,
+		FrontendHome: authhttp.FrontendHome(cfg.FrontendURL),
+		CookieOpts:   cookieOpts,
 	})
+	authR := authhttp.NewRouter(authH)
+
+	userH := userhttp.NewHandler(users, arts, images, urls)
+	userR := userhttp.NewRouter(userH)
+
+	artworkH := artworkhttp.NewHandler(arts, tags, users, images, vis, urls)
+	artworkR := artworkhttp.NewRouter(artworkH, authMW)
+
+	imageR := imagehttp.NewRouter(upload, authMW)
+
+	registrars := server.ProvideRouteRegistrars(authR, userR, artworkR, imageR)
+
+	devseed := &server.DevSeed{
+		AppEnv: cfg.AppEnv, Users: users, Artworks: arts,
+		Tags: tags, Images: images, Store: store,
+		JWT: jwts, Cookie: cookieOpts,
+	}
+
+	r := server.NewRouter(authMW, registrars, server.AllowedOrigin(cfg.AllowedOrigin),
+		server.AppEnv(cfg.AppEnv), devseed)
 
 	log.Info().Str("addr", cfg.Addr).Msg("listening")
 	if err := http.ListenAndServe(cfg.Addr, r); err != nil {

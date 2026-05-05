@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"io"
 
-	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
-	imagepostgres "local/art-web/api/internal/image/adapters/postgres"
+	artworkdomain "local/art-web/api/internal/artwork/domain"
 	imagedomain "local/art-web/api/internal/image/domain"
+	imageports "local/art-web/api/internal/image/ports"
 	infrastorage "local/art-web/api/internal/infrastructure/storage"
 )
 
@@ -21,33 +21,40 @@ var mimeForFormat = map[string]string{
 	"png":  "image/png",
 }
 
-// imageRepo is a narrow seam for service-level tests. *imagepostgres.Repo satisfies it; this
-// interface is not exported.
-//
-// IMPORTANT: signatures must match repo.go exactly. Insert returns
-// (*InsertResult, error) — pointer to InsertResult — and FindByClientImageID
-// returns nil (not the zero value) when the row is missing.
-type imageRepo interface {
-	FindByClientImageID(ctx context.Context, artworkID, clientImageID string) (*imagepostgres.InsertedImage, error)
-	Insert(ctx context.Context, in imagepostgres.InsertInput) (*imagepostgres.InsertResult, error)
-}
+// imageRepo is the narrow seam for service-level tests. Aliased to
+// ports.ImageRepository so the postgres adapter satisfies it directly. Kept
+// unexported so consumers see only the constructor signatures.
+type imageRepo = imageports.ImageRepository
+
+// ErrFingerprintMismatch is the canonical sentinel for the same-client_image_id-
+// but-different-bytes retry case. The postgres adapter returns the same value
+// via re-export, so handlers that errors.Is against either name match.
+var ErrFingerprintMismatch = imagedomain.ErrFingerprintMismatch
 
 type Service struct {
 	store    infrastorage.Storage
 	images   imageRepo
-	artworks *artworkpostgres.Repo
+	artworks ArtworkLookup
 	ids      IDProvider
 }
 
-func NewService(s infrastorage.Storage, im *imagepostgres.Repo, a *artworkpostgres.Repo) *Service {
+// ArtworkLookup is the service's narrow view of the artwork repo — it only
+// needs Get for upload-time validation. The artwork postgres adapter
+// satisfies this structurally.
+type ArtworkLookup interface {
+	Get(ctx context.Context, id string) (*artworkdomain.Artwork, error)
+}
+
+// NewService wires the upload service against ports-typed collaborators. The
+// concrete *imagepostgres.Repo and *artworkpostgres.Repo satisfy these
+// interfaces, so existing callers compile without conversion.
+func NewService(s infrastorage.Storage, im imageRepo, a ArtworkLookup) *Service {
 	return &Service{store: s, images: im, artworks: a, ids: NewUUIDProvider()}
 }
 
-// NewServiceWithIDs is the test-mode constructor. The contract suite passes a
-// deterministic *CounterIDProvider here. Production uses NewService (which
-// takes *imagepostgres.Repo). This constructor accepts the imageRepo interface directly so
-// stub-based tests don't need to bypass it.
-func NewServiceWithIDs(s infrastorage.Storage, im imageRepo, a *artworkpostgres.Repo, ids IDProvider) *Service {
+// NewServiceWithIDs is the test-mode constructor with an injectable IDProvider.
+// The contract suite passes a deterministic *CounterIDProvider here.
+func NewServiceWithIDs(s infrastorage.Storage, im imageRepo, a ArtworkLookup, ids IDProvider) *Service {
 	return &Service{store: s, images: im, artworks: a, ids: ids}
 }
 
@@ -59,7 +66,7 @@ type UploadOne struct {
 }
 
 type UploadResult struct {
-	Image   imagepostgres.InsertedImage
+	Image   imagedomain.Image
 	Existed bool
 }
 
@@ -68,7 +75,7 @@ var (
 	ErrContentTypeMismatch = errors.New("body content type does not match declared manifest content_type")
 )
 
-func (s *Service) UploadOne(ctx context.Context, art *artworkpostgres.Artwork, in UploadOne) (*UploadResult, error) {
+func (s *Service) UploadOne(ctx context.Context, art *artworkdomain.Artwork, in UploadOne) (*UploadResult, error) {
 	limited := io.LimitReader(in.Body, MaxBytes+1)
 	buf, err := io.ReadAll(limited)
 	if err != nil {
@@ -88,7 +95,7 @@ func (s *Service) UploadOne(ctx context.Context, art *artworkpostgres.Artwork, i
 	}
 	if existing != nil {
 		if existing.SourceSHA256 != sha {
-			return nil, imagepostgres.ErrFingerprintMismatch
+			return nil, ErrFingerprintMismatch
 		}
 		return &UploadResult{Image: *existing, Existed: true}, nil
 	}
@@ -109,7 +116,7 @@ func (s *Service) UploadOne(ctx context.Context, art *artworkpostgres.Artwork, i
 		return nil, err
 	}
 
-	res, err := s.images.Insert(ctx, imagepostgres.InsertInput{
+	res, err := s.images.Insert(ctx, imageports.InsertInput{
 		ID: imgID, ArtworkID: art.ID, ClientImageID: in.Manifest.ClientImageID,
 		Position: in.Manifest.Position, ContentType: in.Manifest.ContentType,
 		StorageKey: key, SourceSHA256: sha,
@@ -133,7 +140,7 @@ func (s *Service) UploadOne(ctx context.Context, art *artworkpostgres.Artwork, i
 	}
 
 	return &UploadResult{
-		Image: imagepostgres.InsertedImage{
+		Image: imagedomain.Image{
 			ID: res.ID, ArtworkID: art.ID, ClientImageID: in.Manifest.ClientImageID,
 			StorageKey: key, ContentType: in.Manifest.ContentType, Blurhash: dec.Blurhash,
 			SourceSHA256: sha,

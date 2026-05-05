@@ -53,7 +53,7 @@ func jsonError(w http.ResponseWriter, body string, code int) {
 	_, _ = w.Write([]byte(body))
 }
 
-func StartHandler(providers map[string]ports.Provider, cookieOpts CookieOpts) http.Handler {
+func StartHandler(providers map[string]ports.OAuthProvider, cookieOpts CookieOpts) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p, ok := providers[chi.URLParam(r, "provider")]
 		if !ok {
@@ -67,7 +67,7 @@ func StartHandler(providers map[string]ports.Provider, cookieOpts CookieOpts) ht
 }
 
 func CallbackHandler(
-	providers map[string]ports.Provider,
+	providers map[string]ports.OAuthProvider,
 	users UserUpserter,
 	jwts *service.JWT,
 	frontendHome string,

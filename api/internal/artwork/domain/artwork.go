@@ -2,17 +2,16 @@ package domain
 
 import "time"
 
+// Artwork mirrors the persistence shape so the postgres adapter can return it
+// directly via a type alias. Tags/Images are populated only when callers
+// explicitly preload them — the bare repo Get returns just the row fields.
 type Artwork struct {
-	ID            string
-	UserID        string
-	Title         string
-	Description   *string
-	Visibility    Visibility
-	CoverPosition int
-	CreatedAt     time.Time
-	PublishedAt   *time.Time
-	Tags          []Tag
-	Images        []Image // populated when repo preloads
+	ID, UserID, Title, Visibility string
+	Description                   *string
+	PublishedAt, CreatedAt        *time.Time
+	CoverPosition                 int
+	Tags                          []Tag   // optional, repo preloads only when asked
+	Images                        []Image // optional, repo preloads only when asked
 }
 
 // Image is a slim view; full Image lives in internal/image/domain.
