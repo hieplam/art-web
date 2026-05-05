@@ -209,6 +209,42 @@ cd web && bun run test
 cd web && bun run test:e2e
 ```
 
+### API coverage
+
+The API uses Makefile targets for coverage so the gates are reproducible. Run from `api/`. All targets need Docker running (testcontainers Postgres + MinIO).
+
+```bash
+cd api
+
+make help                # list every target with a one-line description
+make test                # full suite + per-function coverage summary
+make test-cover-slices   # per-slice coverage gate (Phase 0 §8.3 requires ≥ 80%)
+make test-cover          # whole-module summary (last 20 lines of cover -func)
+make test-cover-html     # opens browser with red/green per-line annotation
+make test-contract       # 56-cell byte-strict HTTP contract suite
+make test-race           # tests with -race detector
+make test-all            # lint + race + coverage (pre-merge gate, ~90s warm)
+```
+
+Phase 0 hard gate is `make test-cover-slices` showing each business slice ≥ 80%. Current baseline:
+
+```
+=== auth ===     total: (statements) 82.5%
+=== user ===     total: (statements) 82.8%
+=== artwork ===  total: (statements) 81.4%
+=== image ===    total: (statements) 82.0%
+```
+
+The byte-strict contract suite (`make test-contract`) replays 56 captured golden snapshots from `api/internal/httpapi/contract/golden/`. Failures here mean an observable HTTP byte changed — see `api/internal/httpapi/contract/error_codes_observed.md` for the locked error-code surface. Re-capturing requires explicit reviewer signoff via the CODEOWNERS rule on `golden/`:
+
+```bash
+# Only when bytes legitimately change (e.g., during a planned refactor):
+GOLDEN_UPDATE=1 go test ./internal/httpapi/contract/... -run TestContractMatrix
+git diff api/internal/httpapi/contract/golden/  # review every byte before staging
+```
+
+If a test fails with `Cannot connect to Docker daemon`, start Docker Desktop and re-run. The harness has a 60-second container-boot timeout.
+
 ---
 
 ## Project layout
