@@ -101,3 +101,16 @@ func TestPatchDescription_PreservesTitle(t *testing.T) {
 		t.Fatalf("description not updated: %v", got.Description)
 	}
 }
+
+func TestSetCoverPosition_PersistsValue(t *testing.T) {
+	repo, _, uid := newCtx(t)
+	aid, _ := repo.Create(t.Context(), uid, "x", "", "private")
+
+	if err := repo.SetCoverPosition(t.Context(), aid, 5); err != nil {
+		t.Fatalf("SetCoverPosition: %v", err)
+	}
+	got, _ := repo.Get(t.Context(), aid)
+	if got.CoverPosition != 5 {
+		t.Fatalf("got %d want 5", got.CoverPosition)
+	}
+}

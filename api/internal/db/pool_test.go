@@ -27,6 +27,13 @@ func TestNew_RejectsBadDSN(t *testing.T) {
 	}
 }
 
+func TestNew_BadDSN_ReturnsError(t *testing.T) {
+	_, err := db.New(context.Background(), "this-is-not-a-valid-dsn")
+	if err == nil {
+		t.Fatal("expected error for malformed DSN")
+	}
+}
+
 func startEphemeralPostgres(t *testing.T) string {
 	return dbtest.StartPostgres(t)
 }
