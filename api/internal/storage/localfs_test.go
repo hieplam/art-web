@@ -122,3 +122,38 @@ func TestLocalFS_RejectsTraversal_Variants(t *testing.T) {
 		}
 	}
 }
+
+func TestLocalFS_Delete_RejectsTraversal(t *testing.T) {
+	s := storage.NewLocalFS(t.TempDir())
+	if err := s.Delete(context.Background(), "../etc/passwd"); err == nil {
+		t.Fatal("expected traversal rejection on Delete")
+	}
+}
+
+func TestLocalFS_Move_RejectsTraversalSrc(t *testing.T) {
+	s := storage.NewLocalFS(t.TempDir())
+	if err := s.Move(context.Background(), "../etc/passwd", "valid/dst"); err == nil {
+		t.Fatal("expected traversal rejection on Move src")
+	}
+}
+
+func TestLocalFS_Move_RejectsTraversalDst(t *testing.T) {
+	s := storage.NewLocalFS(t.TempDir())
+	// Need to seed a real source first so Move gets past the abs(src) check
+	// and reaches the abs(dst) check.
+	if err := s.Put(context.Background(), "valid/src.jpg",
+		strings.NewReader("x"), "image/jpeg"); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := s.Move(context.Background(), "valid/src.jpg", "../etc/passwd"); err == nil {
+		t.Fatal("expected traversal rejection on Move dst")
+	}
+}
+
+func TestLocalFS_Exists_RejectsTraversal(t *testing.T) {
+	s := storage.NewLocalFS(t.TempDir())
+	_, err := s.Exists(context.Background(), "../etc/passwd")
+	if err == nil {
+		t.Fatal("expected traversal rejection on Exists")
+	}
+}
