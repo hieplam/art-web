@@ -18,27 +18,9 @@ import (
 )
 
 func TestR2_PutGetMove(t *testing.T) {
-	ctx := context.Background()
-	c, err := tcminio.Run(ctx, "minio/minio:RELEASE.2024-12-18T13-15-44Z")
-	if err != nil {
-		t.Fatalf("minio: %v", err)
-	}
-	t.Cleanup(func() { _ = c.Terminate(ctx) })
-
-	endpoint, _ := c.ConnectionString(ctx)
-	cli := s3.NewFromConfig(aws.Config{
-		Region:      "us-east-1",
-		Credentials: credentials.NewStaticCredentialsProvider("minioadmin", "minioadmin", ""),
-	}, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String("http://" + endpoint)
-		o.UsePathStyle = true
-	})
-	_, err = cli.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String("art")})
-	if err != nil {
-		t.Fatalf("create bucket: %v", err)
-	}
-
+	cli := newR2Client(t)
 	s := storage.NewR2(cli, "art")
+	ctx := context.Background()
 
 	if err := s.Put(ctx, "public/x/0.jpg", bytes.NewReader([]byte("hi")), "image/jpeg"); err != nil {
 		t.Fatalf("put: %v", err)

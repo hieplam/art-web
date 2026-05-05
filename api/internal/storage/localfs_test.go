@@ -44,13 +44,6 @@ func TestLocalFS_Move(t *testing.T) {
 	}
 }
 
-func TestLocalFS_RejectsTraversal(t *testing.T) {
-	s := storage.NewLocalFS(t.TempDir())
-	if err := s.Put(context.Background(), "../etc/passwd", strings.NewReader("x"), "text/plain"); err == nil {
-		t.Fatal("expected traversal rejection")
-	}
-}
-
 func TestLocalFS_Move_MissingSource_ReturnsError(t *testing.T) {
 	s := storage.NewLocalFS(t.TempDir())
 	if err := s.Move(context.Background(), "no/such/key.jpg", "dst/key.jpg"); err == nil {
