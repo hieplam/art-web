@@ -70,3 +70,22 @@ func TestUpsertOAuth_Idempotent_ReturnsSameID(t *testing.T) {
 		t.Fatalf("upsert produced two ids: %s vs %s", a, b)
 	}
 }
+
+func TestUpsertOAuth_SlugExhaustionAfter50Collisions(t *testing.T) {
+	r := newRepo(t)
+	// Seed 50 users that occupy the slug space "alice", "alice-2", ..., "alice-50".
+	for i := 0; i < 50; i++ {
+		subject := "S" + strings.Repeat("x", i+1) // unique oauth_subject per insertion
+		if _, err := r.UpsertOAuth(t.Context(), "google", subject, "x@x", "alice", ""); err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+	}
+	// 51st upsert must run out of slug space and return the sentinel error.
+	_, err := r.UpsertOAuth(t.Context(), "google", "exhausted-subject", "x@x", "alice", "")
+	if err == nil {
+		t.Fatal("expected slug-exhaustion error")
+	}
+	if !strings.Contains(err.Error(), "slug exhausted") {
+		t.Fatalf("expected 'slug exhausted', got %v", err)
+	}
+}
