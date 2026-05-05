@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"local/art-web/api/internal/dbtest"
+	imageservice "local/art-web/api/internal/image/service"
+	infratest "local/art-web/api/internal/infrastructure/testing"
 	"local/art-web/api/internal/httpapi/contract"
-	"local/art-web/api/internal/image"
 )
 
 // fixedNow is the deterministic clock for every contract test.
@@ -72,9 +72,9 @@ var noRedirectClient = &http.Client{
 }
 
 func bootContract(t *testing.T) (string, seedResponse, func(c contractCase) *http.Response) {
-	srv := dbtest.BootApp(t, dbtest.BootOpts{
+	srv := infratest.BootApp(t, infratest.BootOpts{
 		FixedNow:   fixedNow,
-		IDProvider: &image.CounterIDProvider{},
+		IDProvider: &imageservice.CounterIDProvider{},
 		RandReader: fixedRand{},
 		Providers:  contract.FakeProviders(),
 	})
@@ -292,7 +292,7 @@ func TestContractMatrix(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			resp := send(c)
 			defer resp.Body.Close()
-			dbtest.AssertGolden(t, c.name, resp)
+			infratest.AssertGolden(t, c.name, resp)
 		})
 	}
 }

@@ -11,13 +11,20 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	"local/art-web/api/internal/artwork"
-	"local/art-web/api/internal/auth"
-	"local/art-web/api/internal/db"
-	"local/art-web/api/internal/httpapi"
-	"local/art-web/api/internal/image"
-	"local/art-web/api/internal/storage"
-	"local/art-web/api/internal/user"
+	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
+	artworkservice "local/art-web/api/internal/artwork/service"
+	authhttp "local/art-web/api/internal/auth/adapters/http"
+	authoauth "local/art-web/api/internal/auth/adapters/oauth"
+	authports "local/art-web/api/internal/auth/ports"
+	authservice "local/art-web/api/internal/auth/service"
+	imagehttp "local/art-web/api/internal/image/adapters/http"
+	imagepostgres "local/art-web/api/internal/image/adapters/postgres"
+	imageservice "local/art-web/api/internal/image/service"
+	"local/art-web/api/internal/infrastructure/database"
+	"local/art-web/api/internal/infrastructure/server"
+	infrastorage "local/art-web/api/internal/infrastructure/storage"
+	userpostgres "local/art-web/api/internal/user/adapters/postgres"
+	"local/art-web/api/pkg/signing"
 )
 
 func main() {
@@ -25,23 +32,23 @@ func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	ctx := context.Background()
 
-	if err := db.MigrateUp(ctx, cfg.DatabaseURL); err != nil {
+	if err := database.MigrateUp(ctx, cfg.DatabaseURL); err != nil {
 		log.Error("migrate", "err", err)
 		os.Exit(1)
 	}
-	pool, err := db.New(ctx, cfg.DatabaseURL)
+	pool, err := database.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		log.Error("db", "err", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
 
-	var store storage.Storage
+	var store infrastorage.Storage
 	switch {
 	case cfg.AppEnv == "dev":
-		store = storage.NewLocalFS("./var/storage")
+		store = infrastorage.NewLocalFS("./var/storage")
 	case cfg.AppEnv == "test" && cfg.S3Endpoint == "":
-		store = storage.NewLocalFS("./var/storage")
+		store = infrastorage.NewLocalFS("./var/storage")
 	default:
 		endpoint := cfg.S3Endpoint
 		if endpoint == "" {
@@ -54,36 +61,36 @@ func main() {
 			o.BaseEndpoint = aws.String(endpoint)
 			o.UsePathStyle = true
 		})
-		store = storage.NewR2(s3cli, cfg.R2Bucket)
+		store = infrastorage.NewR2(s3cli, cfg.R2Bucket)
 	}
 
 	signKey := mustDecodeHexKey("WORKER_SIGNING_KEY", cfg.WorkerSigningKey)
 	jwtKey := mustDecodeHexKey("JWT_SIGNING_KEY", cfg.JWTSigningKey)
 
-	jwts := auth.NewJWT(jwtKey, time.Now)
-	urls := auth.NewURLBuilder(cfg.CDNOrigin, signKey, time.Now)
+	jwts := authservice.NewJWT(jwtKey, time.Now)
+	urls := signing.NewURLBuilder(cfg.CDNOrigin, signKey, time.Now)
 
-	users := user.NewRepo(pool)
-	arts := artwork.NewRepo(pool)
-	tags := artwork.NewTagsRepo(pool)
-	images := image.NewRepo(pool)
-	imgSvc := image.NewService(store, images, arts)
-	upload := image.NewHandler(imgSvc, arts, urls)
-	vis := artwork.NewVisibilityService(arts, store)
+	users := userpostgres.NewRepo(pool)
+	arts := artworkpostgres.NewRepo(pool)
+	tags := artworkpostgres.NewTagsRepo(pool)
+	images := imagepostgres.NewRepo(pool)
+	imgSvc := imageservice.NewService(store, images, arts)
+	upload := imagehttp.NewHandler(imgSvc, arts, urls)
+	vis := artworkservice.NewVisibilityService(arts, store)
 
-	artwork.RollbackLog = func(err error) { log.Error("flip rollback", "err", err) }
+	artworkservice.RollbackLog = func(err error) { log.Error("flip rollback", "err", err) }
 
-	r := httpapi.New(&httpapi.Deps{
+	r := server.New(&server.Deps{
 		AppEnv: cfg.AppEnv,
 		JWT:    jwts, URL: urls,
-		Providers: map[string]auth.Provider{
-			"google": auth.NewGoogleProvider(cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.GoogleRedirectURL),
+		Providers: map[string]authports.Provider{
+			"google": authoauth.NewGoogleProvider(cfg.GoogleClientID, cfg.GoogleClientSecret, cfg.GoogleRedirectURL),
 		},
 		Users: users, Artworks: arts, Tags: tags, Images: images, Store: store,
 		Upload: upload, Vis: vis,
 		Frontend:      cfg.FrontendURL,
 		AllowedOrigin: cfg.AllowedOrigin,
-		CookieOpts: auth.CookieOpts{
+		CookieOpts: authhttp.CookieOpts{
 			Domain: cfg.CookieDomain,
 			Secure: secureCookieForEnv(cfg.AppEnv),
 		},
