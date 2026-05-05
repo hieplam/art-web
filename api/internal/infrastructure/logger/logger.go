@@ -10,8 +10,14 @@ import (
 	"local/art-web/api/internal/infrastructure/config"
 )
 
-// New returns a configured zerolog.Logger. Production callers use this; tests
-// inject their own via the Wire test ProviderSet.
+// New returns a configured zerolog.Logger and mutates two zerolog globals:
+// it calls zerolog.SetGlobalLevel and assigns log.Logger so any third-party
+// code that uses zerolog/log directly picks up the same level + sink.
+//
+// Call once at startup. Calling from tests permanently mutates global state
+// for any concurrent or subsequent tests in the same process; tests that
+// need a custom logger should construct a zerolog.Logger directly rather
+// than going through this function.
 func New(cfg config.LoggerConfig) zerolog.Logger {
 	level, err := zerolog.ParseLevel(cfg.Level)
 	if err != nil {

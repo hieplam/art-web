@@ -3,6 +3,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 )
@@ -65,11 +66,11 @@ func Load() (*AppConfig, error) {
 		},
 		Database: DatabaseConfig{URL: os.Getenv("DATABASE_URL")},
 		Auth: AuthConfig{
-			JWTKey:  os.Getenv("JWT_KEY"),
-			SignKey: os.Getenv("URL_SIGN_KEY"),
+			JWTKey:  os.Getenv("JWT_SIGNING_KEY"),
+			SignKey: os.Getenv("WORKER_SIGNING_KEY"),
 			Cookie: CookieConfig{
 				Domain: getenv("COOKIE_DOMAIN", ""),
-				Secure: getenv("COOKIE_SECURE", "true") == "true",
+				Secure: parseBoolEnv("COOKIE_SECURE", true),
 			},
 		},
 		Storage: StorageConfig{
@@ -84,7 +85,10 @@ func Load() (*AppConfig, error) {
 		return nil, errors.New("DATABASE_URL is required")
 	}
 	if cfg.Auth.JWTKey == "" || cfg.Auth.SignKey == "" {
-		return nil, errors.New("JWT_KEY and URL_SIGN_KEY are required")
+		return nil, errors.New("JWT_SIGNING_KEY and WORKER_SIGNING_KEY are required")
+	}
+	if cfg.Server.Port <= 0 || cfg.Server.Port > 65535 {
+		return nil, fmt.Errorf("PORT must be a valid port number 1-65535 (got %q)", getenv("PORT", "8787"))
 	}
 	return cfg, nil
 }
@@ -99,4 +103,20 @@ func getenv(k, fallback string) string {
 func atoi(s string) int {
 	n, _ := strconv.Atoi(s)
 	return n
+}
+
+// parseBoolEnv reads a boolean env var via strconv.ParseBool (accepts
+// "1"/"true"/"TRUE"/"t"/"T" and their false equivalents) and falls back
+// to defaultValue on missing or unparseable input. Fail-safe: unparseable
+// values fall back to the default rather than silently flipping to false.
+func parseBoolEnv(k string, defaultValue bool) bool {
+	v := os.Getenv(k)
+	if v == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
 }

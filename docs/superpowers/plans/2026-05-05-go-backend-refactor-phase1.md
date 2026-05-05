@@ -423,6 +423,26 @@ The diff is enormous (every file in `api/internal/` either moves or has an impor
 
 **Goal:** Add the four `internal/infrastructure/` packages that exist purely as new code: `config`, `database` (cleanup of the old db package), `logger` (zerolog scaffolding — actual swap is Task 5), `server` (cleanup of the moved httpapi pieces). Each package gets its `providers.go` skeleton ready for Task 4 (Wire).
 
+> **Note (revised after Task 3 review):** Step 1's `Load()` template below shows
+> `JWT_KEY`/`URL_SIGN_KEY` and a `getenv("COOKIE_SECURE", "true") == "true"`
+> boolean parse. Both are wrong:
+> - **Env var names** must match the existing stack (`cmd/api/config.go`):
+>   `JWT_SIGNING_KEY` and `WORKER_SIGNING_KEY`. The plan-template typo would
+>   silently fail required-field validation in any environment provisioned
+>   with the existing names.
+> - **Boolean parse** must use `strconv.ParseBool` (accepts `"1"`/`"true"`/`"TRUE"`/etc.)
+>   with a fail-safe default rather than literal `== "true"`. The literal
+>   compare silently flips to `false` for `COOKIE_SECURE=TRUE` or `=1`,
+>   which would disable secure cookies in production with no diagnostic.
+> - **`PORT` validation:** `atoi` returns 0 silently on bad input, so
+>   `PORT=abc` would have the server bind to `:0` (random ephemeral). Add
+>   `if cfg.Server.Port <= 0 || cfg.Server.Port > 65535 { return error }`.
+>
+> The actual implementation (commit `eec7c8f` + follow-up review fix) uses
+> the corrected names, `parseBoolEnv` helper with `strconv.ParseBool`, and
+> port range validation. Future re-runs of this task should follow the
+> shipped code, not the template below.
+
 **Files:**
 - Create: `api/internal/infrastructure/config/config.go`
 - Create: `api/internal/infrastructure/config/providers.go`
