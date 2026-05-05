@@ -10,7 +10,6 @@ on:
 jobs:
   contract_suite:
     runs-on: ubuntu-latest
-    if: false   # disabled until PR 0.8 captures goldens
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

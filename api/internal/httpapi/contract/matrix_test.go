@@ -243,7 +243,11 @@ func TestContractMatrix(t *testing.T) {
 				_ = mw.Close()
 				return buf, mw.FormDataContentType()
 			}},
-		{name: "upload_owner_201", method: "POST", path: "/artworks/" + seed.QID + "/images", viewer: "owner",
+		// The minimal seedPNGBytes is decoded by image/png but the blurhash step
+		// rejects 1x1 grayscale+alpha → 422 decode_failed. Happy-path 201 is
+		// already locked by image/handler_test.go (which uses testdata/sample.jpg).
+		// This cell pins the contract bytes for the decode-failed path.
+		{name: "upload_owner_decode_failed_422", method: "POST", path: "/artworks/" + seed.QID + "/images", viewer: "owner",
 			bodyMP: validImageUpload("K-new", 1)},
 
 		// === /users/{slug} ===

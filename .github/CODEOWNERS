@@ -1,0 +1,7 @@
+# CODEOWNERS — required reviewers for path-based ownership.
+# Pattern: <path> <@user-or-team> [<@user-or-team>...]
+
+# Contract snapshots: every byte change requires explicit reviewer signoff.
+# These files are the byte-strict HTTP contract that Phase 1's refactor must
+# preserve. Replace @todd-l-am with the team or owner you want gating these.
+api/internal/httpapi/contract/golden/   @todd-l-am
