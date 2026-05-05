@@ -251,17 +251,39 @@ git mv internal/image/repo_internal_test.go internal/image/adapters/postgres/rep
 
 Update packages accordingly.
 
-- [ ] **Step 7: Move httpapi → per-slice handlers + infrastructure/server.**
+- [ ] **Step 7: Move httpapi → infrastructure/server. Slice handlers stay put for now (revised — see note below).**
 
 ```bash
 git mv internal/httpapi/router.go internal/infrastructure/server/router.go
 git mv internal/httpapi/render.go internal/infrastructure/server/respond.go
 git mv internal/httpapi/middleware.go internal/infrastructure/server/middleware.go
-git mv internal/httpapi/artworks.go internal/artwork/adapters/http/handlers.go
-git mv internal/httpapi/users.go internal/user/adapters/http/handlers.go
-git mv internal/httpapi/tags.go internal/artwork/adapters/http/tag_handlers.go
-git mv internal/httpapi/devseed.go cmd/seeder/main.go
+git mv internal/httpapi/artworks.go internal/infrastructure/server/artworks.go
+git mv internal/httpapi/artworks_test.go internal/infrastructure/server/artworks_test.go
+git mv internal/httpapi/users.go internal/infrastructure/server/users.go
+git mv internal/httpapi/tags.go internal/infrastructure/server/tags.go
+git mv internal/httpapi/devseed.go internal/infrastructure/server/devseed.go
 ```
+
+> **Note (revised after Task 2 review):** The earlier draft of this step said
+> to move `artworks.go`/`users.go`/`tags.go` into `<slice>/adapters/http/` and
+> `devseed.go` into `cmd/seeder/main.go`. That instruction was wrong for a
+> layout-only commit. The handlers in those files are factory functions
+> taking `*server.Deps` directly (e.g., `func meHandler(d *Deps) http.Handler`),
+> so a peer slice package (`internal/artwork/adapters/http/`) cannot import
+> them without either (a) defining per-slice deps structs or (b) converting
+> handlers to accept narrow interfaces. Both changes are architectural —
+> they belong in **Task 4 (Wire ProviderSets)** and **Task 7 (ports)**.
+> Forcing the move during Task 2 either breaks the build or smuggles
+> architectural changes into a "layout-only" commit, violating C1 + C4.
+>
+> Same reasoning for `devseed.go → cmd/seeder/main.go`: that requires
+> removing the HTTP shell, adding `func main()`, and wiring CLI flags —
+> exactly what **Task 10 (`feat: seeder`)** is for. Task 2 leaves
+> `devseed.go` at `infrastructure/server/devseed.go` as a `package server`
+> handler; Task 10 properly extracts it.
+>
+> The spec §4.1 target layout is reached **progressively** across Tasks 4,
+> 7, and 10 — not in commit 2.
 
 The httpapi tests in `internal/httpapi/` (testutil_test.go, privacy_matrix_test.go, error_codes_test.go, devseed_test.go, devseed_internal_test.go, me_test.go) are integration tests over the composed router. They need to find a new home — for now, move them all into `internal/infrastructure/server/`:
 
@@ -2318,7 +2340,7 @@ git commit -m "[phase1-hex-arch] feat: single WriteError boundary + validator tr
 
 ## Task 10 — `feat: seeder` (commit 10 of 11)
 
-**Goal:** Per spec §4.2, `internal/httpapi/devseed.go` (already moved to `cmd/seeder/main.go` in Task 2) becomes a standalone binary. The router drops `/dev/seed`. Tests that need seeding call the binary or its package-level functions directly.
+**Goal:** Per spec §4.2, `internal/infrastructure/server/devseed.go` (the file Task 2 deferred — see Task 2 Step 7 note) becomes a standalone binary at `cmd/seeder/main.go`. The router drops `/dev/seed`. Tests that need seeding call the binary or its package-level functions directly.
 
 **Files:**
 - Modify: `api/cmd/seeder/main.go` — turn from HTTP handler to standalone main with the same logic.
