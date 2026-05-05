@@ -5,6 +5,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/rs/zerolog"
 
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	artworkservice "local/art-web/api/internal/artwork/service"
@@ -33,6 +34,7 @@ type Deps struct {
 	Frontend      string
 	AllowedOrigin string
 	CookieOpts    authhttp.CookieOpts
+	Logger        zerolog.Logger
 }
 
 func New(d *Deps) chi.Router {

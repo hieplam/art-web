@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"os"
 	"time"
@@ -10,6 +9,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	artworkservice "local/art-web/api/internal/artwork/service"
@@ -29,16 +30,17 @@ import (
 
 func main() {
 	cfg := loadConfig()
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
+	log.Logger = logger
 	ctx := context.Background()
 
 	if err := database.MigrateUp(ctx, cfg.DatabaseURL); err != nil {
-		log.Error("migrate", "err", err)
+		log.Error().Err(err).Msg("migrate")
 		os.Exit(1)
 	}
 	pool, err := database.New(ctx, cfg.DatabaseURL)
 	if err != nil {
-		log.Error("db", "err", err)
+		log.Error().Err(err).Msg("db")
 		os.Exit(1)
 	}
 	defer pool.Close()
@@ -78,7 +80,7 @@ func main() {
 	upload := imagehttp.NewHandler(imgSvc, arts, urls)
 	vis := artworkservice.NewVisibilityService(arts, store)
 
-	artworkservice.RollbackLog = func(err error) { log.Error("flip rollback", "err", err) }
+	artworkservice.RollbackLog = func(err error) { log.Error().Err(err).Msg("flip rollback") }
 
 	r := server.New(&server.Deps{
 		AppEnv: cfg.AppEnv,
@@ -94,11 +96,12 @@ func main() {
 			Domain: cfg.CookieDomain,
 			Secure: secureCookieForEnv(cfg.AppEnv),
 		},
+		Logger: logger,
 	})
 
-	log.Info("listening", "addr", cfg.Addr)
+	log.Info().Str("addr", cfg.Addr).Msg("listening")
 	if err := http.ListenAndServe(cfg.Addr, r); err != nil {
-		log.Error("server", "err", err)
+		log.Error().Err(err).Msg("server")
 		os.Exit(1)
 	}
 }

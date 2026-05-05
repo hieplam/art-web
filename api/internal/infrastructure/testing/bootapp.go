@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	artworkservice "local/art-web/api/internal/artwork/service"
 	authhttp "local/art-web/api/internal/auth/adapters/http"
@@ -136,6 +138,7 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 		Frontend:      opts.Frontend,
 		AllowedOrigin: opts.AllowedOrigin,
 		CookieOpts:    authhttp.CookieOpts{Secure: false},
+		Logger:        zerolog.Nop(),
 	})
 
 	srv := httptest.NewServer(router)
