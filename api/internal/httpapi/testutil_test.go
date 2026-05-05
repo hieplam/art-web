@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -201,6 +202,29 @@ func (env *MatrixEnv) request(t *testing.T, viewer, method, path string) (string
 	env.router.ServeHTTP(rec, req)
 	body, _ := io.ReadAll(rec.Body)
 	return string(body), rec.Code
+}
+
+// requestWithJSONBody sends method+path with the given JSON body string,
+// authenticated by viewer. Returns body bytes and status. Used by tests that
+// need to send PATCH/POST without short-circuiting on bad_json.
+func (env *MatrixEnv) requestWithJSONBody(t *testing.T, viewer, method, path, body string) (string, int) {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	switch viewer {
+	case "owner":
+		req.AddCookie(&http.Cookie{Name: "auth", Value: env.ownerToken})
+	case "other":
+		req.AddCookie(&http.Cookie{Name: "auth", Value: env.otherToken})
+	case "anon":
+		// no cookie
+	default:
+		t.Fatalf("unknown viewer %q", viewer)
+	}
+	rec := httptest.NewRecorder()
+	env.router.ServeHTTP(rec, req)
+	b, _ := io.ReadAll(rec.Body)
+	return string(b), rec.Code
 }
 
 // randHexN returns a hex-encoded string of n random bytes.
