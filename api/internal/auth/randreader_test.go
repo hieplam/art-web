@@ -22,8 +22,11 @@ func TestSetStateRandForTest_SwapsAndRestores(t *testing.T) {
 		stub.bytes[i] = byte(i + 1)
 	}
 
-	// Swap and verify stateRand is now the stub.
+	// Swap and verify stateRand is now the stub. defer restore() so that
+	// any t.Fatal in the assertions below still restores the package-global
+	// stateRand — otherwise a fail leaks the stub into subsequent tests.
 	restore := SetStateRandForTest(stub)
+	defer restore()
 	if stateRand != stub {
 		t.Fatal("SetStateRandForTest did not install the stub")
 	}
