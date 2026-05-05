@@ -3,7 +3,6 @@ package auth
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -122,6 +121,6 @@ func LogoutHandler(cookieOpts CookieOpts) http.Handler {
 
 func randState() string {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
+	_, _ = readState(b)
 	return hex.EncodeToString(b)
 }

@@ -136,3 +136,29 @@ func TestDevSeed_NotMounted_When_AppEnv_NotTest(t *testing.T) {
 			rec.Code, rec.Body.String())
 	}
 }
+
+func TestDevSeed_FixedSuffix_ProducesDeterministicSlug(t *testing.T) {
+	deps := testDeps(t, "test") // helper from testutil_test.go
+	r := httpapi.New(deps)
+
+	req := httptest.NewRequest("POST", "/dev/seed?suffix=fixed1234", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status=%d want 200; body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp struct {
+		AliceSlug string `json:"aliceSlug"`
+		BobSlug   string `json:"bobSlug"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.AliceSlug != "alice-fixed1234" {
+		t.Fatalf("alice slug=%q want alice-fixed1234", resp.AliceSlug)
+	}
+	if resp.BobSlug != "bob-fixed1234" {
+		t.Fatalf("bob slug=%q want bob-fixed1234", resp.BobSlug)
+	}
+}

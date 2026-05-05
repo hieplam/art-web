@@ -70,7 +70,10 @@ func (h *DevSeed) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	suffix := devRandHex(4)
+	suffix := r.URL.Query().Get("suffix")
+	if suffix == "" {
+		suffix = devRandHex(4)
+	}
 	aliceSlug := "alice-" + suffix
 	bobSlug := "bob-" + suffix
 	aliceID, err := h.Users.UpsertOAuth(ctx, "test", "alice-"+suffix, "alice@test", aliceSlug, "")
