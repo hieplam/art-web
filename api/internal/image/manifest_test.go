@@ -38,3 +38,22 @@ func TestParseManifest_RejectsDuplicateClientID(t *testing.T) {
 		t.Fatal("expected dup-clientid reject")
 	}
 }
+
+func TestParseManifest_RejectsInvalidJSON(t *testing.T) {
+	if _, err := image.ParseManifest(strings.NewReader(`not json`)); err == nil {
+		t.Fatal("expected JSON decode error")
+	}
+}
+
+func TestParseManifest_RejectsEmptyArray(t *testing.T) {
+	if _, err := image.ParseManifest(strings.NewReader(`[]`)); err == nil {
+		t.Fatal("expected empty manifest error")
+	}
+}
+
+func TestParseManifest_RejectsMissingClientImageID(t *testing.T) {
+	js := `[{"position":0,"content_type":"image/jpeg"}]`
+	if _, err := image.ParseManifest(strings.NewReader(js)); err == nil {
+		t.Fatal("expected missing client_image_id error")
+	}
+}

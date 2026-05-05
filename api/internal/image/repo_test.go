@@ -2,6 +2,7 @@ package image_test
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"local/art-web/api/internal/artwork"
@@ -74,5 +75,41 @@ func TestCase18_PositionCollision_RejectedAs412(t *testing.T) {
 	}
 	if _, err := repo.Insert(t.Context(), b); err != image.ErrPositionTaken {
 		t.Fatalf("expected ErrPositionTaken, got %v", err)
+	}
+}
+
+func TestListByArtwork_ReturnsImagesInPositionOrder(t *testing.T) {
+	repo, aid := setup(t)
+	ctx := context.Background()
+
+	// Insert 3 images at positions 2, 0, 1 to verify ordering.
+	for _, p := range []int{2, 0, 1} {
+		_, err := repo.Insert(ctx, image.InsertInput{
+			ArtworkID:     aid,
+			ClientImageID: fmt.Sprintf("CID-%d", p),
+			ContentType:   "image/jpeg",
+			StorageKey:    fmt.Sprintf("private/%s/%d.jpg", aid, p),
+			SourceSHA256:  fmt.Sprintf("sha-%d", p),
+			Width:         1, Height: 1, ByteSize: 10,
+			Position: p,
+			Blurhash: "",
+		})
+		if err != nil {
+			t.Fatalf("insert position %d: %v", p, err)
+		}
+	}
+
+	got, err := repo.ListByArtwork(ctx, aid)
+	if err != nil {
+		t.Fatalf("ListByArtwork: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 images, got %d", len(got))
+	}
+	// Verify position order: 0, 1, 2.
+	for i, im := range got {
+		if im.Position != i {
+			t.Fatalf("image[%d].Position = %d, want %d", i, im.Position, i)
+		}
 	}
 }

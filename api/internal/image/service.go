@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/google/uuid"
-
 	"local/art-web/api/internal/artwork"
 	"local/art-web/api/internal/storage"
 )
@@ -21,14 +19,32 @@ var mimeForFormat = map[string]string{
 	"png":  "image/png",
 }
 
+// imageRepo is a narrow seam for service-level tests. *Repo satisfies it; this
+// interface is not exported.
+//
+// IMPORTANT: signatures must match repo.go exactly. Insert returns
+// (*InsertResult, error) — pointer to InsertResult — and FindByClientImageID
+// returns nil (not the zero value) when the row is missing.
+type imageRepo interface {
+	FindByClientImageID(ctx context.Context, artworkID, clientImageID string) (*InsertedImage, error)
+	Insert(ctx context.Context, in InsertInput) (*InsertResult, error)
+}
+
 type Service struct {
 	store    storage.Storage
-	images   *Repo
+	images   imageRepo
 	artworks *artwork.Repo
+	ids      IDProvider
 }
 
 func NewService(s storage.Storage, im *Repo, a *artwork.Repo) *Service {
-	return &Service{store: s, images: im, artworks: a}
+	return &Service{store: s, images: im, artworks: a, ids: NewUUIDProvider()}
+}
+
+// NewServiceWithIDs is the test-mode constructor. The contract suite passes a
+// deterministic *CounterIDProvider here. Production uses NewService.
+func NewServiceWithIDs(s storage.Storage, im *Repo, a *artwork.Repo, ids IDProvider) *Service {
+	return &Service{store: s, images: im, artworks: a, ids: ids}
 }
 
 const MaxBytes = 25 * 1024 * 1024
@@ -81,7 +97,7 @@ func (s *Service) UploadOne(ctx context.Context, art *artwork.Artwork, in Upload
 		return nil, ErrContentTypeMismatch
 	}
 
-	imgID := uuid.NewString()
+	imgID := s.ids.NewID()
 	ext, _ := ExtFor(in.Manifest.ContentType)
 	key := fmt.Sprintf("%s/%s/%s.%s", art.Visibility, art.ID, imgID, ext)
 
