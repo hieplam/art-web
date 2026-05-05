@@ -1,6 +1,7 @@
 package image
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -32,7 +33,9 @@ func TestUniqueConstraint_PgErrorReturnsConstraintName(t *testing.T) {
 
 func TestInsert_RejectsEmptySourceSHA256(t *testing.T) {
 	r := &Repo{pool: nil} // pool is never reached; the guard returns early.
-	_, err := r.Insert(nil, InsertInput{SourceSHA256: ""})
+	// context.TODO() instead of nil so staticcheck (SA1012) is happy; the
+	// guard returns before ctx is actually used.
+	_, err := r.Insert(context.TODO(), InsertInput{SourceSHA256: ""})
 	if err == nil || err.Error() != "SourceSHA256 is required" {
 		t.Fatalf("expected SourceSHA256 required error, got %v", err)
 	}
