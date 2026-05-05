@@ -40,6 +40,13 @@ type BootOpts struct {
 	// real 302 redirect (default empty map → unknown_provider 404, which would
 	// lock the wrong contract bytes — see Finding 4 of the round-1 review).
 	Providers map[string]auth.Provider
+
+	// IDProvider injects a deterministic image-ID source. nil → production default.
+	IDProvider image.IDProvider
+
+	// RandReader injects a deterministic random source for OAuth state cookies.
+	// nil → crypto/rand.Reader (production default).
+	RandReader auth.RandReader
 }
 
 // BootApp returns an *httptest.Server backed by the real httpapi.Deps stack
@@ -93,7 +100,14 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 	urls := auth.NewURLBuilder("http://localhost:8787", opts.SignKey, clock)
 	arts := artwork.NewRepo(pool)
 	images := image.NewRepo(pool)
-	imgSvc := image.NewService(store, images, arts)
+	if opts.RandReader != nil {
+		t.Cleanup(auth.SetStateRandForTest(opts.RandReader))
+	}
+	ids := opts.IDProvider
+	if ids == nil {
+		ids = image.NewUUIDProvider()
+	}
+	imgSvc := image.NewServiceWithIDs(store, images, arts, ids)
 	upload := image.NewHandler(imgSvc, arts, urls)
 	vis := artwork.NewVisibilityService(arts, store)
 
