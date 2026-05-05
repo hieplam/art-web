@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	artworkservice "local/art-web/api/internal/artwork/service"
@@ -144,6 +145,7 @@ func setupMatrixEnv(t *testing.T) *MatrixEnv {
 		Frontend:      "http://localhost:3000/",
 		AllowedOrigin: "http://localhost:3000",
 		CookieOpts:    authhttp.CookieOpts{Secure: false},
+		Logger:        zerolog.Nop(),
 	})
 
 	aliceTok, err := jwts.Issue(aliceID, time.Hour)
@@ -280,5 +282,6 @@ func testDeps(t *testing.T, appEnv string) *server.Deps {
 		Frontend:      "http://localhost:3000/",
 		AllowedOrigin: "http://localhost:3000",
 		CookieOpts:    authhttp.CookieOpts{Secure: false},
+		Logger:        zerolog.Nop(),
 	}
 }

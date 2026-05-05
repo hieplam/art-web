@@ -9,7 +9,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
@@ -21,7 +20,9 @@ import (
 	imagehttp "local/art-web/api/internal/image/adapters/http"
 	imagepostgres "local/art-web/api/internal/image/adapters/postgres"
 	imageservice "local/art-web/api/internal/image/service"
+	infraconfig "local/art-web/api/internal/infrastructure/config"
 	"local/art-web/api/internal/infrastructure/database"
+	infralogger "local/art-web/api/internal/infrastructure/logger"
 	"local/art-web/api/internal/infrastructure/server"
 	infrastorage "local/art-web/api/internal/infrastructure/storage"
 	userpostgres "local/art-web/api/internal/user/adapters/postgres"
@@ -30,8 +31,9 @@ import (
 
 func main() {
 	cfg := loadConfig()
-	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
-	log.Logger = logger
+	// infralogger.New writes to stderr and installs zerolog.SetGlobalLevel
+	// from LOG_LEVEL (defaulting to InfoLevel on missing/invalid values).
+	logger := infralogger.New(infraconfig.LoggerConfig{Level: os.Getenv("LOG_LEVEL")})
 	ctx := context.Background()
 
 	if err := database.MigrateUp(ctx, cfg.DatabaseURL); err != nil {

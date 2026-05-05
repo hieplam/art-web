@@ -34,7 +34,11 @@ type Deps struct {
 	Frontend      string
 	AllowedOrigin string
 	CookieOpts    authhttp.CookieOpts
-	Logger        zerolog.Logger
+	// Logger is the request-scoped/composition logger for handlers and
+	// middleware. Tests should pass zerolog.Nop() to avoid mutating
+	// process-global state. Distinct from the zerolog/log package's
+	// global log.Logger that main.go uses for startup/shutdown lines.
+	Logger zerolog.Logger
 }
 
 func New(d *Deps) chi.Router {
