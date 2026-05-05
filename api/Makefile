@@ -73,5 +73,7 @@ wire-verify:
 	git diff --exit-code cmd/api/wire_gen.go
 
 # Regenerate ports/<slice>/mocks via mockery v3.
+# NOTE: .mockery.yaml lands in Task 7; running this target before then
+# fails immediately with a config-not-found error from mockery.
 mocks:
 	go run github.com/vektra/mockery/v3@latest --config .mockery.yaml

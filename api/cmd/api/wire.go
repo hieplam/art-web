@@ -32,6 +32,10 @@ func InitializeApp(ctx context.Context) (*App, func(), error) {
 	wire.Build(
 		infraconfig.ProviderSet,
 		logger.ProviderSet,
+		// database.ProviderSet provides NewGormDB + NewTransactor; the
+		// transactor is currently unconsumed (no field on App, no downstream
+		// dep), so Wire elides it from wire_gen.go. Repos in Task 7 will
+		// activate it.
 		database.ProviderSet,
 		// later: storage.ProviderSet, auth.ProviderSet, user.ProviderSet,
 		//        artwork.ProviderSet, image.ProviderSet, server.ProviderSet,
