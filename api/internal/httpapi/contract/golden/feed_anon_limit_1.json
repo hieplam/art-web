@@ -1,0 +1,12 @@
+{
+  "body": "{\"items\":[{\"artist\":{\"avatar_url\":null,\"display_name\":\"alice-fixed1234\",\"id\":\"<UUID>\",\"slug\":\"alice-fixed1234\"},\"cover\":{\"blurhash\":\"LA8y*ixv}9-7EJrpEeS$BWOZNxNG\",\"height\":1168,\"id\":\"<UUID>\",\"position\":0,\"url\":\"http://localhost:8787/img/public/<UUID>/<UUID>.jpg\",\"width\":784},\"created_at\":\"<TIMESTAMP>\",\"id\":\"<UUID>\",\"published_at\":\"<TIMESTAMP>\",\"title\":\"Public P\",\"visibility\":\"public\"}],\"next_cursor\":null}\n",
+  "headers": {
+    "Cache-Control": [
+      "public, max-age=60"
+    ],
+    "Content-Type": [
+      "application/json; charset=utf-8"
+    ]
+  },
+  "status": 200
+}

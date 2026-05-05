@@ -1,0 +1,12 @@
+{
+  "body": "{\"error\":\"unauthorized\"}",
+  "headers": {
+    "Cache-Control": [
+      "private, no-store"
+    ],
+    "Content-Type": [
+      "application/json; charset=utf-8"
+    ]
+  },
+  "status": 401
+}

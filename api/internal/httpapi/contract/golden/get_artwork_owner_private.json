@@ -1,0 +1,12 @@
+{
+  "body": "{\"artist\":{\"avatar_url\":null,\"display_name\":\"alice-fixed1234\",\"id\":\"<UUID>\",\"slug\":\"alice-fixed1234\"},\"cover\":{\"blurhash\":\"LmH?}cSMjao1|wo1S3a|S3sUSMWp\",\"height\":1248,\"id\":\"<UUID>\",\"position\":0,\"url\":\"http://localhost:8787/img/private/<UUID>/<UUID>.jpg?sig=<SIG>&exp=<EXP>\",\"width\":832},\"created_at\":\"<TIMESTAMP>\",\"description\":\"Seeded private artwork Q\",\"id\":\"<UUID>\",\"images\":[{\"blurhash\":\"LmH?}cSMjao1|wo1S3a|S3sUSMWp\",\"height\":1248,\"id\":\"<UUID>\",\"position\":0,\"url\":\"http://localhost:8787/img/private/<UUID>/<UUID>.jpg?sig=<SIG>&exp=<EXP>\",\"width\":832}],\"published_at\":null,\"tags\":[\"t\"],\"title\":\"Private Q\",\"visibility\":\"private\"}\n",
+  "headers": {
+    "Cache-Control": [
+      "private, no-store"
+    ],
+    "Content-Type": [
+      "application/json; charset=utf-8"
+    ]
+  },
+  "status": 200
+}

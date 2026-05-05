@@ -44,6 +44,20 @@ func TestNormalize_ReplacesHMACSignedURLSuffix(t *testing.T) {
 	}
 }
 
+// TestNormalize_ReplacesHMACSignedURLSuffix_JSONEscaped covers the form Go's
+// encoding/json actually produces for response bodies — `&` HTML-escaped to
+// the 6-char sequence &. Real golden bodies hit this path; the literal-`&`
+// test above exercises the alternate match.
+func TestNormalize_ReplacesHMACSignedURLSuffix_JSONEscaped(t *testing.T) {
+	// Raw string preserves the literal backslash-u-0026 sequence.
+	body := `{"url":"https://x/y.jpg?sig=deadbeefcafe1234&exp=1714823472"}`
+	got := dbtest.NormalizeBody([]byte(body))
+	want := `{"url":"https://x/y.jpg?sig=<SIG>&exp=<EXP>"}`
+	if string(got) != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
 func TestNormalize_ReplacesBase64Cursor(t *testing.T) {
 	// httpapi/artworks.go:54 builds cursors as base64.RawURLEncoding(timestamp|uuid).
 	// Reproduce the actual encoding so the test matches what the real handler emits.

@@ -1,0 +1,12 @@
+{
+  "body": "{\"error\":\"bad_cursor\",\"message\":\"bad_cursor: illegal base64 data at input byte 10\"}\n",
+  "headers": {
+    "Cache-Control": [
+      "private, no-store"
+    ],
+    "Content-Type": [
+      "application/json; charset=utf-8"
+    ]
+  },
+  "status": 400
+}

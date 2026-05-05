@@ -1,0 +1,12 @@
+{
+  "body": "{\"error\":\"exchange_failed\"}",
+  "headers": {
+    "Content-Type": [
+      "application/json; charset=utf-8"
+    ],
+    "Set-Cookie": [
+      "oauth_state=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+    ]
+  },
+  "status": 502
+}

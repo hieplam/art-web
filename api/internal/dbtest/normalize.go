@@ -16,7 +16,12 @@ var (
 	nextCursorRe = regexp.MustCompile(`"next_cursor":"[A-Za-z0-9_-]+"`)
 	uuidRe       = regexp.MustCompile(`[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
 	rfc3339Re    = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z`)
-	signedURLRe  = regexp.MustCompile(`\?sig=[0-9a-f]+&exp=\d+`)
+	// signedURLRe matches the URLBuilder.Private output: ?sig=<hex>&exp=<unix>.
+	// Real response bodies are emitted by Go's encoding/json with default HTML
+	// escaping, which writes `&` as `&` in JSON string values. The regex
+	// matches both forms so the rule fires whether the body bytes hold literal
+	// `&` or the escaped sequence.
+	signedURLRe  = regexp.MustCompile(`\?sig=[0-9a-f]+(?:&|\\u0026)exp=\d+`)
 	// cookieAuthRe is anchored with ^ so the rule ONLY rewrites the cookie's
 	// own name=value at the start of a Set-Cookie value, never an unrelated
 	// substring like `xauth=` or a Domain attribute that happens to contain

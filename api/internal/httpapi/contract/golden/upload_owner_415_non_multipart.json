@@ -1,0 +1,12 @@
+{
+  "body": "{\"error\":\"unsupported_media_type\"}\n",
+  "headers": {
+    "Cache-Control": [
+      "private, no-store"
+    ],
+    "Content-Type": [
+      "application/json; charset=utf-8"
+    ]
+  },
+  "status": 415
+}

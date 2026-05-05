@@ -1,0 +1,12 @@
+{
+  "body": "{\"error\":\"bad_json\"}\n",
+  "headers": {
+    "Cache-Control": [
+      "public, max-age=60"
+    ],
+    "Content-Type": [
+      "application/json; charset=utf-8"
+    ]
+  },
+  "status": 400
+}

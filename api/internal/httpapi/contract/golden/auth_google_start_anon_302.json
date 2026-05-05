@@ -1,0 +1,15 @@
+{
+  "body": "<a href=\"https://example.com/oauth2/auth?state=0102030405060708090a0b0c0d0e0f10\">Found</a>.\n\n",
+  "headers": {
+    "Content-Type": [
+      "text/html; charset=utf-8"
+    ],
+    "Location": [
+      "https://example.com/oauth2/auth?state=0102030405060708090a0b0c0d0e0f10"
+    ],
+    "Set-Cookie": [
+      "oauth_state=0102030405060708090a0b0c0d0e0f10; Path=/; Max-Age=600; HttpOnly; SameSite=Lax"
+    ]
+  },
+  "status": 302
+}

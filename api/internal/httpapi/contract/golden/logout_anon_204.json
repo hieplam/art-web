@@ -1,0 +1,9 @@
+{
+  "body": "",
+  "headers": {
+    "Set-Cookie": [
+      "auth=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+    ]
+  },
+  "status": 204
+}

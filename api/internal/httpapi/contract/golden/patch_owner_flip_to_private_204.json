@@ -1,0 +1,9 @@
+{
+  "body": "",
+  "headers": {
+    "Cache-Control": [
+      "private, no-store"
+    ]
+  },
+  "status": 204
+}

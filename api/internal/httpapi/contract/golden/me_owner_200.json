@@ -1,0 +1,12 @@
+{
+  "body": "{\"avatar_url\":null,\"display_name\":\"alice-fixed1234\",\"id\":\"<UUID>\",\"slug\":\"alice-fixed1234\"}\n",
+  "headers": {
+    "Cache-Control": [
+      "private, no-store"
+    ],
+    "Content-Type": [
+      "application/json; charset=utf-8"
+    ]
+  },
+  "status": 200
+}

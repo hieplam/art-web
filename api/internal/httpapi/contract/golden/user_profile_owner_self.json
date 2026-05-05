@@ -1,0 +1,12 @@
+{
+  "body": "{\"artworks\":[{\"artist\":{\"avatar_url\":null,\"display_name\":\"alice-fixed1234\",\"id\":\"<UUID>\",\"slug\":\"alice-fixed1234\"},\"cover\":{\"blurhash\":\"LmH?}cSMjao1|wo1S3a|S3sUSMWp\",\"height\":1248,\"id\":\"<UUID>\",\"position\":0,\"url\":\"http://localhost:8787/img/private/<UUID>/<UUID>.jpg?sig=<SIG>&exp=<EXP>\",\"width\":832},\"created_at\":\"<TIMESTAMP>\",\"id\":\"<UUID>\",\"published_at\":null,\"title\":\"t\",\"visibility\":\"private\"},{\"artist\":{\"avatar_url\":null,\"display_name\":\"alice-fixed1234\",\"id\":\"<UUID>\",\"slug\":\"alice-fixed1234\"},\"cover\":{\"blurhash\":\"LA8y*ixv}9-7EJrpEeS$BWOZNxNG\",\"height\":1168,\"id\":\"<UUID>\",\"position\":0,\"url\":\"http://localhost:8787/img/private/<UUID>/<UUID>.jpg?sig=<SIG>&exp=<EXP>\",\"width\":784},\"created_at\":\"<TIMESTAMP>\",\"id\":\"<UUID>\",\"published_at\":\"<TIMESTAMP>\",\"title\":\"renamed\",\"visibility\":\"private\"}],\"next_cursor\":null,\"user\":{\"avatar_url\":null,\"display_name\":\"alice-fixed1234\",\"id\":\"<UUID>\",\"slug\":\"alice-fixed1234\"}}\n",
+  "headers": {
+    "Cache-Control": [
+      "private, no-store"
+    ],
+    "Content-Type": [
+      "application/json; charset=utf-8"
+    ]
+  },
+  "status": 200
+}

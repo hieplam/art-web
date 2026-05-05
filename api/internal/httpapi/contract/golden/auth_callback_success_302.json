@@ -1,0 +1,16 @@
+{
+  "body": "<a href=\"http://localhost:3000/\">Found</a>.\n\n",
+  "headers": {
+    "Content-Type": [
+      "text/html; charset=utf-8"
+    ],
+    "Location": [
+      "http://localhost:3000/"
+    ],
+    "Set-Cookie": [
+      "auth=<JWT>; Path=/; Max-Age=604800; HttpOnly; SameSite=Lax",
+      "oauth_state=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+    ]
+  },
+  "status": 302
+}
