@@ -126,7 +126,7 @@ func setupMatrixEnv(t *testing.T) *MatrixEnv {
 	urls := signing.NewURLBuilder("http://localhost:8787", testSignKey, time.Now)
 
 	imgSvc := imageservice.NewService(store, images, arts)
-	upload := imagehttp.NewHandler(imgSvc, arts, urls)
+	upload := imagehttp.NewHandler(imgSvc, arts, urls, zerolog.Nop())
 	vis := artworkservice.NewVisibilityService(arts, store, nil)
 
 	router := buildTestRouter(buildOpts{
@@ -275,10 +275,11 @@ func buildTestRouter(o buildOpts) http.Handler {
 	})
 	authR := authhttp.NewRouter(authH)
 
-	userH := userhttp.NewHandler(o.users, o.arts, o.images, o.urls)
+	v := server.NewValidator()
+	userH := userhttp.NewHandler(o.users, o.arts, o.images, o.urls, zerolog.Nop())
 	userR := userhttp.NewRouter(userH)
 
-	artworkH := artworkhttp.NewHandler(o.arts, o.tags, o.users, o.images, o.vis, o.urls)
+	artworkH := artworkhttp.NewHandler(o.arts, o.tags, o.users, o.images, o.vis, o.urls, zerolog.Nop(), v)
 	artworkR := artworkhttp.NewRouter(artworkH, authMW)
 
 	imageR := imagehttp.NewRouter(o.upload, authMW)
@@ -323,7 +324,7 @@ func testDeps(t *testing.T, appEnv string) testBundle {
 	tags := artworkpostgres.NewTagsRepo(db)
 	images := imagepostgres.NewRepo(db)
 	imgSvc := imageservice.NewService(store, images, arts)
-	upload := imagehttp.NewHandler(imgSvc, arts, urls)
+	upload := imagehttp.NewHandler(imgSvc, arts, urls, zerolog.Nop())
 	vis := artworkservice.NewVisibilityService(arts, store, nil)
 
 	router := buildTestRouter(buildOpts{
@@ -342,6 +343,5 @@ func testDeps(t *testing.T, appEnv string) testBundle {
 		allowedOrigin: "http://localhost:3000",
 		cookieOpts:    authhttp.CookieOpts{Secure: false},
 	})
-	_ = zerolog.Nop()
 	return testBundle{router: router, JWT: jwts}
 }

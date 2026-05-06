@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/rs/zerolog"
 
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	authhttp "local/art-web/api/internal/auth/adapters/http"
@@ -85,7 +86,7 @@ func newHandler(t *testing.T, store infrastorage.Storage) (*chi.Mux, string, str
 	images := imagepostgres.NewRepo(db)
 	svc := imageservice.NewService(store, images, arts)
 	jwts := authservice.NewJWT([]byte("0123456789abcdef0123456789abcdef"), nil)
-	h := imagehttp.NewHandler(svc, arts, signing.NewURLBuilder("http://x", []byte("k"), nil))
+	h := imagehttp.NewHandler(svc, arts, signing.NewURLBuilder("http://x", []byte("k"), nil), zerolog.Nop())
 
 	r := chi.NewRouter()
 	r.Use(authhttp.ParseTokenMiddleware(jwts))

@@ -8,12 +8,14 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/rs/zerolog"
 
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	authhttp "local/art-web/api/internal/auth/adapters/http"
 	imagepostgres "local/art-web/api/internal/image/adapters/postgres"
 	imagedomain "local/art-web/api/internal/image/domain"
 	imageservice "local/art-web/api/internal/image/service"
+	"local/art-web/api/internal/infrastructure/httperr"
 	"local/art-web/api/pkg/signing"
 )
 
@@ -21,10 +23,11 @@ type Handler struct {
 	svc *imageservice.Service
 	art *artworkpostgres.Repo
 	url *signing.URLBuilder
+	log zerolog.Logger
 }
 
-func NewHandler(s *imageservice.Service, ar *artworkpostgres.Repo, u *signing.URLBuilder) *Handler {
-	return &Handler{svc: s, art: ar, url: u}
+func NewHandler(s *imageservice.Service, ar *artworkpostgres.Repo, u *signing.URLBuilder, log zerolog.Logger) *Handler {
+	return &Handler{svc: s, art: ar, url: u, log: log}
 }
 
 func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
@@ -71,31 +74,23 @@ func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 		}
 		out, err := h.svc.UploadOne(r.Context(), art, imageservice.UploadOne{Manifest: e, Body: f})
 		f.Close()
-		switch {
-		case errors.Is(err, imagepostgres.ErrFingerprintMismatch):
-			writeJSON(w, http.StatusConflict, map[string]string{
-				"error":   "fingerprint_mismatch",
-				"message": "client_image_id reused with different bytes",
-			})
-			return
-		case errors.Is(err, imagepostgres.ErrPositionTaken):
-			writeJSON(w, http.StatusPreconditionFailed, map[string]string{"error": "position_taken"})
-			return
-		case errors.Is(err, imageservice.ErrTooLarge):
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "too_large"})
-			return
-		case errors.Is(err, imageservice.ErrContentTypeMismatch):
-			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
-				"error":   "content_type_mismatch",
-				"message": "body does not match declared content_type",
-			})
-			return
-		case err != nil:
+		if err != nil {
+			// The decode: prefix check must happen before WriteError because
+			// WriteError has no decode_failed arm (the prefix is service-internal).
 			if strings.HasPrefix(err.Error(), "decode:") {
 				writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "decode_failed"})
 				return
 			}
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "upload_failed"})
+			// fingerprint_mismatch, position_taken, too_large, content_type_mismatch,
+			// and upload_failed all flow through WriteError.
+			if errors.Is(err, imagepostgres.ErrFingerprintMismatch) ||
+				errors.Is(err, imagepostgres.ErrPositionTaken) ||
+				errors.Is(err, imageservice.ErrTooLarge) ||
+				errors.Is(err, imageservice.ErrContentTypeMismatch) {
+				httperr.WriteError(w, h.log, err)
+				return
+			}
+			httperr.WriteError(w, h.log, err)
 			return
 		}
 		if !out.Existed {

@@ -17,6 +17,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/rs/zerolog"
+
 	artworkhttp "local/art-web/api/internal/artwork/adapters/http"
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	artworkservice "local/art-web/api/internal/artwork/service"
@@ -24,6 +26,7 @@ import (
 	authservice "local/art-web/api/internal/auth/service"
 	imagepostgres "local/art-web/api/internal/image/adapters/postgres"
 	"local/art-web/api/internal/infrastructure/database"
+	"local/art-web/api/internal/infrastructure/server"
 	infrastorage "local/art-web/api/internal/infrastructure/storage"
 	infratest "local/art-web/api/internal/infrastructure/testing"
 	userpostgres "local/art-web/api/internal/user/adapters/postgres"
@@ -105,7 +108,7 @@ func newIntEnv(t *testing.T) *intEnv {
 	}
 
 	mw := authhttp.NewMiddleware(jwts)
-	h := artworkhttp.NewHandler(arts, tags, users, images, vis, urls)
+	h := artworkhttp.NewHandler(arts, tags, users, images, vis, urls, zerolog.Nop(), server.NewValidator())
 	router := artworkhttp.NewRouter(h, mw)
 
 	r := chi.NewRouter()

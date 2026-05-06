@@ -82,9 +82,10 @@ func main() {
 	tags := artworkpostgres.NewTagsRepo(db)
 	images := imagepostgres.NewRepo(db)
 	imgSvc := imageservice.NewService(store, images, arts)
-	upload := imagehttp.NewHandler(imgSvc, arts, urls)
+	upload := imagehttp.NewHandler(imgSvc, arts, urls, logger)
 	rollbackReporter := artworklog.NewZerologReporter(logger)
 	vis := artworkservice.NewVisibilityService(arts, store, rollbackReporter)
+	v := server.NewValidator()
 
 	cookieOpts := authhttp.CookieOpts{
 		Domain: cfg.CookieDomain,
@@ -103,10 +104,10 @@ func main() {
 	})
 	authR := authhttp.NewRouter(authH)
 
-	userH := userhttp.NewHandler(users, arts, images, urls)
+	userH := userhttp.NewHandler(users, arts, images, urls, logger)
 	userR := userhttp.NewRouter(userH)
 
-	artworkH := artworkhttp.NewHandler(arts, tags, users, images, vis, urls)
+	artworkH := artworkhttp.NewHandler(arts, tags, users, images, vis, urls, logger, v)
 	artworkR := artworkhttp.NewRouter(artworkH, authMW)
 
 	imageR := imagehttp.NewRouter(upload, authMW)

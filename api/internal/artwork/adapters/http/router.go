@@ -11,11 +11,14 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-playground/validator/v10"
+	"github.com/rs/zerolog"
 
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	artworkservice "local/art-web/api/internal/artwork/service"
 	authhttp "local/art-web/api/internal/auth/adapters/http"
 	imagepostgres "local/art-web/api/internal/image/adapters/postgres"
+	"local/art-web/api/internal/infrastructure/httperr"
 	"local/art-web/api/internal/infrastructure/httputil"
 	userpostgres "local/art-web/api/internal/user/adapters/postgres"
 	"local/art-web/api/pkg/signing"
@@ -25,12 +28,14 @@ import (
 // upload route (POST /artworks/{id}/images) lives in the image slice's Router
 // — this slice owns only the artwork-data routes plus the tag feed.
 type Handler struct {
-	artworks *artworkpostgres.Repo
-	tags     *artworkpostgres.TagsRepo
-	users    *userpostgres.Repo
-	images   *imagepostgres.Repo
-	vis      *artworkservice.VisibilityService
-	url      *signing.URLBuilder
+	artworks  *artworkpostgres.Repo
+	tags      *artworkpostgres.TagsRepo
+	users     *userpostgres.Repo
+	images    *imagepostgres.Repo
+	vis       *artworkservice.VisibilityService
+	url       *signing.URLBuilder
+	log       zerolog.Logger
+	validator *validator.Validate
 }
 
 // NewHandler wires the artwork-CRUD HTTP handler.
@@ -41,14 +46,18 @@ func NewHandler(
 	images *imagepostgres.Repo,
 	vis *artworkservice.VisibilityService,
 	url *signing.URLBuilder,
+	log zerolog.Logger,
+	v *validator.Validate,
 ) *Handler {
 	return &Handler{
-		artworks: artworks,
-		tags:     tags,
-		users:    users,
-		images:   images,
-		vis:      vis,
-		url:      url,
+		artworks:  artworks,
+		tags:      tags,
+		users:     users,
+		images:    images,
+		vis:       vis,
+		url:       url,
+		log:       log,
+		validator: v,
 	}
 }
 
@@ -56,12 +65,12 @@ func NewHandler(
 func (h *Handler) ListFeed(w http.ResponseWriter, r *http.Request) {
 	cursor, err := httputil.ParseCursor(r)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_cursor", "message": err.Error()})
+		httperr.WriteError(w, h.log, httperr.WrapBadCursor(err))
 		return
 	}
 	page, err := h.artworks.PublicFeed(r.Context(), cursor, httputil.ParseLimit(r))
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "list_failed"})
+		httperr.WriteError(w, h.log, err)
 		return
 	}
 	h.renderFeed(w, r.Context(), page)
@@ -72,12 +81,12 @@ func (h *Handler) Tag(w http.ResponseWriter, r *http.Request) {
 	name := strings.ToLower(chi.URLParam(r, "name"))
 	cursor, err := httputil.ParseCursor(r)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_cursor", "message": err.Error()})
+		httperr.WriteError(w, h.log, httperr.WrapBadCursor(err))
 		return
 	}
 	page, err := h.artworks.ListByTag(r.Context(), name, cursor, httputil.ParseLimit(r))
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "list_failed"})
+		httperr.WriteError(w, h.log, err)
 		return
 	}
 	h.renderFeed(w, r.Context(), page)
@@ -94,12 +103,12 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	images, err := h.images.ListByArtwork(r.Context(), a.ID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "list_failed"})
+		httperr.WriteError(w, h.log, err)
 		return
 	}
 	artist, err := h.users.Get(r.Context(), a.UserID)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "user_failed"})
+		httperr.WriteError(w, h.log, err)
 		return
 	}
 	tags, _ := h.tags.GetTags(r.Context(), a.ID)
@@ -131,30 +140,25 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 // Create handles POST /artworks.
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	uid, _ := authhttp.UserIDFrom(r.Context())
-	var body struct {
-		Title       string   `json:"title"`
-		Description string   `json:"description"`
-		Visibility  string   `json:"visibility"`
-		Tags        []string `json:"tags"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_json"})
+	var req CreateArtworkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httperr.WriteError(w, h.log, httperr.ErrBadJSON)
 		return
 	}
-	if body.Visibility == "" {
-		body.Visibility = "private"
+	if req.Visibility == "" {
+		req.Visibility = "private"
 	}
-	if body.Visibility != "public" && body.Visibility != "private" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_visibility"})
+	if err := h.validator.Struct(&req); err != nil {
+		httperr.WriteError(w, h.log, err)
 		return
 	}
-	id, err := h.artworks.Create(r.Context(), uid, body.Title, body.Description, body.Visibility)
+	id, err := h.artworks.Create(r.Context(), uid, req.Title, req.Description, req.Visibility)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "create_failed"})
+		httperr.WriteError(w, h.log, err)
 		return
 	}
-	if len(body.Tags) > 0 {
-		_ = h.tags.SetTags(r.Context(), id, body.Tags)
+	if len(req.Tags) > 0 {
+		_ = h.tags.SetTags(r.Context(), id, req.Tags)
 	}
 	writeJSON(w, http.StatusCreated, map[string]string{"id": id})
 }
@@ -168,52 +172,42 @@ func (h *Handler) Patch(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
 		return
 	}
-	var body struct {
-		Title         *string  `json:"title,omitempty"`
-		Description   *string  `json:"description,omitempty"`
-		Visibility    *string  `json:"visibility,omitempty"`
-		CoverPosition *int     `json:"cover_position,omitempty"`
-		Tags          []string `json:"tags,omitempty"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_json"})
+	var req PatchArtworkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httperr.WriteError(w, h.log, httperr.ErrBadJSON)
 		return
 	}
-	if body.Title != nil {
-		if err := h.artworks.PatchTitle(r.Context(), id, *body.Title); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "patch_failed"})
+	if err := h.validator.Struct(&req); err != nil {
+		httperr.WriteError(w, h.log, err)
+		return
+	}
+	if req.Title != nil {
+		if err := h.artworks.PatchTitle(r.Context(), id, *req.Title); err != nil {
+			httperr.WriteError(w, h.log, err)
 			return
 		}
 	}
-	if body.Description != nil {
-		if err := h.artworks.PatchDescription(r.Context(), id, *body.Description); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "patch_failed"})
+	if req.Description != nil {
+		if err := h.artworks.PatchDescription(r.Context(), id, *req.Description); err != nil {
+			httperr.WriteError(w, h.log, err)
 			return
 		}
 	}
-	if body.CoverPosition != nil {
-		if *body.CoverPosition < 0 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_cover_position"})
-			return
-		}
-		if err := h.artworks.SetCoverPosition(r.Context(), id, *body.CoverPosition); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "patch_failed"})
+	if req.CoverPosition != nil {
+		if err := h.artworks.SetCoverPosition(r.Context(), id, *req.CoverPosition); err != nil {
+			httperr.WriteError(w, h.log, err)
 			return
 		}
 	}
-	if body.Visibility != nil {
-		if *body.Visibility != "public" && *body.Visibility != "private" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_visibility"})
-			return
-		}
-		if err := h.vis.Flip(r.Context(), id, *body.Visibility); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "flip_failed"})
+	if req.Visibility != nil {
+		if err := h.vis.Flip(r.Context(), id, *req.Visibility); err != nil {
+			httperr.WriteError(w, h.log, err)
 			return
 		}
 	}
-	if body.Tags != nil {
-		if err := h.tags.SetTags(r.Context(), id, body.Tags); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "tag_failed"})
+	if req.Tags != nil {
+		if err := h.tags.SetTags(r.Context(), id, req.Tags); err != nil {
+			httperr.WriteError(w, h.log, err)
 			return
 		}
 	}
@@ -231,7 +225,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 	// TODO post-v1: also purge R2 objects (currently leaks).
 	if err := h.artworks.Delete(r.Context(), id); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "delete_failed"})
+		httperr.WriteError(w, h.log, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

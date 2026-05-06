@@ -10,10 +10,12 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/rs/zerolog"
 
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	authhttp "local/art-web/api/internal/auth/adapters/http"
 	imagepostgres "local/art-web/api/internal/image/adapters/postgres"
+	"local/art-web/api/internal/infrastructure/httperr"
 	"local/art-web/api/internal/infrastructure/httputil"
 	userpostgres "local/art-web/api/internal/user/adapters/postgres"
 	"local/art-web/api/pkg/signing"
@@ -30,17 +32,18 @@ type Handler struct {
 	artworks *artworkpostgres.Repo
 	images   *imagepostgres.Repo
 	url      *signing.URLBuilder
+	log      zerolog.Logger
 }
 
-// NewHandler wires a user-profile handler. All four collaborators are
-// required.
+// NewHandler wires a user-profile handler. All collaborators are required.
 func NewHandler(
 	users *userpostgres.Repo,
 	artworks *artworkpostgres.Repo,
 	images *imagepostgres.Repo,
 	url *signing.URLBuilder,
+	log zerolog.Logger,
 ) *Handler {
-	return &Handler{users: users, artworks: artworks, images: images, url: url}
+	return &Handler{users: users, artworks: artworks, images: images, url: url, log: log}
 }
 
 // Profile handles GET /users/{slug}. Renders the slug owner's user object
@@ -50,18 +53,20 @@ func (h *Handler) Profile(w http.ResponseWriter, r *http.Request) {
 	viewer, _ := authhttp.UserIDFrom(r.Context())
 	profileUser, err := h.users.GetBySlug(r.Context(), slug)
 	if err != nil {
+		// GetBySlug returns raw GORM errors (not userdomain.ErrNotFound per repo contract).
+		// Per spec §7.2.1, any error from slug lookup is a 404 not_found.
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
 		return
 	}
 	isOwner := viewer == profileUser.ID
 	cursor, err := httputil.ParseCursor(r)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_cursor", "message": err.Error()})
+		httperr.WriteError(w, h.log, httperr.WrapBadCursor(err))
 		return
 	}
 	page, err := h.artworks.ListByUser(r.Context(), profileUser.ID, isOwner, cursor, httputil.ParseLimit(r))
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "list_failed"})
+		httperr.WriteError(w, h.log, err)
 		return
 	}
 	items := make([]any, 0, len(page.Items))

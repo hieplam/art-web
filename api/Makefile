@@ -1,4 +1,4 @@
-.PHONY: help tidy build test test-race lint test-contract test-cover test-cover-slices test-cover-html test-all
+.PHONY: help tidy build test test-race lint test-contract test-cover test-cover-slices test-cover-html test-all json-field-order
 
 # Default target — `make` with no args lists every target.
 help:
@@ -14,6 +14,7 @@ help:
 	@echo "  test-cover-html    full suite, opens HTML drill-down in browser"
 	@echo "  test-contract      run only the byte-strict HTTP contract suite"
 	@echo "  test-all           lint + test-race + coverage (full pre-merge check, slowest)"
+	@echo "  json-field-order   AST check: dto.go structs must have alphabetical JSON-tag field order"
 	@echo ""
 	@echo "Note: every test target needs Docker running (testcontainers Postgres + MinIO)."
 	@echo "First run boots containers cold (~10-30s); subsequent runs reuse via sync.Once."
@@ -60,6 +61,12 @@ test-all:
 	go test -race -coverprofile=/tmp/coverage.out ./...
 	@echo "---"
 	go tool cover -func=/tmp/coverage.out | tail -1
+
+# AST gate: every struct in every dto.go must have fields in alphabetical
+# JSON-tag order. Required because encoding/json marshals map keys
+# alphabetically; struct field order must match for byte-identical output.
+json-field-order:
+	go run ./internal/infrastructure/server/cmd/json_field_order
 
 .PHONY: wire wire-verify mocks
 

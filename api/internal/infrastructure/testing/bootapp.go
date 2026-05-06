@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	artworkhttp "local/art-web/api/internal/artwork/adapters/http"
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	artworkservice "local/art-web/api/internal/artwork/service"
@@ -113,8 +115,9 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 		ids = imageservice.NewUUIDProvider()
 	}
 	imgSvc := imageservice.NewServiceWithIDs(store, images, arts, ids)
-	upload := imagehttp.NewHandler(imgSvc, arts, urls)
+	upload := imagehttp.NewHandler(imgSvc, arts, urls, zerolog.Nop())
 	vis := artworkservice.NewVisibilityService(arts, store, nil)
+	v := server.NewValidator()
 
 	providers := opts.Providers
 	if providers == nil {
@@ -131,10 +134,10 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 	})
 	authR := authhttp.NewRouter(authH)
 
-	userH := userhttp.NewHandler(users, arts, images, urls)
+	userH := userhttp.NewHandler(users, arts, images, urls, zerolog.Nop())
 	userR := userhttp.NewRouter(userH)
 
-	artworkH := artworkhttp.NewHandler(arts, tags, users, images, vis, urls)
+	artworkH := artworkhttp.NewHandler(arts, tags, users, images, vis, urls, zerolog.Nop(), v)
 	artworkR := artworkhttp.NewRouter(artworkH, authMW)
 
 	imageR := imagehttp.NewRouter(upload, authMW)

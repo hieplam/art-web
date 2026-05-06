@@ -7,6 +7,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/go-playground/validator/v10"
+	"github.com/rs/zerolog"
+
 	artworkhttp "local/art-web/api/internal/artwork/adapters/http"
 	authhttp "local/art-web/api/internal/auth/adapters/http"
 	authservice "local/art-web/api/internal/auth/service"
@@ -16,7 +19,7 @@ import (
 // route the slice owns at the chi-router level. We don't invoke the handlers
 // (they need real collaborators) — we just walk the route table.
 func TestRouter_MountsAllArtworkRoutes(t *testing.T) {
-	h := artworkhttp.NewHandler(nil, nil, nil, nil, nil, nil)
+	h := artworkhttp.NewHandler(nil, nil, nil, nil, nil, nil, zerolog.Nop(), validator.New())
 	mw := authhttp.NewMiddleware(authservice.NewJWT([]byte("0123456789abcdef0123456789abcdef"), nil))
 	router := artworkhttp.NewRouter(h, mw)
 

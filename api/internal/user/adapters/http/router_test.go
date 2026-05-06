@@ -8,6 +8,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/rs/zerolog"
+
 	userhttp "local/art-web/api/internal/user/adapters/http"
 )
 
@@ -24,7 +26,7 @@ func TestRouter_RegistersUsersSlugRoute(t *testing.T) {
 	//
 	// chi exposes router.Routes() so we can inspect the route table without
 	// invoking handlers.
-	h := userhttp.NewHandler(nil, nil, nil, nil)
+	h := userhttp.NewHandler(nil, nil, nil, nil, zerolog.Nop())
 	router := userhttp.NewRouter(h)
 
 	r := chi.NewRouter()

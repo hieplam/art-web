@@ -7,6 +7,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/rs/zerolog"
+
 	authhttp "local/art-web/api/internal/auth/adapters/http"
 	authservice "local/art-web/api/internal/auth/service"
 	imagehttp "local/art-web/api/internal/image/adapters/http"
@@ -15,7 +17,7 @@ import (
 // TestRouter_MountsUploadRoute confirms the image Router registers
 // POST /artworks/{id}/images.
 func TestRouter_MountsUploadRoute(t *testing.T) {
-	h := imagehttp.NewHandler(nil, nil, nil)
+	h := imagehttp.NewHandler(nil, nil, nil, zerolog.Nop())
 	mw := authhttp.NewMiddleware(authservice.NewJWT([]byte("0123456789abcdef0123456789abcdef"), nil))
 	router := imagehttp.NewRouter(h, mw)
 

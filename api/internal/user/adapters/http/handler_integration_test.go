@@ -11,6 +11,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/rs/zerolog"
+
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
 	authhttp "local/art-web/api/internal/auth/adapters/http"
 	authservice "local/art-web/api/internal/auth/service"
@@ -79,7 +81,7 @@ func newIntEnv(t *testing.T) *intEnv {
 	urls := signing.NewURLBuilder("http://x", []byte("k"), nil)
 
 	mw := authhttp.NewMiddleware(jwts)
-	h := userhttp.NewHandler(users, arts, images, urls)
+	h := userhttp.NewHandler(users, arts, images, urls, zerolog.Nop())
 	router := userhttp.NewRouter(h)
 
 	r := chi.NewRouter()
