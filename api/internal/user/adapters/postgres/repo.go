@@ -109,7 +109,7 @@ func (r *Repo) UpsertOAuth(ctx context.Context, provider, subject, email, displa
 			}
 			return "", errors.New("oauth conflict but row not found on re-read")
 		default:
-			return "", err
+			return "", fmt.Errorf("user.UpsertOAuth: %w", err)
 		}
 	}
 	return "", errors.New("slug exhausted")
