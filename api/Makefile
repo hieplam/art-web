@@ -1,4 +1,4 @@
-.PHONY: help tidy build test test-race lint test-contract test-cover test-cover-slices test-cover-html test-all json-field-order
+.PHONY: help tidy build test test-race lint test-contract test-cover test-cover-slices test-cover-html test-all json-field-order banned-imports cover-threshold
 
 # Default target — `make` with no args lists every target.
 help:
@@ -15,6 +15,8 @@ help:
 	@echo "  test-contract      run only the byte-strict HTTP contract suite"
 	@echo "  test-all           lint + test-race + coverage (full pre-merge check, slowest)"
 	@echo "  json-field-order   AST check: dto.go structs must have alphabetical JSON-tag field order"
+	@echo "  banned-imports     AST check: domain has no internal imports; ports no framework; service no adapter"
+	@echo "  cover-threshold    fail if any slice (auth/user/artwork/image) drops below 80% coverage"
 	@echo ""
 	@echo "Note: every test target needs Docker running (testcontainers Postgres + MinIO)."
 	@echo "First run boots containers cold (~10-30s); subsequent runs reuse via sync.Once."
@@ -67,6 +69,27 @@ test-all:
 # alphabetically; struct field order must match for byte-identical output.
 json-field-order:
 	go run ./internal/infrastructure/server/cmd/json_field_order
+
+# AST gate: enforces hexagonal-architecture import boundaries (spec §10.1).
+#   domain  : no internal/* imports (pure)
+#   ports   : no framework imports (gorm/chi/jwt/validator/etc.)
+#   service : no slice-adapter imports (<slice>/adapters/...)
+banned-imports:
+	go run ./internal/infrastructure/server/cmd/banned_imports
+
+# Coverage gate (spec §10.1): each business slice must hit ≥80% statement
+# coverage. Reuses test-cover-slices' per-slice -coverpkg profile and parses
+# go tool cover's "total: ... %" line for a numeric comparison.
+cover-threshold:
+	@set -e ; \
+	threshold=80.0 ; \
+	for pkg in auth user artwork image; do \
+	  go test -coverpkg=./internal/$$pkg/... -coverprofile=/tmp/cov-$$pkg.out ./internal/$$pkg/... >/dev/null ; \
+	  pct=$$(go tool cover -func=/tmp/cov-$$pkg.out | awk '/^total:/{gsub("%","",$$3); print $$3}') ; \
+	  awk -v p="$$pct" -v t="$$threshold" 'BEGIN{ if (p+0 < t+0) exit 1 }' \
+	    && echo "  $$pkg: $$pct% OK" \
+	    || { echo "  $$pkg: $$pct% < $$threshold% FAIL" >&2 ; exit 1 ; } ; \
+	done
 
 .PHONY: wire wire-verify mocks
 
