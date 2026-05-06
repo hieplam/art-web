@@ -5,64 +5,62 @@ import (
 	"context"
 	"strings"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"gorm.io/gorm"
+
+	"local/art-web/api/internal/infrastructure/database"
 )
 
-type TagsRepo struct{ pool *pgxpool.Pool }
+// TagsRepo is the GORM-backed adapter for the tags / artwork_tags tables.
+type TagsRepo struct{ db *gorm.DB }
 
-func NewTagsRepo(p *pgxpool.Pool) *TagsRepo { return &TagsRepo{pool: p} }
+// NewTagsRepo constructs a tag repository against the root *gorm.DB. Like
+// the artwork repo, it resolves database.DB(ctx, r.db) inside each method so
+// callers may compose it under an outer Transactor (spec §7.6.1).
+func NewTagsRepo(db *gorm.DB) *TagsRepo { return &TagsRepo{db: db} }
 
 func (t *TagsRepo) SetTags(ctx context.Context, artworkID string, raw []string) error {
-	tx, err := t.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `DELETE FROM artwork_tags WHERE artwork_id = $1`, artworkID); err != nil {
-		return err
-	}
-	seen := map[string]bool{}
-	for _, r := range raw {
-		n := strings.ToLower(strings.TrimSpace(r))
-		if n == "" || seen[n] {
-			continue
-		}
-		seen[n] = true
-		var id string
-		err := tx.QueryRow(ctx, `
-			INSERT INTO tags (name) VALUES ($1)
-			ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-			RETURNING id`, n).Scan(&id)
-		if err != nil {
+	return database.DB(ctx, t.db).WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("artwork_id = ?", artworkID).
+			Delete(&artworkTagModel{}).Error; err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO artwork_tags (artwork_id, tag_id) VALUES ($1,$2)`,
-			artworkID, id); err != nil {
-			return err
+		seen := map[string]bool{}
+		for _, r := range raw {
+			n := strings.ToLower(strings.TrimSpace(r))
+			if n == "" || seen[n] {
+				continue
+			}
+			seen[n] = true
+			// ON CONFLICT (name) DO UPDATE … RETURNING id mirrors the legacy
+			// upsert. GORM doesn't expose that directly, so fall back to raw
+			// SQL — the trailing UPDATE is a no-op that lets RETURNING fire
+			// on existing rows the same way the pgx version did.
+			var id string
+			if err := tx.Raw(`
+				INSERT INTO tags (name) VALUES (?)
+				ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+				RETURNING id`, n).Scan(&id).Error; err != nil {
+				return err
+			}
+			if err := tx.Create(&artworkTagModel{ArtworkID: artworkID, TagID: id}).Error; err != nil {
+				return err
+			}
 		}
-	}
-	return tx.Commit(ctx)
+		return nil
+	})
 }
 
 func (t *TagsRepo) GetTags(ctx context.Context, artworkID string) ([]string, error) {
-	rows, err := t.pool.Query(ctx, `
-		SELECT t.name FROM tags t
-		JOIN artwork_tags atag ON atag.tag_id = t.id
-		WHERE atag.artwork_id = $1
-		ORDER BY t.name`, artworkID)
+	var names []string
+	err := database.DB(ctx, t.db).WithContext(ctx).
+		Table("tags AS t").
+		Select("t.name").
+		Joins("JOIN artwork_tags atag ON atag.tag_id = t.id").
+		Where("atag.artwork_id = ?", artworkID).
+		Order("t.name").
+		Scan(&names).Error
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var n string
-		_ = rows.Scan(&n)
-		out = append(out, n)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return names, nil
 }

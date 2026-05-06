@@ -32,11 +32,26 @@ func TestUniqueConstraint_PgErrorReturnsConstraintName(t *testing.T) {
 }
 
 func TestInsert_RejectsEmptySourceSHA256(t *testing.T) {
-	r := &Repo{pool: nil} // pool is never reached; the guard returns early.
-	// context.TODO() instead of nil so staticcheck (SA1012) is happy; the
-	// guard returns before ctx is actually used.
+	r := &Repo{db: nil} // db is never reached; the guard returns early.
 	_, err := r.Insert(context.TODO(), InsertInput{SourceSHA256: ""})
 	if err == nil || err.Error() != "SourceSHA256 is required" {
 		t.Fatalf("expected SourceSHA256 required error, got %v", err)
+	}
+}
+
+func TestToDomainImage_NilBlurhashBecomesEmpty(t *testing.T) {
+	m := &imageModel{ID: "i", ArtworkID: "a", ClientImageID: "c"}
+	out := toDomainImage(m)
+	if out.Blurhash != "" {
+		t.Fatalf("nil blurhash should map to empty string, got %q", out.Blurhash)
+	}
+}
+
+func TestToDomainImage_PtrBlurhashPropagates(t *testing.T) {
+	v := "L00000fQfQfQfQfQfQfQfQfQfQfQ"
+	m := &imageModel{ID: "i", Blurhash: &v}
+	out := toDomainImage(m)
+	if out.Blurhash != v {
+		t.Fatalf("got %q want %q", out.Blurhash, v)
 	}
 }

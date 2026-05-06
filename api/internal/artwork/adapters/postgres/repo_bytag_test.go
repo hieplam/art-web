@@ -9,7 +9,7 @@ import (
 
 func TestListByTag_PublicOnly(t *testing.T) {
 	repo, _, uid := newCtx(t)
-	tags := artworkpostgres.NewTagsRepo(repo.Pool())
+	tags := artworkpostgres.NewTagsRepo(repo.DB())
 
 	pub, _ := repo.Create(t.Context(), uid, "tagged public", "", "private")
 	_ = repo.PatchVisibility(t.Context(), pub, "public")

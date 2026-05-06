@@ -4,200 +4,205 @@ package postgres
 import (
 	"context"
 	"strings"
-	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"gorm.io/gorm"
 
 	artworkdomain "local/art-web/api/internal/artwork/domain"
 	"local/art-web/api/internal/artwork/ports"
+	"local/art-web/api/internal/infrastructure/database"
 )
 
 // Artwork is the persistence-shape entity returned by Repo. It is an alias for
-// the domain entity so handlers can read fields directly without any mapping
-// step at the adapter boundary.
+// the domain entity so handlers can read fields directly without a per-call
+// mapping shim at the adapter boundary.
 type Artwork = artworkdomain.Artwork
 
-type Repo struct{ pool *pgxpool.Pool }
+// Repo is the artwork slice's GORM-backed persistence adapter.
+type Repo struct{ db *gorm.DB }
 
-func NewRepo(p *pgxpool.Pool) *Repo { return &Repo{pool: p} }
+// NewRepo constructs a repo with the root *gorm.DB. database.DB(ctx, r.db)
+// resolves to the active handle (root or transactional) per spec §7.6.1.
+func NewRepo(db *gorm.DB) *Repo { return &Repo{db: db} }
 
-func (r *Repo) Pool() *pgxpool.Pool { return r.pool }
-
-func (r *Repo) Create(ctx context.Context, userID, title, description, visibility string) (string, error) {
-	var id string
-	err := r.pool.QueryRow(ctx, `
-		INSERT INTO artworks (user_id, title, description, visibility, published_at)
-		VALUES ($1, $2, NULLIF($3,''), $4, CASE WHEN $4='public' THEN now() ELSE NULL END)
-		RETURNING id`,
-		userID, title, description, visibility).Scan(&id)
-	return id, err
-}
-
-func (r *Repo) Get(ctx context.Context, id string) (*Artwork, error) {
-	var a Artwork
-	var desc *string
-	var pub *time.Time
-	var cre time.Time
-	err := r.pool.QueryRow(ctx, `
-		SELECT id, user_id, title, description, visibility, published_at, created_at, cover_position
-		FROM artworks WHERE id = $1`, id).
-		Scan(&a.ID, &a.UserID, &a.Title, &desc, &a.Visibility, &pub, &cre, &a.CoverPosition)
-	if err != nil {
-		return nil, err
-	}
-	a.Description = desc
-	a.PublishedAt = pub
-	a.CreatedAt = &cre
-	return &a, nil
-}
-
-func (r *Repo) PatchTitle(ctx context.Context, id, title string) error {
-	_, err := r.pool.Exec(ctx, `UPDATE artworks SET title=$2 WHERE id=$1`, id, title)
-	return err
-}
-
-func (r *Repo) PatchDescription(ctx context.Context, id, description string) error {
-	_, err := r.pool.Exec(ctx,
-		`UPDATE artworks SET description=NULLIF($2,'') WHERE id=$1`, id, description)
-	return err
-}
-
-func (r *Repo) PatchVisibility(ctx context.Context, id, vis string) error {
-	_, err := r.pool.Exec(ctx, `
-		UPDATE artworks
-		SET visibility = $2,
-		    published_at = CASE WHEN $2='public' THEN COALESCE(published_at, now()) ELSE published_at END
-		WHERE id = $1`, id, vis)
-	return err
-}
-
-func (r *Repo) SetCoverPosition(ctx context.Context, id string, position int) error {
-	_, err := r.pool.Exec(ctx, `UPDATE artworks SET cover_position=$2 WHERE id=$1`, id, position)
-	return err
-}
-
-func (r *Repo) Delete(ctx context.Context, id string) error {
-	_, err := r.pool.Exec(ctx, `DELETE FROM artworks WHERE id=$1`, id)
-	return err
-}
+// DB returns the underlying root *gorm.DB. Tests use this to seed fixtures
+// directly; production code should not reach into it.
+func (r *Repo) DB() *gorm.DB { return r.db }
 
 // FeedCursor and FeedPage are aliased to the ports types so callers may use
-// either name interchangeably; ports owns the canonical definition.
+// either name interchangeably; ports owns the canonical definitions.
 type (
 	FeedCursor = ports.FeedCursor
 	FeedPage   = ports.FeedPage
 	FlipMove   = ports.FlipMove
 )
 
+func (r *Repo) Create(ctx context.Context, userID, title, description, visibility string) (string, error) {
+	db := database.DB(ctx, r.db).WithContext(ctx)
+	var descPtr *string
+	if description != "" {
+		descPtr = &description
+	}
+	m := artworkModel{
+		UserID:      userID,
+		Title:       title,
+		Description: descPtr,
+		Visibility:  visibility,
+	}
+	// Mirror the SQL CASE: published_at = now() iff visibility='public'.
+	// We rely on Postgres to apply DEFAULT now() for created_at and
+	// gen_random_uuid() for id (both declared in the migration; tags include
+	// the matching `default:` clauses).
+	if visibility == "public" {
+		// Use expression so the timestamp comes from the DB clock, not Go.
+		err := db.Raw(`
+			INSERT INTO artworks (user_id, title, description, visibility, published_at)
+			VALUES (?, ?, NULLIF(?, ''), ?, now())
+			RETURNING id`,
+			userID, title, description, visibility).Scan(&m.ID).Error
+		if err != nil {
+			return "", err
+		}
+		return m.ID, nil
+	}
+	if err := db.Create(&m).Error; err != nil {
+		return "", err
+	}
+	return m.ID, nil
+}
+
+func (r *Repo) Get(ctx context.Context, id string) (*Artwork, error) {
+	var m artworkModel
+	err := database.DB(ctx, r.db).WithContext(ctx).First(&m, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return toDomainArtwork(&m), nil
+}
+
+func (r *Repo) PatchTitle(ctx context.Context, id, title string) error {
+	return database.DB(ctx, r.db).WithContext(ctx).
+		Model(&artworkModel{}).Where("id = ?", id).
+		Update("title", title).Error
+}
+
+func (r *Repo) PatchDescription(ctx context.Context, id, description string) error {
+	var v any
+	if description == "" {
+		v = nil
+	} else {
+		v = description
+	}
+	return database.DB(ctx, r.db).WithContext(ctx).
+		Model(&artworkModel{}).Where("id = ?", id).
+		Update("description", v).Error
+}
+
+func (r *Repo) PatchVisibility(ctx context.Context, id, vis string) error {
+	if vis == "public" {
+		return database.DB(ctx, r.db).WithContext(ctx).Exec(`
+			UPDATE artworks
+			SET visibility = ?,
+			    published_at = COALESCE(published_at, now())
+			WHERE id = ?`, vis, id).Error
+	}
+	return database.DB(ctx, r.db).WithContext(ctx).
+		Model(&artworkModel{}).Where("id = ?", id).
+		Update("visibility", vis).Error
+}
+
+func (r *Repo) SetCoverPosition(ctx context.Context, id string, position int) error {
+	return database.DB(ctx, r.db).WithContext(ctx).
+		Model(&artworkModel{}).Where("id = ?", id).
+		Update("cover_position", position).Error
+}
+
+func (r *Repo) Delete(ctx context.Context, id string) error {
+	return database.DB(ctx, r.db).WithContext(ctx).
+		Where("id = ?", id).Delete(&artworkModel{}).Error
+}
+
+// PublicFeed returns the next page of public artworks ordered by published_at
+// DESC, id DESC. The cursor's (stamp, id) tuple — when non-zero — strictly
+// excludes rows newer than or equal to it.
 func (r *Repo) PublicFeed(ctx context.Context, c FeedCursor, limit int) (*FeedPage, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 24
 	}
-	rows, err := r.pool.Query(ctx, `
-		SELECT id, user_id, title, description, visibility, published_at, created_at, cover_position
-		FROM artworks
-		WHERE visibility='public' AND published_at IS NOT NULL
-		  AND ($1::boolean OR (published_at, id) < ($2::timestamptz, $3::uuid))
-		ORDER BY published_at DESC, id DESC
-		LIMIT $4`,
-		c.IsZero(), nullableStamp(c), nullableID(c), limit+1)
-	if err != nil {
+	q := database.DB(ctx, r.db).WithContext(ctx).
+		Model(&artworkModel{}).
+		Where("visibility = ? AND published_at IS NOT NULL", "public")
+	if !c.IsZero() {
+		q = q.Where("(published_at, id) < (?, ?)", c.Stamp, c.ID)
+	}
+	var rows []artworkModel
+	if err := q.Order("published_at DESC, id DESC").Limit(limit + 1).Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	return scanFeedRows(rows, limit, false)
-}
-
-func nullableStamp(c FeedCursor) any {
-	if c.IsZero() {
-		return nil
-	}
-	return c.Stamp
-}
-func nullableID(c FeedCursor) any {
-	if c.IsZero() {
-		return nil
-	}
-	return c.ID
+	return rowsToFeedPage(rows, limit, false), nil
 }
 
 func (r *Repo) ListByUser(ctx context.Context, userID string, viewerIsOwner bool, c FeedCursor, limit int) (*FeedPage, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 24
 	}
-	q := `
-		SELECT id, user_id, title, description, visibility, published_at, created_at, cover_position
-		FROM artworks
-		WHERE user_id = $1 ` +
-		map[bool]string{
-			true:  ``,
-			false: ` AND visibility='public' AND published_at IS NOT NULL`,
-		}[viewerIsOwner] + `
-		  AND ($2::boolean OR (created_at, id) < ($3::timestamptz, $4::uuid))
-		ORDER BY created_at DESC, id DESC
-		LIMIT $5`
-	rows, err := r.pool.Query(ctx, q, userID, c.IsZero(), nullableStamp(c), nullableID(c), limit+1)
-	if err != nil {
+	q := database.DB(ctx, r.db).WithContext(ctx).
+		Model(&artworkModel{}).
+		Where("user_id = ?", userID)
+	if !viewerIsOwner {
+		q = q.Where("visibility = ? AND published_at IS NOT NULL", "public")
+	}
+	if !c.IsZero() {
+		q = q.Where("(created_at, id) < (?, ?)", c.Stamp, c.ID)
+	}
+	var rows []artworkModel
+	if err := q.Order("created_at DESC, id DESC").Limit(limit + 1).Find(&rows).Error; err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	return scanFeedRows(rows, limit, true)
-}
-
-func scanFeedRows(rows pgx.Rows, limit int, useCreatedAt bool) (*FeedPage, error) {
-	out := &FeedPage{}
-	for rows.Next() {
-		var a Artwork
-		var desc *string
-		var pub *time.Time
-		var cre time.Time
-		if err := rows.Scan(&a.ID, &a.UserID, &a.Title, &desc, &a.Visibility, &pub, &cre, &a.CoverPosition); err != nil {
-			return nil, err
-		}
-		a.PublishedAt = pub
-		a.CreatedAt = &cre
-		a.Description = desc
-		out.Items = append(out.Items, a)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if len(out.Items) > limit {
-		last := out.Items[limit-1]
-		out.Items = out.Items[:limit]
-		var stamp time.Time
-		if useCreatedAt {
-			stamp = *last.CreatedAt
-		} else {
-			// PublicFeed and ListByTag both enforce `published_at IS NOT NULL`,
-			// so this branch is always taken when useCreatedAt is false.
-			stamp = *last.PublishedAt
-		}
-		out.NextCursor = &FeedCursor{Stamp: stamp, ID: last.ID}
-	}
-	return out, nil
+	return rowsToFeedPage(rows, limit, true), nil
 }
 
 func (r *Repo) ListByTag(ctx context.Context, tag string, c FeedCursor, limit int) (*FeedPage, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 24
 	}
-	rows, err := r.pool.Query(ctx, `
-		SELECT a.id, a.user_id, a.title, a.description, a.visibility, a.published_at, a.created_at, a.cover_position
-		FROM artworks a
-		JOIN artwork_tags atag ON atag.artwork_id = a.id
-		JOIN tags t ON t.id = atag.tag_id
-		WHERE t.name = lower($1)
-		  AND a.visibility='public' AND a.published_at IS NOT NULL
-		  AND ($2::boolean OR (a.published_at, a.id) < ($3::timestamptz, $4::uuid))
-		ORDER BY a.published_at DESC, a.id DESC
-		LIMIT $5`, tag, c.IsZero(), nullableStamp(c), nullableID(c), limit+1)
-	if err != nil {
+	q := database.DB(ctx, r.db).WithContext(ctx).
+		Table("artworks AS a").
+		Select("a.*").
+		Joins("JOIN artwork_tags atag ON atag.artwork_id = a.id").
+		Joins("JOIN tags t ON t.id = atag.tag_id").
+		Where("t.name = lower(?)", tag).
+		Where("a.visibility = ? AND a.published_at IS NOT NULL", "public")
+	if !c.IsZero() {
+		q = q.Where("(a.published_at, a.id) < (?, ?)", c.Stamp, c.ID)
+	}
+	var rows []artworkModel
+	if err := q.Order("a.published_at DESC, a.id DESC").Limit(limit + 1).Scan(&rows).Error; err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	return scanFeedRows(rows, limit, false)
+	return rowsToFeedPage(rows, limit, false), nil
+}
+
+// rowsToFeedPage converts a slice of GORM rows into a domain FeedPage,
+// trimming to limit and synthesizing the next cursor when extra rows were
+// fetched. useCreatedAt selects which column drives the cursor stamp; feeds
+// that filter on published_at use that column instead.
+func rowsToFeedPage(rows []artworkModel, limit int, useCreatedAt bool) *FeedPage {
+	out := &FeedPage{}
+	for _, m := range rows {
+		out.Items = append(out.Items, *toDomainArtwork(&m))
+	}
+	if len(out.Items) > limit {
+		last := out.Items[limit-1]
+		out.Items = out.Items[:limit]
+		var stamp = *last.CreatedAt
+		if !useCreatedAt {
+			// PublicFeed and ListByTag both filter on published_at IS NOT NULL,
+			// so the deref is always safe in this branch.
+			stamp = *last.PublishedAt
+		}
+		out.NextCursor = &FeedCursor{Stamp: stamp, ID: last.ID}
+	}
+	return out
 }
 
 // PendingFlipMoves enumerates the storage-key transitions implied by flipping
@@ -206,54 +211,47 @@ func (r *Repo) ListByTag(ctx context.Context, tag string, c FeedCursor, limit in
 // Returns an error if any row's key fails the prefix invariant — that's a
 // data-shape inconsistency the caller should surface.
 func (r *Repo) PendingFlipMoves(ctx context.Context, artworkID, fromVis, toVis string) ([]FlipMove, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT id, storage_key FROM artwork_images WHERE artwork_id = $1`, artworkID)
+	var rows []artworkImageModel
+	err := database.DB(ctx, r.db).WithContext(ctx).
+		Where("artwork_id = ?", artworkID).
+		Find(&rows).Error
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var moves []FlipMove
-	for rows.Next() {
-		var id, src string
-		if err := rows.Scan(&id, &src); err != nil {
-			return nil, err
+	for _, im := range rows {
+		if !strings.HasPrefix(im.StorageKey, fromVis+"/") {
+			return nil, &flipPrefixError{src: im.StorageKey, fromVis: fromVis}
 		}
-		if !strings.HasPrefix(src, fromVis+"/") {
-			return nil, &flipPrefixError{src: src, fromVis: fromVis}
-		}
-		dst := toVis + strings.TrimPrefix(src, fromVis)
-		moves = append(moves, FlipMove{ID: id, Src: src, Dst: dst})
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+		dst := toVis + strings.TrimPrefix(im.StorageKey, fromVis)
+		moves = append(moves, FlipMove{ID: im.ID, Src: im.StorageKey, Dst: dst})
 	}
 	return moves, nil
 }
 
-// FinalizeFlip updates artwork_images.storage_key to the new dst values for the
-// completed moves and flips artworks.visibility to target — both inside a
+// FinalizeFlip updates artwork_images.storage_key to the new dst values for
+// the completed moves and flips artworks.visibility to target — both inside a
 // single transaction so a partial failure cannot leak files into the wrong
 // visibility prefix while the artwork row still claims the old visibility.
 func (r *Repo) FinalizeFlip(ctx context.Context, artworkID, target string, completed []FlipMove) error {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-	for _, m := range completed {
-		if _, err := tx.Exec(ctx,
-			`UPDATE artwork_images SET storage_key=$2 WHERE id=$1`, m.ID, m.Dst); err != nil {
-			return err
+	return database.DB(ctx, r.db).WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		for _, m := range completed {
+			if err := tx.Model(&artworkImageModel{}).
+				Where("id = ?", m.ID).
+				Update("storage_key", m.Dst).Error; err != nil {
+				return err
+			}
 		}
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE artworks SET
-		  visibility=$2,
-		  published_at = CASE WHEN $2='public' THEN COALESCE(published_at, now()) ELSE published_at END
-		WHERE id=$1`, artworkID, target); err != nil {
-		return err
-	}
-	return tx.Commit(ctx)
+		if target == "public" {
+			return tx.Exec(`
+				UPDATE artworks SET
+				  visibility = ?,
+				  published_at = COALESCE(published_at, now())
+				WHERE id = ?`, target, artworkID).Error
+		}
+		return tx.Model(&artworkModel{}).Where("id = ?", artworkID).
+			Update("visibility", target).Error
+	})
 }
 
 // flipPrefixError lets the visibility service surface a precise error when an
@@ -266,3 +264,4 @@ type flipPrefixError struct {
 func (e *flipPrefixError) Error() string {
 	return "storage_key " + e.src + " does not match artwork visibility " + e.fromVis
 }
+

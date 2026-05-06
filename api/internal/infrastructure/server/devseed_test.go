@@ -43,36 +43,30 @@ func TestDevSeed_TestEnv_ReturnsFixture(t *testing.T) {
 		t.Fatalf("PID/QID must be distinct non-empty UUIDs; got P=%q Q=%q", out.PID, out.QID)
 	}
 
-	pool, err := database.New(t.Context(), infratest.StartPostgres(t))
+	db, cleanup, err := database.NewGormDBFromDSN(infratest.StartPostgres(t))
 	if err != nil {
-		t.Fatalf("db.New: %v", err)
+		t.Fatalf("NewGormDB: %v", err)
 	}
-	t.Cleanup(func() { pool.Close() })
-	rows, err := pool.Query(t.Context(), `
+	t.Cleanup(cleanup)
+	type row struct {
+		ID         string `gorm:"column:id"`
+		StorageKey string `gorm:"column:storage_key"`
+	}
+	var rows []row
+	if err := db.WithContext(t.Context()).Raw(`
 		SELECT id, storage_key
 		FROM artwork_images
-		WHERE artwork_id IN ($1, $2)
-		ORDER BY artwork_id`, out.PID, out.QID)
-	if err != nil {
+		WHERE artwork_id IN (?, ?)
+		ORDER BY artwork_id`, out.PID, out.QID).Scan(&rows).Error; err != nil {
 		t.Fatalf("query seed images: %v", err)
 	}
-	defer rows.Close()
-	var n int
-	for rows.Next() {
-		var id, key string
-		if err := rows.Scan(&id, &key); err != nil {
-			t.Fatalf("scan seed image: %v", err)
+	for _, rr := range rows {
+		if !strings.Contains(rr.StorageKey, "/"+rr.ID+".") {
+			t.Fatalf("seed storage_key %q does not include image id %q", rr.StorageKey, rr.ID)
 		}
-		if !strings.Contains(key, "/"+id+".") {
-			t.Fatalf("seed storage_key %q does not include image id %q", key, id)
-		}
-		n++
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("seed image rows: %v", err)
-	}
-	if n != 2 {
-		t.Fatalf("expected 2 seed image rows, got %d", n)
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 seed image rows, got %d", len(rows))
 	}
 }
 
@@ -110,14 +104,14 @@ func TestDevSeed_Many120_WritesAllItems(t *testing.T) {
 
 	// Query the DB directly to confirm all 120 bulk items (+ 1 public P) were written,
 	// not silently capped at the old maxMany=100 limit.
-	pool, err := database.New(t.Context(), infratest.StartPostgres(t))
+	db, cleanup, err := database.NewGormDBFromDSN(infratest.StartPostgres(t))
 	if err != nil {
-		t.Fatalf("db.New: %v", err)
+		t.Fatalf("NewGormDB: %v", err)
 	}
-	t.Cleanup(func() { pool.Close() })
-	var n int
-	_ = pool.QueryRow(t.Context(),
-		`SELECT COUNT(*) FROM artworks WHERE visibility='public'`).Scan(&n)
+	t.Cleanup(cleanup)
+	var n int64
+	_ = db.WithContext(t.Context()).Table("artworks").
+		Where("visibility = ?", "public").Count(&n).Error
 	if n < 121 {
 		t.Fatalf("expected at least 121 public artworks (120 bulk + 1 P), got %d — cap may still be too low", n)
 	}

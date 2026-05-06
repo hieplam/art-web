@@ -13,15 +13,13 @@ import (
 )
 
 func newRepo(t *testing.T) *userpostgres.Repo {
-	pool, err := database.New(context.Background(), infratest.StartPostgres(t))
+	db, cleanup, err := database.NewGormDBFromDSN(infratest.StartPostgres(t))
 	if err != nil {
-		t.Fatalf("db.New: %v", err)
+		t.Fatalf("NewGormDB: %v", err)
 	}
-	infratest.TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
-		_, err := pool.Exec(ctx, sql)
-		return err
-	})
-	return userpostgres.NewRepo(pool)
+	t.Cleanup(cleanup)
+	infratest.TruncateAllGorm(t, db)
+	return userpostgres.NewRepo(db)
 }
 
 func TestUpsertOAuth_FirstTimeAssignsSlug(t *testing.T) {
@@ -74,14 +72,12 @@ func TestUpsertOAuth_Idempotent_ReturnsSameID(t *testing.T) {
 
 func TestUpsertOAuth_SlugExhaustionAfter50Collisions(t *testing.T) {
 	r := newRepo(t)
-	// Seed 50 users that occupy the slug space "alice", "alice-2", ..., "alice-50".
 	for i := 0; i < 50; i++ {
 		subject := "S" + strings.Repeat("x", i+1) // unique oauth_subject per insertion
 		if _, err := r.UpsertOAuth(t.Context(), "google", subject, "x@x", "alice", ""); err != nil {
 			t.Fatalf("seed %d: %v", i, err)
 		}
 	}
-	// 51st upsert must run out of slug space and return the sentinel error.
 	_, err := r.UpsertOAuth(t.Context(), "google", "exhausted-subject", "x@x", "alice", "")
 	if err == nil {
 		t.Fatal("expected slug-exhaustion error")
@@ -93,7 +89,7 @@ func TestUpsertOAuth_SlugExhaustionAfter50Collisions(t *testing.T) {
 
 func TestGet_NotFound_ReturnsErrNotFound(t *testing.T) {
 	r := newRepo(t)
-	_, err := r.Get(t.Context(), "00000000-0000-0000-0000-000000000000")
+	_, err := r.Get(context.Background(), "00000000-0000-0000-0000-000000000000")
 	if !errors.Is(err, userpostgres.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -106,8 +102,8 @@ func TestGetBySlug_NotFound_PassesThroughError(t *testing.T) {
 		t.Fatal("expected error for missing slug")
 	}
 	// Current behavior: GetBySlug does NOT translate to ErrNotFound — it returns
-	// the raw pgx.ErrNoRows. This test pins that behavior so it does not change
-	// silently.
+	// the underlying gorm.ErrRecordNotFound. This test pins that behavior so it
+	// does not change silently.
 	if errors.Is(err, userpostgres.ErrNotFound) {
 		t.Fatalf("GetBySlug should not return ErrNotFound; got %v", err)
 	}
@@ -120,8 +116,6 @@ func TestUpsertOAuth_DuplicateOAuthKey_ReturnsExistingID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first: %v", err)
 	}
-	// Re-upsert with the SAME provider+subject but different display name → must
-	// hit the lookupExistingOAuth fast path at repo.go:45-55 (UPDATE, no INSERT).
 	second, err := r.UpsertOAuth(t.Context(), "google", "S-DUP", "a@b", "different-name", "")
 	if err != nil {
 		t.Fatalf("re-upsert: %v", err)

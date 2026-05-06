@@ -2,7 +2,6 @@
 package postgres_test
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -13,18 +12,15 @@ import (
 )
 
 func newCtx(t *testing.T) (*artworkpostgres.Repo, *userpostgres.Repo, string) {
-	pool, err := database.New(context.Background(), infratest.StartPostgres(t))
+	db, cleanup, err := database.NewGormDBFromDSN(infratest.StartPostgres(t))
 	if err != nil {
-		t.Fatalf("db.New: %v", err)
+		t.Fatalf("NewGormDB: %v", err)
 	}
-	t.Cleanup(func() { pool.Close() })
-	infratest.TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
-		_, err := pool.Exec(ctx, sql)
-		return err
-	})
-	users := userpostgres.NewRepo(pool)
+	t.Cleanup(cleanup)
+	infratest.TruncateAllGorm(t, db)
+	users := userpostgres.NewRepo(db)
 	uid, _ := users.UpsertOAuth(t.Context(), "google", "S1", "a@b", "alice", "")
-	return artworkpostgres.NewRepo(pool), users, uid
+	return artworkpostgres.NewRepo(db), users, uid
 }
 
 func TestCreate_DefaultsToPrivateNullPublishedAt(t *testing.T) {

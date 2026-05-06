@@ -53,8 +53,8 @@ func TestPublicFeed_SameSecondPublish_NoSkipsOrDupes(t *testing.T) {
 	pinned := time.Now().UTC().Truncate(time.Second).Add(123456 * time.Microsecond)
 	for i := 0; i < N; i++ {
 		id, _ := repo.Create(t.Context(), uid, "x", "", "public")
-		if _, err := repo.Pool().Exec(t.Context(),
-			`UPDATE artworks SET published_at=$2 WHERE id=$1`, id, pinned); err != nil {
+		if err := repo.DB().WithContext(t.Context()).Exec(
+			`UPDATE artworks SET published_at=? WHERE id=?`, pinned, id).Error; err != nil {
 			t.Fatalf("pin: %v", err)
 		}
 	}

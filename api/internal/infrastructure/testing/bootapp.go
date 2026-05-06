@@ -2,7 +2,6 @@
 package testing
 
 import (
-	"context"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -83,20 +82,17 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 	}
 
 	dsn := StartPostgres(t)
-	pool, err := database.New(context.Background(), dsn)
+	db, cleanup, err := database.NewGormDBFromDSN(dsn)
 	if err != nil {
-		t.Fatalf("db.New: %v", err)
+		t.Fatalf("NewGormDB: %v", err)
 	}
-	t.Cleanup(func() { pool.Close() })
+	t.Cleanup(cleanup)
 	// NOTE: StartPostgres shares one container via sync.Once. If multiple tests
 	// in the same binary both call BootApp concurrently, the second TruncateAll
 	// will wipe data seeded by the first. Call BootApp once per suite invocation
 	// (not once per test case), or migrate to per-call sub-schemas if isolation
 	// is required. PR 0.7's contract suite only seeds once via /dev/seed.
-	TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
-		_, err := pool.Exec(ctx, sql)
-		return err
-	})
+	TruncateAllGorm(t, db)
 
 	store := infrastorage.NewLocalFS(t.TempDir())
 	clock := time.Now
@@ -105,10 +101,10 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 	}
 	jwts := authservice.NewJWT(opts.JWTKey, clock)
 	urls := signing.NewURLBuilder("http://localhost:8787", opts.SignKey, clock)
-	users := userpostgres.NewRepo(pool)
-	arts := artworkpostgres.NewRepo(pool)
-	tags := artworkpostgres.NewTagsRepo(pool)
-	images := imagepostgres.NewRepo(pool)
+	users := userpostgres.NewRepo(db)
+	arts := artworkpostgres.NewRepo(db)
+	tags := artworkpostgres.NewTagsRepo(db)
+	images := imagepostgres.NewRepo(db)
 	if opts.RandReader != nil {
 		t.Cleanup(authhttp.SetStateRandForTest(opts.RandReader))
 	}

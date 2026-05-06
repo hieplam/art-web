@@ -12,6 +12,7 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"gorm.io/gorm"
 
 	"local/art-web/api/migrations"
 )
@@ -66,6 +67,9 @@ func StartPostgres(t testing.TB) string {
 	return sharedDSN
 }
 
+// TruncateAll wipes every business table in the shared test database. The
+// exec callback must run the SQL against the active DB handle (the GORM
+// adapter passes db.WithContext(ctx).Exec(sql).Error).
 func TruncateAll(t testing.TB, exec func(ctx context.Context, sql string, args ...any) error) {
 	t.Helper()
 	if err := exec(context.Background(), `
@@ -73,4 +77,13 @@ func TruncateAll(t testing.TB, exec func(ctx context.Context, sql string, args .
 	`); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
+}
+
+// TruncateAllGorm is a convenience wrapper for callers that already hold a
+// *gorm.DB; it adapts the call into the legacy exec-callback shape.
+func TruncateAllGorm(t testing.TB, db *gorm.DB) {
+	t.Helper()
+	TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
+		return db.WithContext(ctx).Exec(sql).Error
+	})
 }

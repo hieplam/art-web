@@ -67,21 +67,18 @@ type MatrixEnv struct {
 func setupMatrixEnv(t *testing.T) *MatrixEnv {
 	t.Helper()
 	dsn := infratest.StartPostgres(t)
-	pool, err := database.New(context.Background(), dsn)
+	db, cleanup, err := database.NewGormDBFromDSN(dsn)
 	if err != nil {
-		t.Fatalf("db.New: %v", err)
+		t.Fatalf("NewGormDB: %v", err)
 	}
-	t.Cleanup(func() { pool.Close() })
+	t.Cleanup(cleanup)
 
-	infratest.TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
-		_, err := pool.Exec(ctx, sql)
-		return err
-	})
+	infratest.TruncateAllGorm(t, db)
 
-	users := userpostgres.NewRepo(pool)
-	arts := artworkpostgres.NewRepo(pool)
-	tags := artworkpostgres.NewTagsRepo(pool)
-	images := imagepostgres.NewRepo(pool)
+	users := userpostgres.NewRepo(db)
+	arts := artworkpostgres.NewRepo(db)
+	tags := artworkpostgres.NewTagsRepo(db)
+	images := imagepostgres.NewRepo(db)
 
 	// Seed Alice (owner) with a unique suffix.
 	// Pass "alice-<suffix>" as displayName so slugify produces "alice-<suffix>" as the slug.
@@ -309,25 +306,22 @@ type testBundle struct {
 func testDeps(t *testing.T, appEnv string) testBundle {
 	t.Helper()
 	dsn := infratest.StartPostgres(t)
-	pool, err := database.New(context.Background(), dsn)
+	db, cleanup, err := database.NewGormDBFromDSN(dsn)
 	if err != nil {
-		t.Fatalf("db.New: %v", err)
+		t.Fatalf("NewGormDB: %v", err)
 	}
-	t.Cleanup(func() { pool.Close() })
+	t.Cleanup(cleanup)
 
-	infratest.TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
-		_, err := pool.Exec(ctx, sql)
-		return err
-	})
+	infratest.TruncateAllGorm(t, db)
 
 	store := infrastorage.NewLocalFS(t.TempDir())
 	jwts := authservice.NewJWT(testJWTKey, time.Now)
 	urls := signing.NewURLBuilder("http://localhost:8787", testSignKey, time.Now)
 
-	users := userpostgres.NewRepo(pool)
-	arts := artworkpostgres.NewRepo(pool)
-	tags := artworkpostgres.NewTagsRepo(pool)
-	images := imagepostgres.NewRepo(pool)
+	users := userpostgres.NewRepo(db)
+	arts := artworkpostgres.NewRepo(db)
+	tags := artworkpostgres.NewTagsRepo(db)
+	images := imagepostgres.NewRepo(db)
 	imgSvc := imageservice.NewService(store, images, arts)
 	upload := imagehttp.NewHandler(imgSvc, arts, urls)
 	vis := artworkservice.NewVisibilityService(arts, store, nil)

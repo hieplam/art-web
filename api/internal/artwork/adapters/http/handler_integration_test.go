@@ -8,7 +8,6 @@
 package http_test
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,20 +49,17 @@ type intEnv struct {
 
 func newIntEnv(t *testing.T) *intEnv {
 	t.Helper()
-	pool, err := database.New(context.Background(), infratest.StartPostgres(t))
+	db, cleanup, err := database.NewGormDBFromDSN(infratest.StartPostgres(t))
 	if err != nil {
-		t.Fatalf("db.New: %v", err)
+		t.Fatalf("NewGormDB: %v", err)
 	}
-	t.Cleanup(func() { pool.Close() })
-	infratest.TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
-		_, err := pool.Exec(ctx, sql)
-		return err
-	})
+	t.Cleanup(cleanup)
+	infratest.TruncateAllGorm(t, db)
 
-	users := userpostgres.NewRepo(pool)
-	arts := artworkpostgres.NewRepo(pool)
-	tags := artworkpostgres.NewTagsRepo(pool)
-	images := imagepostgres.NewRepo(pool)
+	users := userpostgres.NewRepo(db)
+	arts := artworkpostgres.NewRepo(db)
+	tags := artworkpostgres.NewTagsRepo(db)
+	images := imagepostgres.NewRepo(db)
 
 	suffix := uuid.NewString()[:4]
 	aliceID, err := users.UpsertOAuth(t.Context(), "test", "alice-"+suffix, "alice@test", "alice-"+suffix, "")

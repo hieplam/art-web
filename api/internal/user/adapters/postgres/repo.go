@@ -8,10 +8,10 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
+	"gorm.io/gorm"
 
+	"local/art-web/api/internal/infrastructure/database"
 	userdomain "local/art-web/api/internal/user/domain"
 )
 
@@ -22,15 +22,24 @@ type User = userdomain.User
 
 // ErrNotFound is returned by Get when the requested user row does not exist.
 // It lets callers distinguish "JWT subject vanished" (return 401) from a
-// generic DB failure (return 500) without depending on pgx error sentinels.
+// generic DB failure (return 500) without depending on driver error sentinels.
 var ErrNotFound = errors.New("user not found")
 
-type Repo struct{ pool *pgxpool.Pool }
+// Repo is the user slice's GORM-backed persistence adapter.
+type Repo struct{ db *gorm.DB }
 
-func NewRepo(p *pgxpool.Pool) *Repo { return &Repo{pool: p} }
+// NewRepo constructs a repo with the root *gorm.DB. Inside request scope, the
+// repo retrieves the active handle (root or transactional) via
+// database.DB(ctx, r.db) so spec §7.6.1's transactor pattern works seamlessly.
+func NewRepo(db *gorm.DB) *Repo { return &Repo{db: db} }
+
+// DB returns the underlying root *gorm.DB. Tests use this to seed fixtures
+// directly; production code should not reach into it.
+func (r *Repo) DB() *gorm.DB { return r.db }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9-]+`)
 
+// Slugify mirrors the previous public function; tests reference it directly.
 func Slugify(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = slugRe.ReplaceAllString(s, "-")
@@ -45,39 +54,58 @@ func Slugify(s string) string {
 }
 
 func (r *Repo) UpsertOAuth(ctx context.Context, provider, subject, email, displayName, avatar string) (string, error) {
-	if id, ok, err := r.lookupExistingOAuth(ctx, provider, subject); err != nil {
-		return "", err
-	} else if ok {
-		_, err := r.pool.Exec(ctx,
-			`UPDATE users SET email=$1, display_name=$2, avatar_url=NULLIF($3,'') WHERE id=$4`,
-			email, displayName, avatar, id)
-		if err != nil {
-			return "", err
+	db := database.DB(ctx, r.db).WithContext(ctx)
+
+	// Existing user with same (provider, subject)?
+	var existing userModel
+	err := db.Where("oauth_provider = ? AND oauth_subject = ?", provider, subject).First(&existing).Error
+	if err == nil {
+		updates := map[string]any{
+			"email":        email,
+			"display_name": displayName,
 		}
-		return id, nil
+		if avatar != "" {
+			updates["avatar_url"] = avatar
+		} else {
+			updates["avatar_url"] = nil
+		}
+		if err := db.Model(&userModel{}).Where("id = ?", existing.ID).Updates(updates).Error; err != nil {
+			return "", fmt.Errorf("user.Update: %w", err)
+		}
+		return existing.ID, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return "", fmt.Errorf("user.Lookup: %w", err)
 	}
 
 	base := Slugify(displayName)
 	slug := base
+	var avatarPtr *string
+	if avatar != "" {
+		avatarPtr = &avatar
+	}
 	for i := 0; i < 50; i++ {
-		var id string
-		err := r.pool.QueryRow(ctx, `
-			INSERT INTO users (oauth_provider, oauth_subject, email, display_name, slug, avatar_url)
-			VALUES ($1,$2,$3,$4,$5, NULLIF($6,''))
-			RETURNING id`,
-			provider, subject, email, displayName, slug, avatar).Scan(&id)
+		m := userModel{
+			OAuthProvider: provider,
+			OAuthSubject:  subject,
+			Email:         email,
+			DisplayName:   displayName,
+			Slug:          slug,
+			AvatarURL:     avatarPtr,
+		}
+		err := db.Create(&m).Error
 		if err == nil {
-			return id, nil
+			return m.ID, nil
 		}
 		switch uniqueConstraint(err) {
 		case "users_slug_key":
 			slug = fmt.Sprintf("%s-%d", base, i+2)
 			continue
 		case "users_oauth_provider_oauth_subject_key":
-			if id, ok, lerr := r.lookupExistingOAuth(ctx, provider, subject); lerr != nil {
-				return "", lerr
-			} else if ok {
-				return id, nil
+			// Race: someone else inserted between our Lookup and Create.
+			if err := db.Where("oauth_provider = ? AND oauth_subject = ?", provider, subject).
+				First(&existing).Error; err == nil {
+				return existing.ID, nil
 			}
 			return "", errors.New("oauth conflict but row not found on re-read")
 		default:
@@ -87,45 +115,31 @@ func (r *Repo) UpsertOAuth(ctx context.Context, provider, subject, email, displa
 	return "", errors.New("slug exhausted")
 }
 
-func (r *Repo) lookupExistingOAuth(ctx context.Context, provider, subject string) (string, bool, error) {
-	var id string
-	err := r.pool.QueryRow(ctx,
-		`SELECT id FROM users WHERE oauth_provider=$1 AND oauth_subject=$2`,
-		provider, subject).Scan(&id)
-	if err == nil {
-		return id, true, nil
-	}
-	if errors.Is(err, pgx.ErrNoRows) {
-		return "", false, nil
-	}
-	return "", false, err
-}
-
 func (r *Repo) Get(ctx context.Context, id string) (*User, error) {
-	var u User
-	err := r.pool.QueryRow(ctx,
-		`SELECT id, slug, display_name, email, COALESCE(avatar_url,'') FROM users WHERE id=$1`,
-		id).Scan(&u.ID, &u.Slug, &u.DisplayName, &u.Email, &u.AvatarURL)
-	if errors.Is(err, pgx.ErrNoRows) {
+	var m userModel
+	err := database.DB(ctx, r.db).WithContext(ctx).First(&m, "id = ?", id).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get user: %w", err)
 	}
-	return &u, nil
+	return toDomainUser(&m), nil
 }
 
 func (r *Repo) GetBySlug(ctx context.Context, slug string) (*User, error) {
-	var u User
-	err := r.pool.QueryRow(ctx,
-		`SELECT id, slug, display_name, email, COALESCE(avatar_url,'') FROM users WHERE slug=$1`,
-		slug).Scan(&u.ID, &u.Slug, &u.DisplayName, &u.Email, &u.AvatarURL)
-	if err != nil {
+	var m userModel
+	if err := database.DB(ctx, r.db).WithContext(ctx).First(&m, "slug = ?", slug).Error; err != nil {
+		// Per spec §7.2.1 + §3, GetBySlug does NOT translate to ErrNotFound;
+		// the handler treats any error as 404. Pin via repo_test.go.
 		return nil, err
 	}
-	return &u, nil
+	return toDomainUser(&m), nil
 }
 
+// uniqueConstraint inspects an error from GORM's postgres driver and returns
+// the violated constraint name on a 23505 unique violation; empty otherwise.
+// GORM wraps pgconn errors, so errors.As against *pgconn.PgError still works.
 func uniqueConstraint(err error) string {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {

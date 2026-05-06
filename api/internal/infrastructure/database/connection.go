@@ -2,56 +2,43 @@
 package database
 
 import (
-	"context"
 	"errors"
-	"fmt"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
 	infraconfig "local/art-web/api/internal/infrastructure/config"
 )
 
-type Pool = pgxpool.Pool
-
 // DatabaseConfig aliases config.DatabaseConfig so callers of NewGormDB need
 // not import the config package directly (Option A per Task 3 spec).
 type DatabaseConfig = infraconfig.DatabaseConfig
 
-func New(ctx context.Context, dsn string) (*Pool, error) {
-	cfg, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		return nil, fmt.Errorf("parse dsn: %w", err)
-	}
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		return nil, err
-	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("ping: %w", err)
-	}
-	return pool, nil
-}
-
-// NewGormDB opens a GORM connection. Unused until Task 8 swaps consumers.
-// Returns (*gorm.DB, cleanup, error) per spec §6.5.
+// NewGormDB opens a GORM connection. Returns (*gorm.DB, cleanup, error) per
+// spec §6.5. AutoMigrate is forbidden (spec §10.2); migrations live in
+// api/migrations/*.sql and are run via golang-migrate (see migrate.go).
 func NewGormDB(cfg DatabaseConfig) (*gorm.DB, func(), error) {
 	if cfg.URL == "" {
 		return nil, nil, errors.New("database url required")
 	}
-	db, err := gorm.Open(postgres.Open(cfg.URL), &gorm.Config{
-		// Don't auto-migrate; migrations live in api/migrations/*.sql
-		// per spec §10.2 (forbidden).
-	})
+	db, err := gorm.Open(postgres.Open(cfg.URL), &gorm.Config{})
 	if err != nil {
 		return nil, nil, err
 	}
-	cleanup := func() {
-		if sqlDB, err := db.DB(); err == nil {
-			_ = sqlDB.Close()
-		}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, nil, err
 	}
+	if err := sqlDB.Ping(); err != nil {
+		_ = sqlDB.Close()
+		return nil, nil, err
+	}
+	cleanup := func() { _ = sqlDB.Close() }
 	return db, cleanup, nil
+}
+
+// NewGormDBFromDSN is a convenience constructor for tests that already have
+// a DSN string from testcontainers. Production code uses NewGormDB(cfg).
+func NewGormDBFromDSN(dsn string) (*gorm.DB, func(), error) {
+	return NewGormDB(DatabaseConfig{URL: dsn})
 }

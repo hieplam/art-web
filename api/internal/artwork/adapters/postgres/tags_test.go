@@ -9,7 +9,7 @@ import (
 
 func TestUpsertTags_NormalizesAndDedupes(t *testing.T) {
 	repo, _, uid := newCtx(t)
-	tags := artworkpostgres.NewTagsRepo(repo.Pool())
+	tags := artworkpostgres.NewTagsRepo(repo.DB())
 	id, _ := repo.Create(t.Context(), uid, "x", "", "private")
 	if err := tags.SetTags(t.Context(), id, []string{"  Cats  ", "cats", "DOGS"}); err != nil {
 		t.Fatalf("set: %v", err)

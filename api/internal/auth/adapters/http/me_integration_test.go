@@ -27,17 +27,14 @@ import (
 // TestMe_HappyPath_RendersUser asserts /me with a valid auth cookie returns
 // 200 with the renderUser shape (id, slug, display_name, avatar_url keys).
 func TestMe_HappyPath_RendersUser(t *testing.T) {
-	pool, err := database.New(context.Background(), infratest.StartPostgres(t))
+	db, cleanup, err := database.NewGormDBFromDSN(infratest.StartPostgres(t))
 	if err != nil {
-		t.Fatalf("db.New: %v", err)
+		t.Fatalf("NewGormDB: %v", err)
 	}
-	t.Cleanup(func() { pool.Close() })
-	infratest.TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
-		_, err := pool.Exec(ctx, sql)
-		return err
-	})
+	t.Cleanup(cleanup)
+	infratest.TruncateAllGorm(t, db)
 
-	users := userpostgres.NewRepo(pool)
+	users := userpostgres.NewRepo(db)
 	uid, err := users.UpsertOAuth(context.Background(), "google", "S-me", "alice@me", "Alice", "")
 	if err != nil {
 		t.Fatalf("upsert: %v", err)

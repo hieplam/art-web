@@ -71,20 +71,18 @@ func (s *spyStore) Delete(ctx context.Context, k string) error {
 }
 
 func newHandler(t *testing.T, store infrastorage.Storage) (*chi.Mux, string, string) {
-	pool, err := database.New(context.Background(), infratest.StartPostgres(t))
+	db, cleanup, err := database.NewGormDBFromDSN(infratest.StartPostgres(t))
 	if err != nil {
-		t.Fatalf("db.New: %v", err)
+		t.Fatalf("NewGormDB: %v", err)
 	}
-	infratest.TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
-		_, err := pool.Exec(ctx, sql)
-		return err
-	})
-	users := userpostgres.NewRepo(pool)
+	t.Cleanup(cleanup)
+	infratest.TruncateAllGorm(t, db)
+	users := userpostgres.NewRepo(db)
 	uid, _ := users.UpsertOAuth(t.Context(), "google", "S", "a@b", "alice", "")
-	arts := artworkpostgres.NewRepo(pool)
+	arts := artworkpostgres.NewRepo(db)
 	aid, _ := arts.Create(t.Context(), uid, "x", "", "private")
 
-	images := imagepostgres.NewRepo(pool)
+	images := imagepostgres.NewRepo(db)
 	svc := imageservice.NewService(store, images, arts)
 	jwts := authservice.NewJWT([]byte("0123456789abcdef0123456789abcdef"), nil)
 	h := imagehttp.NewHandler(svc, arts, signing.NewURLBuilder("http://x", []byte("k"), nil))
@@ -340,15 +338,18 @@ func TestUploadCase20_PartialFailureResume(t *testing.T) {
 	}
 
 	// infratest.StartPostgres is sync.Once: the second call returns the same DSN as
-	// newHandler used, so this pool reads the same database. Tests must not run
+	// newHandler used, so this DB reads the same database. Tests must not run
 	// in parallel with other tests that call TruncateAll on the shared container.
-	pool, err := database.New(t.Context(), infratest.StartPostgres(t))
+	verifyDB, vClean, err := database.NewGormDBFromDSN(infratest.StartPostgres(t))
 	if err != nil {
-		t.Fatalf("db.New: %v", err)
+		t.Fatalf("NewGormDB: %v", err)
 	}
-	var n int
-	_ = pool.QueryRow(t.Context(),
-		`SELECT COUNT(*) FROM artwork_images WHERE artwork_id=$1`, aid).Scan(&n)
+	t.Cleanup(vClean)
+	var n int64
+	if err := verifyDB.WithContext(t.Context()).Table("artwork_images").
+		Where("artwork_id = ?", aid).Count(&n).Error; err != nil {
+		t.Fatalf("count: %v", err)
+	}
 	if n != 5 {
 		t.Fatalf("expected 5 rows, got %d", n)
 	}

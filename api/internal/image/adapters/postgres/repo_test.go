@@ -13,19 +13,17 @@ import (
 )
 
 func setup(t *testing.T) (*imagepostgres.Repo, string) {
-	pool, err := database.New(context.Background(), infratest.StartPostgres(t))
+	db, cleanup, err := database.NewGormDBFromDSN(infratest.StartPostgres(t))
 	if err != nil {
-		t.Fatalf("db.New: %v", err)
+		t.Fatalf("NewGormDB: %v", err)
 	}
-	infratest.TruncateAll(t, func(ctx context.Context, sql string, _ ...any) error {
-		_, err := pool.Exec(ctx, sql)
-		return err
-	})
-	users := userpostgres.NewRepo(pool)
+	t.Cleanup(cleanup)
+	infratest.TruncateAllGorm(t, db)
+	users := userpostgres.NewRepo(db)
 	uid, _ := users.UpsertOAuth(t.Context(), "google", "S", "a@b", "alice", "")
-	arts := artworkpostgres.NewRepo(pool)
+	arts := artworkpostgres.NewRepo(db)
 	aid, _ := arts.Create(t.Context(), uid, "x", "", "private")
-	return imagepostgres.NewRepo(pool), aid
+	return imagepostgres.NewRepo(db), aid
 }
 
 func TestCase17_RetryWithSameClientIDAndSameBytes_IsNoOp(t *testing.T) {
@@ -82,7 +80,6 @@ func TestListByArtwork_ReturnsImagesInPositionOrder(t *testing.T) {
 	repo, aid := setup(t)
 	ctx := context.Background()
 
-	// Insert 3 images at positions 2, 0, 1 to verify ordering.
 	for _, p := range []int{2, 0, 1} {
 		_, err := repo.Insert(ctx, imagepostgres.InsertInput{
 			ArtworkID:     aid,
@@ -106,7 +103,6 @@ func TestListByArtwork_ReturnsImagesInPositionOrder(t *testing.T) {
 	if len(got) != 3 {
 		t.Fatalf("expected 3 images, got %d", len(got))
 	}
-	// Verify position order: 0, 1, 2.
 	for i, im := range got {
 		if im.Position != i {
 			t.Fatalf("image[%d].Position = %d, want %d", i, im.Position, i)

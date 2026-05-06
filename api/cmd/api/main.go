@@ -43,12 +43,12 @@ func main() {
 		log.Error().Err(err).Msg("migrate")
 		os.Exit(1)
 	}
-	pool, err := database.New(ctx, cfg.DatabaseURL)
+	db, cleanup, err := database.NewGormDB(infraconfig.DatabaseConfig{URL: cfg.DatabaseURL})
 	if err != nil {
 		log.Error().Err(err).Msg("db")
 		os.Exit(1)
 	}
-	defer pool.Close()
+	defer cleanup()
 
 	var store infrastorage.Storage
 	switch {
@@ -77,10 +77,10 @@ func main() {
 	jwts := authservice.NewJWT(jwtKey, time.Now)
 	urls := signing.NewURLBuilder(cfg.CDNOrigin, signKey, time.Now)
 
-	users := userpostgres.NewRepo(pool)
-	arts := artworkpostgres.NewRepo(pool)
-	tags := artworkpostgres.NewTagsRepo(pool)
-	images := imagepostgres.NewRepo(pool)
+	users := userpostgres.NewRepo(db)
+	arts := artworkpostgres.NewRepo(db)
+	tags := artworkpostgres.NewTagsRepo(db)
+	images := imagepostgres.NewRepo(db)
 	imgSvc := imageservice.NewService(store, images, arts)
 	upload := imagehttp.NewHandler(imgSvc, arts, urls)
 	rollbackReporter := artworklog.NewZerologReporter(logger)

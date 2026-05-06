@@ -29,3 +29,23 @@ func TestUniqueConstraint_PgErrorReturnsConstraintName(t *testing.T) {
 		t.Fatalf("expected users_slug_key, got %q", got)
 	}
 }
+
+func TestToDomainUser_NilAvatarBecomesEmpty(t *testing.T) {
+	m := &userModel{ID: "u1", Slug: "alice", DisplayName: "Alice", Email: "a@b", AvatarURL: nil}
+	u := toDomainUser(m)
+	if u.AvatarURL != "" {
+		t.Fatalf("nil AvatarURL should map to empty string, got %q", u.AvatarURL)
+	}
+	if u.ID != "u1" || u.Slug != "alice" || u.DisplayName != "Alice" || u.Email != "a@b" {
+		t.Fatalf("unexpected mapping: %+v", u)
+	}
+}
+
+func TestToDomainUser_PtrAvatarPropagates(t *testing.T) {
+	v := "https://cdn/example.png"
+	m := &userModel{ID: "u2", Slug: "bob", DisplayName: "Bob", Email: "b@b", AvatarURL: &v}
+	u := toDomainUser(m)
+	if u.AvatarURL != v {
+		t.Fatalf("got %q want %q", u.AvatarURL, v)
+	}
+}
