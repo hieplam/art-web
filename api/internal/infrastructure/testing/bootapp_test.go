@@ -8,9 +8,9 @@ import (
 )
 
 func TestBootApp_HealthzReturns200(t *testing.T) {
-	srv := infratest.BootApp(t, infratest.BootOpts{})
+	booted := infratest.BootApp(t, infratest.BootOpts{})
 
-	resp, err := http.Get(srv.URL + "/healthz")
+	resp, err := http.Get(booted.Server.URL + "/healthz")
 	if err != nil {
 		t.Fatalf("GET /healthz: %v", err)
 	}

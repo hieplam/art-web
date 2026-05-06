@@ -1,194 +1,36 @@
-package server
+package seeder
 
 import (
 	"bytes"
-	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"embed"
-	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
-	"fmt"
 	stdimage "image"
 	"image/color"
 	_ "image/jpeg"
 	"image/png"
 	"math"
 	mrand "math/rand/v2"
-	"net/http"
 	"path"
-	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/buckket/go-blurhash"
-	"github.com/google/uuid"
-
-	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
-	authhttp "local/art-web/api/internal/auth/adapters/http"
-	authservice "local/art-web/api/internal/auth/service"
-	imagepostgres "local/art-web/api/internal/image/adapters/postgres"
-	infrastorage "local/art-web/api/internal/infrastructure/storage"
-	userpostgres "local/art-web/api/internal/user/adapters/postgres"
 )
 
 // seedsFS holds curated retro-style images bundled at compile time. Drop
-// your own images into api/internal/infrastructure/server/seeds/ and rebuild — the
-// loader will pick them up. JPEG and PNG are both supported. If the
-// directory has no usable images, the procedural generator runs as a
-// fallback so /dev/seed never blocks on missing content.
+// images into api/internal/seeder/seeds/ and rebuild — the loader will pick
+// them up. JPEG and PNG are both supported. If the directory has no usable
+// images, the procedural generator runs as a fallback so seeding never
+// blocks on missing content.
 //
 //go:embed seeds
 var seedsFS embed.FS
 
-// DevSeed handles the POST /dev/seed endpoint, only active when AppEnv == "test".
-type DevSeed struct {
-	AppEnv   string
-	Users    *userpostgres.Repo
-	Artworks *artworkpostgres.Repo
-	Tags     *artworkpostgres.TagsRepo
-	Images   *imagepostgres.Repo
-	Store    infrastorage.Storage
-	JWT      *authservice.JWT
-	Cookie   authhttp.CookieOpts
-}
-
-type seedResponse struct {
-	AliceCookie string `json:"aliceCookie"`
-	BobCookie   string `json:"bobCookie"`
-	AliceSlug   string `json:"aliceSlug"`
-	BobSlug     string `json:"bobSlug"`
-	PID         string `json:"pId"`
-	QID         string `json:"qId"`
-}
-
-func (h *DevSeed) handle(w http.ResponseWriter, r *http.Request) {
-	if h.AppEnv != "test" {
-		http.NotFound(w, r)
-		return
-	}
-
-	ctx := r.Context()
-	suffix := r.URL.Query().Get("suffix")
-	if suffix == "" {
-		suffix = devRandHex(4)
-	}
-	aliceSlug := "alice-" + suffix
-	bobSlug := "bob-" + suffix
-	aliceID, err := h.Users.UpsertOAuth(ctx, "test", "alice-"+suffix, "alice@test", aliceSlug, "")
-	if err != nil {
-		writeSeedErr(w, err)
-		return
-	}
-	bobID, err := h.Users.UpsertOAuth(ctx, "test", "bob-"+suffix, "bob@test", bobSlug, "")
-	if err != nil {
-		writeSeedErr(w, err)
-		return
-	}
-
-	pID, err := h.Artworks.Create(ctx, aliceID, "Public P", "Seeded public artwork P", "public")
-	if err != nil {
-		writeSeedErr(w, err)
-		return
-	}
-	qID, err := h.Artworks.Create(ctx, aliceID, "Private Q", "Seeded private artwork Q", "private")
-	if err != nil {
-		writeSeedErr(w, err)
-		return
-	}
-
-	if err := h.Tags.SetTags(ctx, pID, []string{"t"}); err != nil {
-		writeSeedErr(w, err)
-		return
-	}
-	if err := h.Tags.SetTags(ctx, qID, []string{"t"}); err != nil {
-		writeSeedErr(w, err)
-		return
-	}
-
-	if err := h.attachSeedImage(ctx, pID, "public", "seed-p", 0); err != nil {
-		writeSeedErr(w, err)
-		return
-	}
-	if err := h.attachSeedImage(ctx, qID, "private", "seed-q", 0); err != nil {
-		writeSeedErr(w, err)
-		return
-	}
-
-	if many, _ := strconv.Atoi(r.URL.Query().Get("many")); many > 0 {
-		const maxMany = 200
-		if many > maxMany {
-			many = maxMany
-		}
-		for i := 0; i < many; i++ {
-			id, err := h.Artworks.Create(ctx, aliceID, fmt.Sprintf("Bulk %d", i), "Seeded bulk artwork", "public")
-			if err != nil {
-				writeSeedErr(w, err)
-				return
-			}
-			if err := h.attachSeedImage(ctx, id, "public", fmt.Sprintf("seed-bulk-%d", i), 0); err != nil {
-				writeSeedErr(w, err)
-				return
-			}
-		}
-	}
-
-	aliceJWT, err := h.JWT.Issue(aliceID, time.Hour)
-	if err != nil {
-		writeSeedErr(w, err)
-		return
-	}
-	bobJWT, err := h.JWT.Issue(bobID, time.Hour)
-	if err != nil {
-		writeSeedErr(w, err)
-		return
-	}
-
-	out := seedResponse{
-		AliceCookie: "auth=" + aliceJWT,
-		BobCookie:   "auth=" + bobJWT,
-		AliceSlug:   aliceSlug,
-		BobSlug:     bobSlug,
-		PID:         pID,
-		QID:         qID,
-	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	_ = json.NewEncoder(w).Encode(out)
-}
-
-func (h *DevSeed) attachSeedImage(ctx context.Context, artworkID, visibility, clientID string, position int) error {
-	imageID := uuid.NewString()
-	src, err := pickSeedSource(clientID)
-	if err != nil {
-		return err
-	}
-	key := fmt.Sprintf("%s/%s/%s%s", visibility, artworkID, imageID, src.ext)
-
-	if err := h.Store.Put(ctx, key, bytes.NewReader(src.bytes), src.contentType); err != nil {
-		return err
-	}
-	_, err = h.Images.Insert(ctx, imagepostgres.InsertInput{
-		ID:            imageID,
-		ArtworkID:     artworkID,
-		ClientImageID: clientID,
-		ContentType:   src.contentType,
-		StorageKey:    key,
-		SourceSHA256:  src.sha256Hex,
-		Position:      position,
-		Width:         src.width,
-		Height:        src.height,
-		ByteSize:      len(src.bytes),
-		Blurhash:      src.blurhash,
-	})
-	return err
-}
-
 // seedSource is one resolved seed image — either a curated file from
-// `seeds/` or a deterministically generated procedural image. Metadata
-// (dimensions, blurhash, sha256) is precomputed so attachSeedImage stays
-// cheap when the same source is reused across many seeded artworks.
+// seeds/ or a deterministically generated procedural image. Metadata is
+// precomputed so attachSeedImage stays cheap when the same source is reused
+// across many seeded artworks.
 type seedSource struct {
 	bytes       []byte
 	contentType string
@@ -248,8 +90,6 @@ func loadEmbeddedSeeds() {
 				continue
 			}
 			name := e.Name()
-			// Quick extension gate to skip README.md / .gitkeep without paying
-			// the cost of a decode attempt on every non-image entry.
 			extLower := strings.ToLower(path.Ext(name))
 			if extLower != ".jpg" && extLower != ".jpeg" && extLower != ".png" {
 				continue
@@ -258,10 +98,8 @@ func loadEmbeddedSeeds() {
 			if err != nil || len(raw) < 256 {
 				continue
 			}
-			// Trust the bytes, not the filename. Some web galleries hand out
-			// .png-named URLs that contain JPEG-encoded data; the file
-			// extension is unreliable for content type. image.Decode tells
-			// us the actual format.
+			// Trust the bytes, not the filename: some web galleries hand out
+			// .png-named URLs that contain JPEG-encoded data.
 			img, fmtName, err := stdimage.Decode(bytes.NewReader(raw))
 			if err != nil {
 				continue
@@ -294,31 +132,19 @@ func loadEmbeddedSeeds() {
 	})
 }
 
-func writeSeedErr(w http.ResponseWriter, err error) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(500)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": "seed_failed", "message": err.Error()})
-}
-
-func devRandHex(n int) string {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
-}
-
 // ── Procedural seed artwork generator ────────────────────────────────────────
 //
-// generateSeedArtwork produces a deterministic painterly image keyed on clientID.
-// Same clientID → same image bytes. Outputs varied aspect ratios and three
-// composition styles so a seeded feed reads as a curated gallery drop, not a
-// tile of identical placeholders.
+// generateSeedArtwork produces a deterministic painterly image keyed on
+// clientID. Same clientID → same image bytes. Outputs varied aspect ratios
+// and three composition styles so a seeded feed reads as a curated gallery
+// drop, not a tile of identical placeholders.
 
 // 960px long edge — large enough to look gallery-grade in the masonry,
 // small enough that PNG encode stays well under the seed-time budget.
 const seedLongEdge = 960
 
 // Aspect ratios cycle deterministically by index (derived from the seed),
-// so a `many=N` seed produces a believable mix of portraits, squares,
+// so a many=N seed produces a believable mix of portraits, squares,
 // landscapes, and ultrawides.
 var seedAspects = [...][2]int{
 	{2, 3},  // portrait
@@ -329,8 +155,9 @@ var seedAspects = [...][2]int{
 	{16, 9}, // ultrawide
 }
 
-// Eight curated three-color palettes tuned in OKLab. Each palette commits to a
-// mood (ember-night, ice-teal, …) so a feed has range without feeling random.
+// Eight curated three-color palettes tuned in OKLab. Each palette commits to
+// a mood (ember-night, ice-teal, …) so a feed has range without feeling
+// random.
 type palette struct {
 	a, b, c color.NRGBA
 }
@@ -346,8 +173,8 @@ var seedPalettes = [...]palette{
 	{color.NRGBA{0x14, 0x0e, 0x06, 0xff}, color.NRGBA{0x8c, 0x60, 0x1f, 0xff}, color.NRGBA{0xf3, 0xe1, 0xab, 0xff}}, // warm-rust
 }
 
-// generateSeedArtwork builds a procedural image deterministically from clientID.
-// Returns the in-memory image (for blurhash encoding) and the PNG-encoded bytes.
+// generateSeedArtwork builds a procedural image deterministically from
+// clientID. Returns the in-memory image (for blurhash) and the PNG bytes.
 func generateSeedArtwork(clientID string) (stdimage.Image, []byte, error) {
 	seed := seedFromString(clientID)
 	rng := mrand.New(mrand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
@@ -375,13 +202,6 @@ func generateSeedArtwork(clientID string) (stdimage.Image, []byte, error) {
 	return img, buf.Bytes(), nil
 }
 
-// seedFromString hashes the input string into a stable uint64 RNG seed.
-// Deterministic across runs and platforms.
-func seedFromString(s string) uint64 {
-	sum := sha256.Sum256([]byte(s))
-	return binary.LittleEndian.Uint64(sum[:8])
-}
-
 // dimsFromAspect returns the largest (w, h) honoring aspect (aw:ah) with the
 // long edge fixed at long. Both are rounded down to even ints (PNG-friendly).
 func dimsFromAspect(aw, ah, long int) (int, int) {
@@ -397,8 +217,9 @@ func dimsFromAspect(aw, ah, long int) (int, int) {
 
 // ── Composition styles ───────────────────────────────────────────────────────
 
-// paintGradientField fills with a 2-stop gradient (corner→corner) plus a soft
-// low-frequency sin/cos noise that gives the field a hand-made wash quality.
+// paintGradientField fills with a 2-stop gradient (corner→corner) plus a
+// soft low-frequency sin/cos noise that gives the field a hand-made wash
+// quality.
 func paintGradientField(img *stdimage.NRGBA, p palette, rng *mrand.Rand) {
 	w, h := img.Bounds().Dx(), img.Bounds().Dy()
 	angle := rng.Float64() * 2 * math.Pi
@@ -424,7 +245,6 @@ func paintGradientField(img *stdimage.NRGBA, p palette, rng *mrand.Rand) {
 			t = clamp01(t + noise*0.08)
 			base := lerpColor(a, b, t)
 
-			// Subtle highlight veil from corner bias.
 			veil := math.Max(0, 0.5-math.Hypot(float64(x)/float64(w)-0.2, float64(y)/float64(h)-0.2))
 			base = lerpColor(base, highlight, veil*0.35)
 
@@ -433,12 +253,12 @@ func paintGradientField(img *stdimage.NRGBA, p palette, rng *mrand.Rand) {
 	}
 }
 
-// paintBlockConstructivism stacks 3–6 translucent rectangles in palette order
-// over a base wash. Bold, graphic, but still painterly because of the dither.
+// paintBlockConstructivism stacks 3–6 translucent rectangles in palette
+// order over a base wash. Bold, graphic, but still painterly because of
+// the dither.
 func paintBlockConstructivism(img *stdimage.NRGBA, p palette, rng *mrand.Rand) {
 	w, h := img.Bounds().Dx(), img.Bounds().Dy()
 
-	// Base wash in the deepest tone.
 	for y := range h {
 		for x := range w {
 			img.SetNRGBA(x, y, p.a)
@@ -458,7 +278,6 @@ func paintBlockConstructivism(img *stdimage.NRGBA, p palette, rng *mrand.Rand) {
 		fillRectAlpha(img, x0, y0, bw, bh, col)
 	}
 
-	// Light dither to break up flat fills.
 	for y := range h {
 		for x := range w {
 			if rng.IntN(96) == 0 {
@@ -473,8 +292,8 @@ func paintBlockConstructivism(img *stdimage.NRGBA, p palette, rng *mrand.Rand) {
 	}
 }
 
-// paintParticleDrift lays a base wash, then scatters 220–360 soft circles of
-// varied size and opacity. Reads as digital fog / starfield / dust.
+// paintParticleDrift lays a base wash, then scatters 220–360 soft circles
+// of varied size and opacity. Reads as digital fog / starfield / dust.
 func paintParticleDrift(img *stdimage.NRGBA, p palette, rng *mrand.Rand) {
 	w, h := img.Bounds().Dx(), img.Bounds().Dy()
 
@@ -575,9 +394,7 @@ func blendOver(dst, src color.NRGBA) color.NRGBA {
 	}
 }
 
-// lerpColor linearly interpolates two opaque colors in straight RGB. Cheap
-// and visually acceptable for our painterly-dark palette where blends rarely
-// cross hue boundaries dramatically.
+// lerpColor linearly interpolates two opaque colors in straight RGB.
 func lerpColor(a, b color.NRGBA, t float64) color.NRGBA {
 	t = clamp01(t)
 	return color.NRGBA{

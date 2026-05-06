@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"gorm.io/gorm"
 
 	artworkhttp "local/art-web/api/internal/artwork/adapters/http"
 	artworkpostgres "local/art-web/api/internal/artwork/adapters/postgres"
@@ -25,13 +26,24 @@ import (
 	"local/art-web/api/pkg/signing"
 )
 
+// Booted bundles the test fixtures the contract suite needs in one return
+// value. The DB and JWT are exposed so callers can drive seeder.Run directly
+// (Phase 1 Task 10 replaced the legacy /dev/seed HTTP route with a package
+// call that takes the DB it should write to).
+type Booted struct {
+	Server *httptest.Server
+	DB     *gorm.DB
+	JWT    *authservice.JWT
+	Store  infrastorage.Storage
+}
+
 // BootOpts injects deterministic sources for the contract suite. Any zero
 // field falls back to the current production default.
 type BootOpts struct {
 	// FixedNow, when non-zero, replaces every JWT/URL clock with a constant.
 	FixedNow time.Time
 
-	// AppEnv defaults to "test" so the dev seed route is registered.
+	// AppEnv defaults to "test" so test-only middleware/handler branches activate.
 	AppEnv string
 
 	// Frontend defaults to "http://localhost:3000/".
@@ -59,12 +71,15 @@ type BootOpts struct {
 	RandReader authhttp.RandReader
 }
 
-// BootApp returns an *httptest.Server backed by the slice routers + server
+// BootApp returns a Booted bundle backed by the slice routers + server
 // composition against a fresh testcontainers Postgres + a local-filesystem
 // store under t.TempDir(). It mirrors the production wire setup but builds
 // each piece explicitly so the contract suite can substitute deterministic
 // providers without going through wire_gen.go.
-func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
+//
+// The DB and JWT are exposed in the return so the contract suite can call
+// seeder.Run directly (the legacy /dev/seed HTTP route was removed in Task 10).
+func BootApp(t testing.TB, opts BootOpts) *Booted {
 	t.Helper()
 
 	if opts.AppEnv == "" {
@@ -93,7 +108,7 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 	// in the same binary both call BootApp concurrently, the second TruncateAll
 	// will wipe data seeded by the first. Call BootApp once per suite invocation
 	// (not once per test case), or migrate to per-call sub-schemas if isolation
-	// is required. PR 0.7's contract suite only seeds once via /dev/seed.
+	// is required. The contract suite only seeds once via seeder.Run.
 	TruncateAllGorm(t, db)
 
 	store := infrastorage.NewLocalFS(t.TempDir())
@@ -144,16 +159,15 @@ func BootApp(t testing.TB, opts BootOpts) *httptest.Server {
 
 	registrars := server.ProvideRouteRegistrars(authR, userR, artworkR, imageR)
 
-	devseed := &server.DevSeed{
-		AppEnv: opts.AppEnv, Users: users, Artworks: arts,
-		Tags: tags, Images: images, Store: store,
-		JWT: jwts, Cookie: authhttp.CookieOpts{Secure: false},
-	}
-
 	router := server.NewRouter(authMW, registrars, server.AllowedOrigin(opts.AllowedOrigin),
-		server.AppEnv(opts.AppEnv), devseed)
+		server.AppEnv(opts.AppEnv))
 
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
-	return srv
+	return &Booted{
+		Server: srv,
+		DB:     db,
+		JWT:    jwts,
+		Store:  store,
+	}
 }

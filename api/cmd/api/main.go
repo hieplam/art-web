@@ -114,14 +114,8 @@ func main() {
 
 	registrars := server.ProvideRouteRegistrars(authR, userR, artworkR, imageR)
 
-	devseed := &server.DevSeed{
-		AppEnv: cfg.AppEnv, Users: users, Artworks: arts,
-		Tags: tags, Images: images, Store: store,
-		JWT: jwts, Cookie: cookieOpts,
-	}
-
 	r := server.NewRouter(authMW, registrars, server.AllowedOrigin(cfg.AllowedOrigin),
-		server.AppEnv(cfg.AppEnv), devseed)
+		server.AppEnv(cfg.AppEnv))
 
 	log.Info().Str("addr", cfg.Addr).Msg("listening")
 	if err := http.ListenAndServe(cfg.Addr, r); err != nil {

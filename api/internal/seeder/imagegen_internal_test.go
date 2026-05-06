@@ -1,4 +1,4 @@
-package server
+package seeder
 
 import (
 	"bytes"

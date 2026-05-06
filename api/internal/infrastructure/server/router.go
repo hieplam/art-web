@@ -13,15 +13,15 @@ import (
 )
 
 // AppEnv is a typed string so Wire can distinguish it from other stringly-typed
-// providers. The DevSeed mount and only-in-test branches read it directly.
+// providers. Routers gate test-only behavior on this; production wires "prod".
 type AppEnv string
 
 // AllowedOrigin is a typed string for the same reason as AppEnv.
 type AllowedOrigin string
 
 // Deps is the legacy bundle accepted by New. New code uses NewRouter, which
-// takes the slice routers + a DevSeed registrar via Wire. Deps stays for
-// existing tests (testutil_test.go, bootapp.go) that haven't migrated yet.
+// takes the slice routers via Wire. Deps stays for existing tests
+// (testutil_test.go, bootapp.go) that haven't migrated yet.
 type Deps struct {
 	AppEnv        string
 	JWT           *service.JWT
@@ -34,21 +34,19 @@ type Deps struct {
 	// their own registrar slice pass it here; production wiring goes through
 	// NewRouter directly.
 	Registrars []RouteRegistrar
-
-	// DevSeed, when non-nil and AppEnv == "test", mounts POST /dev/seed on
-	// the composed router. Production passes nil.
-	DevSeed *DevSeed
 }
 
 // NewRouter assembles a chi router from the cross-cutting middleware stack +
 // the slice route registrars. Wire calls this once at app boot. The caller
 // (cmd/api or BootApp) wraps the result into *http.Server.
+//
+// /dev/seed used to mount here in test mode (Phase 1 Task 10 removed it —
+// callers now invoke cmd/seeder directly or `seeder.Run` from Go tests).
 func NewRouter(
 	mw *authhttp.Middleware,
 	registrars []RouteRegistrar,
 	allowed AllowedOrigin,
-	appEnv AppEnv,
-	devseed *DevSeed,
+	_ AppEnv,
 ) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
@@ -64,10 +62,6 @@ func NewRouter(
 	for _, rr := range registrars {
 		rr.RegisterRoutes(r)
 	}
-
-	if appEnv == "test" && devseed != nil {
-		r.Post("/dev/seed", devseed.handle)
-	}
 	return r
 }
 
@@ -81,6 +75,5 @@ func New(d *Deps) chi.Router {
 		d.Registrars,
 		AllowedOrigin(d.AllowedOrigin),
 		AppEnv(d.AppEnv),
-		d.DevSeed,
 	)
 }
