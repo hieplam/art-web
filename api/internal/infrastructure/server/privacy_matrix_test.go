@@ -5,7 +5,6 @@ import (
 	"testing"
 )
 
-
 type privacyCase struct {
 	name           string
 	viewer         string

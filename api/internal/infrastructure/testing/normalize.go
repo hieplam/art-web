@@ -21,7 +21,7 @@ var (
 	// escaping, which writes `&` as `&` in JSON string values. The regex
 	// matches both forms so the rule fires whether the body bytes hold literal
 	// `&` or the escaped sequence.
-	signedURLRe  = regexp.MustCompile(`\?sig=[0-9a-f]+(?:&|\\u0026)exp=\d+`)
+	signedURLRe = regexp.MustCompile(`\?sig=[0-9a-f]+(?:&|\\u0026)exp=\d+`)
 	// cookieAuthRe is anchored with ^ so the rule ONLY rewrites the cookie's
 	// own name=value at the start of a Set-Cookie value, never an unrelated
 	// substring like `xauth=` or a Domain attribute that happens to contain

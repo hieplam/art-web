@@ -3,6 +3,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"gorm.io/gorm"
@@ -73,6 +74,9 @@ func (r *Repo) Create(ctx context.Context, userID, title, description, visibilit
 func (r *Repo) Get(ctx context.Context, id string) (*Artwork, error) {
 	var m artworkModel
 	err := database.DB(ctx, r.db).WithContext(ctx).First(&m, "id = ?", id).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, artworkdomain.ErrNotFound
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +227,12 @@ func (r *Repo) PendingFlipMoves(ctx context.Context, artworkID, fromVis, toVis s
 		if !strings.HasPrefix(im.StorageKey, fromVis+"/") {
 			return nil, &flipPrefixError{src: im.StorageKey, fromVis: fromVis}
 		}
-		dst := toVis + strings.TrimPrefix(im.StorageKey, fromVis)
+		// We've already verified the key starts with fromVis+"/", so the
+		// remainder is everything from len(fromVis) onward (which begins with
+		// the slash). Splicing on the slice index is clearer than the older
+		// TrimPrefix(fromVis) form, which depended on TrimPrefix retaining
+		// the slash byte after a fromVis-only match.
+		dst := toVis + im.StorageKey[len(fromVis):]
 		moves = append(moves, FlipMove{ID: im.ID, Src: im.StorageKey, Dst: dst})
 	}
 	return moves, nil
@@ -264,4 +273,3 @@ type flipPrefixError struct {
 func (e *flipPrefixError) Error() string {
 	return "storage_key " + e.src + " does not match artwork visibility " + e.fromVis
 }
-

@@ -116,4 +116,3 @@ func TestMiddleware_Methods_Compose(t *testing.T) {
 		t.Fatalf("authed request: status=%d want 200", rec.Code)
 	}
 }
-

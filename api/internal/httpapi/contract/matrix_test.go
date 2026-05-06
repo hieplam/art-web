@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"local/art-web/api/internal/httpapi/contract"
 	imageservice "local/art-web/api/internal/image/service"
 	infratest "local/art-web/api/internal/infrastructure/testing"
-	"local/art-web/api/internal/httpapi/contract"
 	"local/art-web/api/internal/seeder"
 )
 
@@ -47,9 +47,9 @@ type contractCase struct {
 	name    string
 	method  string
 	path    string
-	viewer  string // "anon", "owner", "other"
-	body    string // body bytes; empty allowed
-	ctype   string // Content-Type override; if empty and body != "" defaults to application/json
+	viewer  string                                 // "anon", "owner", "other"
+	body    string                                 // body bytes; empty allowed
+	ctype   string                                 // Content-Type override; if empty and body != "" defaults to application/json
 	bodyMP  func(t *testing.T) (io.Reader, string) // optional: builds a multipart body & returns ctype
 	cookies []*http.Cookie                         // optional: extra cookies (e.g. oauth_state for callback cells)
 }

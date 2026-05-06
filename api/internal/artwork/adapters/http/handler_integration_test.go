@@ -34,20 +34,20 @@ import (
 )
 
 type intEnv struct {
-	router    chi.Router
-	jwts      *authservice.JWT
-	users     *userpostgres.Repo
-	arts      *artworkpostgres.Repo
-	tags      *artworkpostgres.TagsRepo
-	images    *imagepostgres.Repo
-	store     infrastorage.Storage
-	urls      *signing.URLBuilder
-	aliceID   string
-	bobID     string
-	aliceTok  string
-	pubID     string
-	privID    string
-	tagged    string // tag name applied to pubID
+	router   chi.Router
+	jwts     *authservice.JWT
+	users    *userpostgres.Repo
+	arts     *artworkpostgres.Repo
+	tags     *artworkpostgres.TagsRepo
+	images   *imagepostgres.Repo
+	store    infrastorage.Storage
+	urls     *signing.URLBuilder
+	aliceID  string
+	bobID    string
+	aliceTok string
+	pubID    string
+	privID   string
+	tagged   string // tag name applied to pubID
 }
 
 func newIntEnv(t *testing.T) *intEnv {

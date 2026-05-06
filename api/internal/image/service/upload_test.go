@@ -74,8 +74,10 @@ func loadJPEG(t *testing.T) []byte {
 
 func TestUploadOne_StoragePutFailure_Surfaces(t *testing.T) {
 	repo := &stubRepo{
-		findFn:   func(_ context.Context, _, _ string) (*imagepostgres.InsertedImage, error) { return nil, nil },
-		insertFn: func(_ context.Context, _ imagepostgres.InsertInput) (*imagepostgres.InsertResult, error) { return &imagepostgres.InsertResult{}, nil },
+		findFn: func(_ context.Context, _, _ string) (*imagepostgres.InsertedImage, error) { return nil, nil },
+		insertFn: func(_ context.Context, _ imagepostgres.InsertInput) (*imagepostgres.InsertResult, error) {
+			return &imagepostgres.InsertResult{}, nil
+		},
 	}
 	store := &stubStore{failPut: true}
 	svc := &Service{store: store, images: repo, artworks: nil, ids: NewUUIDProvider()}

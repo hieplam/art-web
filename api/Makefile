@@ -21,11 +21,13 @@ help:
 	@echo "Note: every test target needs Docker running (testcontainers Postgres + MinIO)."
 	@echo "First run boots containers cold (~10-30s); subsequent runs reuse via sync.Once."
 
+STATICCHECK_VER = v0.6.1
+
 tidy:               ; go mod tidy
 build:              ; go build -o bin/api ./cmd/api
 test:               ; go test -coverprofile=/tmp/coverage.out ./...  && go tool cover --func=/tmp/coverage.out
 test-race:          ; go test -race ./...
-lint:               ; go vet ./... && go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+lint:               ; go vet ./... && go run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VER) ./...
 
 # Byte-strict HTTP contract suite. Replays 56 captured goldens from PR 0.8.
 # Failures here mean Phase 1 changed an observable HTTP byte — see
@@ -59,7 +61,7 @@ test-cover-html:
 # target (~90s warm). Run before opening a PR or merging to master.
 test-all:
 	go vet ./...
-	go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+	go run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VER) ./...
 	go test -race -coverprofile=/tmp/coverage.out ./...
 	@echo "---"
 	go tool cover -func=/tmp/coverage.out | tail -1
@@ -80,30 +82,37 @@ banned-imports:
 # Coverage gate (spec §10.1): each business slice must hit ≥80% statement
 # coverage. Reuses test-cover-slices' per-slice -coverpkg profile and parses
 # go tool cover's "total: ... %" line for a numeric comparison.
+#
+# -count=1 is required: go test's coverage cache otherwise returns stale
+# per-package profiles after edits to production files, which produced the
+# spurious "artwork dropped from 82% to 64%" failures during Task 8/9 review.
 cover-threshold:
-	@set -e ; \
-	threshold=80.0 ; \
+	@threshold=80.0 ; \
+	failed=0 ; \
 	for pkg in auth user artwork image; do \
-	  go test -coverpkg=./internal/$$pkg/... -coverprofile=/tmp/cov-$$pkg.out ./internal/$$pkg/... >/dev/null ; \
+	  go test -count=1 -coverpkg=./internal/$$pkg/... -coverprofile=/tmp/cov-$$pkg.out ./internal/$$pkg/... >/dev/null || { echo "  $$pkg: test failed" >&2 ; failed=1 ; continue ; } ; \
 	  pct=$$(go tool cover -func=/tmp/cov-$$pkg.out | awk '/^total:/{gsub("%","",$$3); print $$3}') ; \
-	  awk -v p="$$pct" -v t="$$threshold" 'BEGIN{ if (p+0 < t+0) exit 1 }' \
-	    && echo "  $$pkg: $$pct% OK" \
-	    || { echo "  $$pkg: $$pct% < $$threshold% FAIL" >&2 ; exit 1 ; } ; \
-	done
+	  if awk -v p="$$pct" -v t="$$threshold" 'BEGIN{ exit (p+0 < t+0) }' ; then \
+	    echo "  $$pkg: $$pct% OK" ; \
+	  else \
+	    echo "  $$pkg: $$pct% < $$threshold% FAIL" >&2 ; \
+	    failed=1 ; \
+	  fi ; \
+	done ; \
+	exit $$failed
 
-.PHONY: wire wire-verify mocks
+.PHONY: wire wire-verify
+
+# Pinned tool versions: keep these in sync with go.mod's require block so CI
+# is reproducible. The legacy targets used @latest, which silently broke wire
+# when v0.8 shipped a backwards-incompatible change.
+WIRE_VER = v0.7.0
 
 # Regenerate cmd/api/wire_gen.go from wire.go.
 wire:
-	cd cmd/api && go run github.com/google/wire/cmd/wire@latest ./...
+	cd cmd/api && go run github.com/google/wire/cmd/wire@$(WIRE_VER) ./...
 
 # Fail if wire_gen.go is stale relative to wire.go (CI gate per spec §6.6).
 wire-verify:
-	cd cmd/api && go run github.com/google/wire/cmd/wire@latest ./...
+	cd cmd/api && go run github.com/google/wire/cmd/wire@$(WIRE_VER) ./...
 	git diff --exit-code cmd/api/wire_gen.go
-
-# Regenerate ports/<slice>/mocks via mockery v3.
-# NOTE: .mockery.yaml lands in Task 7; running this target before then
-# fails immediately with a config-not-found error from mockery.
-mocks:
-	go run github.com/vektra/mockery/v3@latest --config .mockery.yaml
