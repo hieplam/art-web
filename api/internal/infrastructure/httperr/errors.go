@@ -17,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 
 	artworkdomain "local/art-web/api/internal/artwork/domain"
+	authdomain "local/art-web/api/internal/auth/domain"
 	imagedomain "local/art-web/api/internal/image/domain"
 	imageservice "local/art-web/api/internal/image/service"
 	userdomain "local/art-web/api/internal/user/domain"
@@ -31,13 +32,36 @@ type HTTPError struct {
 	Message string `json:"message,omitempty"`
 }
 
-// ErrBadJSON is the http-layer sentinel for JSON decode failures.
-// Handlers that encounter json.Decode errors pass this to WriteError.
-var ErrBadJSON = errors.New("bad json")
-
-// ErrBadCursor is the sentinel for cursor-parse failures. Use WrapBadCursor
-// to carry the original parse-error message through WriteError.
-var ErrBadCursor = errors.New("bad cursor")
+// HTTP-layer sentinels — handlers pass these to WriteError to map onto the
+// captured (status, code) pairs from error_codes_observed.md. Domain-layer
+// sentinels (auth/domain.ErrBadState, image/domain.ErrPositionTaken, etc.)
+// are recognized directly and do not need package-local mirrors.
+var (
+	// ErrBadJSON: JSON decode failure on a request body. Maps to 400 bad_json.
+	ErrBadJSON = errors.New("bad json")
+	// ErrBadCursor: cursor parameter could not be parsed. Use WrapBadCursor
+	// to attach the underlying parse-error message for the Shape-B response.
+	ErrBadCursor = errors.New("bad cursor")
+	// ErrUnauthorized: caller required to authenticate but did not.
+	// Maps to 401 unauthorized. Auth middleware emits this for missing or
+	// invalid JWT cookies.
+	ErrUnauthorized = errors.New("unauthorized")
+	// ErrUnsupportedMediaType: image upload endpoint received a non-multipart
+	// Content-Type. Maps to 415 unsupported_media_type.
+	ErrUnsupportedMediaType = errors.New("unsupported media type")
+	// ErrManifestRequired: image upload missing the required manifest part.
+	// Maps to 400 manifest_required.
+	ErrManifestRequired = errors.New("manifest required")
+	// ErrFileCountMismatch: image upload's file count does not equal the
+	// manifest entry count. Maps to 400 file_count_mismatch.
+	ErrFileCountMismatch = errors.New("file count mismatch")
+	// ErrOpenFile: image upload couldn't open a multipart File. Maps to
+	// 400 open_file (preserves the historical Shape-A leak per spec §3).
+	ErrOpenFile = errors.New("open file")
+	// ErrDecodeFailed: image bytes failed to decode (image/png, image/jpeg).
+	// Maps to 422 decode_failed.
+	ErrDecodeFailed = errors.New("decode failed")
+)
 
 // badCursorError wraps a cursor parse error so it satisfies errors.Is(ErrBadCursor)
 // while preserving the original error message for Shape B output.
@@ -56,16 +80,34 @@ func WrapBadCursor(err error) error { return &badCursorError{cause: err} }
 // a switch arm here.
 func WriteError(w http.ResponseWriter, log zerolog.Logger, err error) {
 	switch {
+	// --- 401 ---
+	case errors.Is(err, ErrUnauthorized):
+		write(w, http.StatusUnauthorized, HTTPError{Error: "unauthorized"})
+
 	// --- 404 ---
 	case errors.Is(err, userdomain.ErrNotFound),
 		errors.Is(err, artworkdomain.ErrNotFound):
 		write(w, http.StatusNotFound, HTTPError{Error: "not_found"})
+	case errors.Is(err, authdomain.ErrUnknownProvider):
+		write(w, http.StatusNotFound, HTTPError{Error: "unknown_provider"})
 
 	// --- 400 (parse) ---
 	case errors.Is(err, ErrBadJSON):
 		write(w, http.StatusBadRequest, HTTPError{Error: "bad_json"})
 	case errors.Is(err, ErrBadCursor):
 		write(w, http.StatusBadRequest, HTTPError{Error: "bad_cursor", Message: err.Error()})
+
+	// --- 400 (auth callback state mismatch) ---
+	case errors.Is(err, authdomain.ErrBadState):
+		write(w, http.StatusBadRequest, HTTPError{Error: "bad_state"})
+
+	// --- 400 (image upload structural) ---
+	case errors.Is(err, ErrManifestRequired):
+		write(w, http.StatusBadRequest, HTTPError{Error: "manifest_required"})
+	case errors.Is(err, ErrFileCountMismatch):
+		write(w, http.StatusBadRequest, HTTPError{Error: "file_count_mismatch"})
+	case errors.Is(err, ErrOpenFile):
+		write(w, http.StatusBadRequest, HTTPError{Error: "open_file"})
 
 	// --- 400 (validation — validator.ValidationErrors flows here) ---
 	case func() bool {
@@ -80,6 +122,10 @@ func WriteError(w http.ResponseWriter, log zerolog.Logger, err error) {
 	case errors.Is(err, imagedomain.ErrPositionTaken):
 		write(w, http.StatusPreconditionFailed, HTTPError{Error: "position_taken"})
 
+	// --- 415 (image: non-multipart body) ---
+	case errors.Is(err, ErrUnsupportedMediaType):
+		write(w, http.StatusUnsupportedMediaType, HTTPError{Error: "unsupported_media_type"})
+
 	// --- 409 (image: fingerprint mismatch, Shape B) ---
 	case errors.Is(err, imagedomain.ErrFingerprintMismatch):
 		write(w, http.StatusConflict, HTTPError{
@@ -88,6 +134,8 @@ func WriteError(w http.ResponseWriter, log zerolog.Logger, err error) {
 		})
 
 	// --- 422 (image) ---
+	case errors.Is(err, ErrDecodeFailed):
+		write(w, http.StatusUnprocessableEntity, HTTPError{Error: "decode_failed"})
 	case errors.Is(err, imageservice.ErrTooLarge):
 		write(w, http.StatusUnprocessableEntity, HTTPError{Error: "too_large"})
 	case errors.Is(err, imageservice.ErrContentTypeMismatch):
@@ -95,6 +143,10 @@ func WriteError(w http.ResponseWriter, log zerolog.Logger, err error) {
 			Error:   "content_type_mismatch",
 			Message: "body does not match declared content_type",
 		})
+
+	// --- 502 (auth callback OAuth exchange failure) ---
+	case errors.Is(err, authdomain.ErrExchangeFailed):
+		write(w, http.StatusBadGateway, HTTPError{Error: "exchange_failed"})
 
 	// --- 500 fallback (operation-name leaks per spec §3) ---
 	default:
