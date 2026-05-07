@@ -14,15 +14,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with: { bun-version: latest }
-      - name: Generate ephemeral signing keys for the e2e stack
-        # web/docker-compose.e2e.yml requires web/.env.local with two hex-encoded
-        # 32-byte keys. The file is gitignored (per-developer secrets in local
-        # dev), so CI synthesises throwaway keys per run — they only sign tokens
-        # against the ephemeral Postgres + MinIO that get torn down at job end.
+      - name: Generate ephemeral signing keys + fake OAuth creds for the e2e stack
+        # web/docker-compose.e2e.yml requires web/.env.local with hex-encoded
+        # 32-byte signing keys; api/.env.dev (optional) carries Google OAuth
+        # creds locally. Both files are gitignored (per-developer secrets), so
+        # CI synthesises throwaway values per run.
+        #
+        # The Playwright login_flow spec mocks accounts.google.com and only
+        # checks that GOOGLE_OAUTH_CLIENT_ID surfaces as a non-empty string in
+        # the authorize URL — any placeholder works. The signing keys gate
+        # the api against the ephemeral Postgres + MinIO that get torn down
+        # at job end.
         run: |
           {
             echo "JWT_SIGNING_KEY=$(openssl rand -hex 32)"
             echo "WORKER_SIGNING_KEY=$(openssl rand -hex 32)"
+            echo "GOOGLE_OAUTH_CLIENT_ID=fake-ci-client-id"
+            echo "GOOGLE_OAUTH_CLIENT_SECRET=fake-ci-client-secret"
           } > web/.env.local
       - name: Build + start full stack
         run: docker compose -f web/docker-compose.e2e.yml up -d --build --wait
