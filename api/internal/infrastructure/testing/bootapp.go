@@ -159,8 +159,12 @@ func BootApp(t testing.TB, opts BootOpts) *Booted {
 
 	registrars := server.ProvideRouteRegistrars(authR, userR, artworkR, imageR)
 
+	// BootApp does NOT mount /dev/seed — Go tests should call seeder.Run via
+	// the returned Booted bundle for direct, byte-identical seeding without
+	// an HTTP roundtrip. Cross-language consumers (web e2e, dev-up.sh) get
+	// the shim from production cmd/api when started with APP_ENV=test.
 	router := server.NewRouter(authMW, registrars, server.AllowedOrigin(opts.AllowedOrigin),
-		server.AppEnv(opts.AppEnv))
+		server.AppEnv(opts.AppEnv), nil)
 
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)

@@ -40,13 +40,15 @@ type Deps struct {
 // the slice route registrars. Wire calls this once at app boot. The caller
 // (cmd/api or BootApp) wraps the result into *http.Server.
 //
-// /dev/seed used to mount here in test mode (Phase 1 Task 10 removed it —
-// callers now invoke cmd/seeder directly or `seeder.Run` from Go tests).
+// devseed is a test-only shim: when non-nil AND appEnv == "test", a thin
+// /dev/seed route is mounted that delegates to seeder.Run. Production passes
+// nil and the route stays unregistered. See devseed.go for rationale.
 func NewRouter(
 	mw *authhttp.Middleware,
 	registrars []RouteRegistrar,
 	allowed AllowedOrigin,
-	_ AppEnv,
+	appEnv AppEnv,
+	devseed *DevSeed,
 ) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer)
@@ -62,6 +64,10 @@ func NewRouter(
 	for _, rr := range registrars {
 		rr.RegisterRoutes(r)
 	}
+
+	if appEnv == "test" && devseed != nil {
+		r.Post("/dev/seed", devseed.Handle)
+	}
 	return r
 }
 
@@ -75,5 +81,6 @@ func New(d *Deps) chi.Router {
 		d.Registrars,
 		AllowedOrigin(d.AllowedOrigin),
 		AppEnv(d.AppEnv),
+		nil,
 	)
 }

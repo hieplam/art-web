@@ -114,8 +114,15 @@ func main() {
 
 	registrars := server.ProvideRouteRegistrars(authR, userR, artworkR, imageR)
 
+	// /dev/seed shim: only built when running with APP_ENV=test. Production
+	// boots leave this nil, so the route stays unregistered.
+	var devseed *server.DevSeed
+	if cfg.AppEnv == "test" {
+		devseed = &server.DevSeed{DB: db, Store: store, JWT: jwts}
+	}
+
 	r := server.NewRouter(authMW, registrars, server.AllowedOrigin(cfg.AllowedOrigin),
-		server.AppEnv(cfg.AppEnv))
+		server.AppEnv(cfg.AppEnv), devseed)
 
 	log.Info().Str("addr", cfg.Addr).Msg("listening")
 	if err := http.ListenAndServe(cfg.Addr, r); err != nil {

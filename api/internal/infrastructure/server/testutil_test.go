@@ -287,7 +287,7 @@ func buildTestRouter(o buildOpts) http.Handler {
 	registrars := server.ProvideRouteRegistrars(authR, userR, artworkR, imageR)
 
 	return server.NewRouter(authMW, registrars, server.AllowedOrigin(o.allowedOrigin),
-		server.AppEnv(o.appEnv))
+		server.AppEnv(o.appEnv), nil)
 }
 
 // testDeps creates a full Deps for use in unit tests with the given appEnv.
