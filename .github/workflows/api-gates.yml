@@ -1,0 +1,70 @@
+name: api-gates
+
+# Per spec §10.1, these gates must pass before merging any PR that touches
+# the api module. They are split into individual jobs so the failing gate
+# is obvious in the GitHub Checks UI without scrolling through one big log.
+#
+# The contract suite already has its own workflow (contract.yml).
+on:
+  pull_request:
+    paths:
+      - 'api/**'
+      - '.github/workflows/api-gates.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'api/**'
+      - '.github/workflows/api-gates.yml'
+
+defaults:
+  run:
+    working-directory: api
+
+jobs:
+  wire-verify:
+    name: wire diff (zero-diff gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache: true
+          cache-dependency-path: api/go.sum
+      - run: make wire-verify
+
+  banned-imports:
+    name: banned imports (architecture gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache: true
+          cache-dependency-path: api/go.sum
+      - run: make banned-imports
+
+  json-field-order:
+    name: json field order (DTO gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache: true
+          cache-dependency-path: api/go.sum
+      - run: make json-field-order
+
+  cover-threshold:
+    name: per-slice coverage ≥ 80%
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: api/go.mod
+          cache: true
+          cache-dependency-path: api/go.sum
+      - run: make cover-threshold

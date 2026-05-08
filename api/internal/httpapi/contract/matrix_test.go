@@ -2,7 +2,6 @@ package contract_test
 
 import (
 	"bytes"
-	"encoding/json"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -11,9 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"local/art-web/api/internal/dbtest"
 	"local/art-web/api/internal/httpapi/contract"
-	"local/art-web/api/internal/image"
+	imageservice "local/art-web/api/internal/image/service"
+	infratest "local/art-web/api/internal/infrastructure/testing"
+	"local/art-web/api/internal/seeder"
 )
 
 // fixedNow is the deterministic clock for every contract test.
@@ -29,21 +29,12 @@ func (fixedRand) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// seedResponse mirrors the /dev/seed response shape (httpapi/devseed.go).
+// jwtFromAuthCookie strips the "auth=" prefix seeder writes around the JWT.
 //
-// IMPORTANT: AliceCookie / BobCookie are the FULL Set-Cookie value
-// ("auth=<JWT>") — devseed.go builds them as "auth=" + jwt. Strip the
-// "auth=" prefix before using them as a cookie value, otherwise requests
-// produce `Cookie: auth=auth=<JWT>` and JWT verification fails with 401.
-type seedResponse struct {
-	AliceCookie string `json:"aliceCookie"`
-	BobCookie   string `json:"bobCookie"`
-	AliceSlug   string `json:"aliceSlug"`
-	PID         string `json:"pId"` // public artwork
-	QID         string `json:"qId"` // private artwork
-}
-
-// jwtFromAuthCookie strips the "auth=" prefix devseed writes around the JWT.
+// IMPORTANT: AliceCookie / BobCookie in seeder.Output are the FULL Set-Cookie
+// value ("auth=<JWT>"). Strip the "auth=" prefix before using them as a
+// cookie value, otherwise requests produce `Cookie: auth=auth=<JWT>` and JWT
+// verification fails with 401.
 func jwtFromAuthCookie(s string) string { return strings.TrimPrefix(s, "auth=") }
 
 // fixedOAuthState is what randState() returns when stateRand is fixedRand{}.
@@ -56,9 +47,9 @@ type contractCase struct {
 	name    string
 	method  string
 	path    string
-	viewer  string // "anon", "owner", "other"
-	body    string // body bytes; empty allowed
-	ctype   string // Content-Type override; if empty and body != "" defaults to application/json
+	viewer  string                                 // "anon", "owner", "other"
+	body    string                                 // body bytes; empty allowed
+	ctype   string                                 // Content-Type override; if empty and body != "" defaults to application/json
 	bodyMP  func(t *testing.T) (io.Reader, string) // optional: builds a multipart body & returns ctype
 	cookies []*http.Cookie                         // optional: extra cookies (e.g. oauth_state for callback cells)
 }
@@ -71,27 +62,20 @@ var noRedirectClient = &http.Client{
 	},
 }
 
-func bootContract(t *testing.T) (string, seedResponse, func(c contractCase) *http.Response) {
-	srv := dbtest.BootApp(t, dbtest.BootOpts{
+func bootContract(t *testing.T) (string, *seeder.Output, func(c contractCase) *http.Response) {
+	booted := infratest.BootApp(t, infratest.BootOpts{
 		FixedNow:   fixedNow,
-		IDProvider: &image.CounterIDProvider{},
+		IDProvider: &imageservice.CounterIDProvider{},
 		RandReader: fixedRand{},
 		Providers:  contract.FakeProviders(),
 	})
 
-	// Seed once via /dev/seed?suffix=fixed1234 — deterministic suffix so the
-	// resulting AliceSlug/BobSlug are stable across runs.
-	r, err := noRedirectClient.Post(srv.URL+"/dev/seed?suffix=fixed1234", "application/json", nil)
+	// Seed once via seeder.Run with deterministic suffix "fixed1234" — the
+	// AliceSlug/BobSlug are stable across runs, which the byte-strict
+	// goldens depend on.
+	seed, err := seeder.Run(t.Context(), booted.DB, booted.Store, booted.JWT, "fixed1234", 0)
 	if err != nil {
-		t.Fatalf("POST /dev/seed: %v", err)
-	}
-	defer r.Body.Close()
-	if r.StatusCode != 200 {
-		t.Fatalf("seed status=%d want 200", r.StatusCode)
-	}
-	var seed seedResponse
-	if err := json.NewDecoder(r.Body).Decode(&seed); err != nil {
-		t.Fatalf("decode seed: %v", err)
+		t.Fatalf("seeder.Run: %v", err)
 	}
 
 	send := func(c contractCase) *http.Response {
@@ -109,7 +93,7 @@ func bootContract(t *testing.T) (string, seedResponse, func(c contractCase) *htt
 		if c.ctype != "" {
 			ctype = c.ctype
 		}
-		req, _ := http.NewRequest(c.method, srv.URL+c.path, bodyReader)
+		req, _ := http.NewRequest(c.method, booted.Server.URL+c.path, bodyReader)
 		if ctype != "" {
 			req.Header.Set("Content-Type", ctype)
 		}
@@ -133,7 +117,7 @@ func bootContract(t *testing.T) (string, seedResponse, func(c contractCase) *htt
 		return resp
 	}
 
-	return srv.URL, seed, send
+	return booted.Server.URL, seed, send
 }
 
 // validImageUpload returns a multipart body builder that uploads a tiny PNG.
@@ -292,7 +276,7 @@ func TestContractMatrix(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			resp := send(c)
 			defer resp.Body.Close()
-			dbtest.AssertGolden(t, c.name, resp)
+			infratest.AssertGolden(t, c.name, resp)
 		})
 	}
 }

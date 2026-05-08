@@ -4,16 +4,17 @@ package contract
 import (
 	"context"
 
-	"local/art-web/api/internal/auth"
+	authdomain "local/art-web/api/internal/auth/domain"
+	authports "local/art-web/api/internal/auth/ports"
 )
 
-// fakeGoogleProvider is a deterministic auth.Provider for the contract suite.
+// fakeGoogleProvider is a deterministic authports.OAuthProvider for the contract suite.
 // Behavior chosen to exercise every auth response branch:
 //
-//   /auth/google/start                                    → 302 to a fixed AuthURL
-//   /auth/google/callback?state=…&code=valid              → success path (UpsertOAuth + JWT)
-//   /auth/google/callback?state=…&code=fail               → 502 exchange_failed
-//   /auth/google/callback?state=mismatch                  → 400 bad_state (state-cookie check)
+//	/auth/google/start                                    → 302 to a fixed AuthURL
+//	/auth/google/callback?state=…&code=valid              → success path (UpsertOAuth + JWT)
+//	/auth/google/callback?state=…&code=fail               → 502 exchange_failed
+//	/auth/google/callback?state=mismatch                  → 400 bad_state (state-cookie check)
 type fakeGoogleProvider struct{}
 
 func (fakeGoogleProvider) Name() string { return "google" }
@@ -24,11 +25,11 @@ func (fakeGoogleProvider) AuthURL(state string) string {
 	return "https://example.com/oauth2/auth?state=" + state
 }
 
-func (fakeGoogleProvider) Exchange(_ context.Context, code string) (*auth.Profile, error) {
+func (fakeGoogleProvider) Exchange(_ context.Context, code string) (*authdomain.Identity, error) {
 	if code == "fail" {
 		return nil, errFakeExchange
 	}
-	return &auth.Profile{
+	return &authdomain.Identity{
 		Subject:     "fake-subject-1",
 		Email:       "fake@example.com",
 		DisplayName: "Fake User",
@@ -47,6 +48,6 @@ func (*exchangeFailure) Error() string { return "fake exchange failure" }
 // FakeProviders returns the providers map the contract suite hands to BootApp.
 // Only "google" is wired today; if Phase 0 ever adds another OAuth provider
 // for testing, add it here with the same deterministic-success/failure shape.
-func FakeProviders() map[string]auth.Provider {
-	return map[string]auth.Provider{"google": fakeGoogleProvider{}}
+func FakeProviders() map[string]authports.OAuthProvider {
+	return map[string]authports.OAuthProvider{"google": fakeGoogleProvider{}}
 }
