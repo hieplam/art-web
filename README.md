@@ -3,6 +3,8 @@
 
 Image-sharing app split into three deployable units include:
 
+
+
 | Service | Stack | Port |
 |---|---|---|
 | `api/` | Go 1.25, chi, pgx, S3 SDK | 8080 |
