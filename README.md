@@ -1,6 +1,7 @@
 # art-web
 
-Image-sharing app split into three deployable units:
+
+Image-sharing app split into three deployable units include:
 
 | Service | Stack | Port |
 |---|---|---|
