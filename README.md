@@ -403,3 +403,4 @@ You're on Go 1.24. Bump your local Go to 1.25, or rebuild via Docker which pins 
 | `/dev/seed` | POST | — (test only) | Seed users + artworks |
 | `/img/public/{art}/{img}.png` | GET | — | Worker: public image |
 | `/img/private/{art}/{img}.png?sig=…&exp=…` | GET | HMAC | Worker: private image |
+ 
